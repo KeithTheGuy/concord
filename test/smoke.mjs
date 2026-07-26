@@ -205,7 +205,14 @@ ok("gremlin: prank relay, self-exclusion, 15s cooldown, unknown-kind rejection")
 // opening a second tab) must not hand you a fresh prank.
 const A2 = connect("");
 await A2.open();
-A2.send({ type: "hello", userId: "user-alice", name: "Alice", color: "#ff5555", avatar: "🦊" });
+A2.send({
+  type: "hello",
+  userId: "user-alice",
+  token: welcomeA.token, // honest client proves the identity is really hers
+  name: "Alice",
+  color: "#ff5555",
+  avatar: "🦊",
+});
 await A2.expect("Alice reconnect welcome", (m) => m.type === "welcome");
 A2.send({ type: "prank", to: bobSid, kind: "airhorn" });
 await A2.expect("cooldown survives reconnect", (m) => m.type === "prank-cooldown");
@@ -219,6 +226,43 @@ await B.expect("prank-missed for absent target", (m) => m.type === "prank-missed
 B.send({ type: "prank", to: aliceSid, kind: "tiny" });
 await A.expect("cooldown refunded after a miss", (m) => m.type === "pranked" && m.kind === "tiny");
 ok("gremlin: a prank that lands on nobody doesn't burn the cooldown");
+
+// --- 8d. identity can't be stolen -----------------------------------------------------
+if (!welcomeA.token) fail("welcome carries an auth token");
+const IMP = connect("");
+await IMP.open();
+IMP.send({
+  type: "hello",
+  userId: "user-alice", // Alice's id is public (it rides on every message)
+  token: "definitely-not-alices-token",
+  name: "Not Alice",
+  color: "#ffffff",
+  avatar: "😈",
+});
+const impWelcome = await IMP.expect("impostor welcome", (m) => m.type === "welcome");
+if (impWelcome.you.userId === "user-alice") fail("impostor was handed Alice's userId");
+IMP.send({ type: "edit", chanId: textChan.id, msgId, content: "I am a clown — Alice" });
+IMP.send({ type: "delete", chanId: textChan.id, msgId });
+await new Promise((r) => setTimeout(r, 400));
+IMP.send({ type: "history", chanId: textChan.id });
+const afterImp = await IMP.expect("history after impostor", (m) => m.type === "history");
+const survivor = afterImp.messages.find((x) => x.id === msgId);
+if (!survivor) fail("impostor deleted another member's message");
+if (survivor.content !== "hello *edited*") fail("impostor edited another member's message", survivor.content);
+ok("identity: a stolen userId is refused, and can't edit or delete that member's messages");
+
+// Re-claiming an identity mid-session must be ignored, or the guard above is
+// pointless — you'd just hello again on the same socket.
+IMP.send({ type: "hello", userId: "user-alice", token: "", name: "Alice", color: "#ff5555", avatar: "🦊" });
+await IMP.expectSilence("re-hello ignored", (m) => m.type === "welcome");
+IMP.send({ type: "delete", chanId: textChan.id, msgId });
+await new Promise((r) => setTimeout(r, 400));
+IMP.send({ type: "history", chanId: textChan.id });
+const afterRehello = await IMP.expect("history after re-hello", (m) => m.type === "history");
+if (!afterRehello.messages.find((x) => x.id === msgId))
+  fail("re-hello on a live socket allowed an identity swap");
+ok("identity: re-hello on a live connection is ignored");
+IMP.ws.close();
 
 // --- 9. disconnect cleanup ------------------------------------------------------------
 B.ws.close();

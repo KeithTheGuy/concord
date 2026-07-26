@@ -85,6 +85,10 @@ function toast(text, isError = false) {
   $("toasts").appendChild(t);
   setTimeout(() => t.remove(), 4000);
 }
+// The server has the final say on our identity: if our stored userId was
+// already claimed here by someone else, it hands us a fresh one in `welcome`.
+const myUserId = () => state.me?.userId || state.profile?.userId;
+
 const esc = (s) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -140,6 +144,7 @@ function connect(code, intent) {
     wsSend({
       type: "hello",
       userId: state.profile.userId,
+      token: store.get("tokens", {})[code] || "", // proves this userId is ours
       name: state.profile.name,
       color: state.profile.color,
       avatar: state.profile.avatar,
@@ -246,6 +251,11 @@ function handleServerMessage(m) {
       state.gotWelcome = true;
       state.reconnectDelay = 1000;
       state.me = m.you;
+      if (m.token) {
+        const tokens = store.get("tokens", {});
+        tokens[state.currentCode] = m.token;
+        store.set("tokens", tokens);
+      }
       state.meta = m.meta;
       state.channels = m.channels;
       state.members = new Map(m.members.map((mm) => [mm.sid, mm]));
@@ -507,7 +517,7 @@ function pushMessage(msg) {
 }
 
 function notifyIfNeeded(msg) {
-  const mine = msg.author.userId === state.profile.userId;
+  const mine = msg.author.userId === myUserId();
   if (mine) return;
   // "Inactive" = other channel, tab hidden, OR window visible but not
   // focused (second monitor while gaming — the whole point of notifications).
@@ -561,7 +571,7 @@ function sendCurrentMessage() {
   const optimistic = {
     id: "pending-" + nonce,
     chanId: state.activeChan,
-    author: { userId: state.profile.userId, name: state.profile.name, color: state.profile.color, avatar: state.profile.avatar },
+    author: { userId: myUserId(), name: state.profile.name, color: state.profile.color, avatar: state.profile.avatar },
     content,
     ts: Date.now(),
     pending: true,
@@ -914,7 +924,7 @@ function buildMsgNode(msg) {
   if (msg.reactions) {
     const row = el("div", "msg-reactions");
     for (const [emoji, users] of Object.entries(msg.reactions)) {
-      const btn = el("button", "reaction" + (users.includes(state.profile.userId) ? " mine" : ""));
+      const btn = el("button", "reaction" + (users.includes(myUserId()) ? " mine" : ""));
       btn.textContent = `${emoji} ${users.length}`;
       btn.title = users.length + " reaction" + (users.length > 1 ? "s" : "");
       btn.onclick = () => wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji });
@@ -942,7 +952,7 @@ function buildMsgNode(msg) {
     reply.title = "Reply";
     reply.onclick = () => setReply(msg);
     actions.appendChild(reply);
-    if (msg.author.userId === state.profile.userId) {
+    if (msg.author.userId === myUserId()) {
       const edit = el("button", "", "✏");
       edit.title = "Edit";
       edit.onclick = () => {
@@ -1487,7 +1497,7 @@ input.addEventListener("keydown", (e) => {
   } else if (e.key === "ArrowUp" && !input.value) {
     // Up-arrow edits your last message, like the real thing.
     const list = state.messages.get(state.activeChan) || [];
-    const own = [...list].reverse().find((x) => x.author.userId === state.profile.userId && !x.pending);
+    const own = [...list].reverse().find((x) => x.author.userId === myUserId() && !x.pending);
     if (own) {
       e.preventDefault();
       state.editingId = own.id;

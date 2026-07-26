@@ -18,7 +18,7 @@ const PRANK_KINDS = new Set([
 const RATE_LIMITED = new Set([
   "msg", "react", "edit", "delete", "typing", "history", "set-profile",
   "create-channel", "update-channel", "delete-channel", "update-server",
-  "voice-join", "voice-leave", "voice-state", "prank",
+  "voice-join", "voice-leave", "voice-state", "prank", "hello",
 ]);
 
 export default {
@@ -194,7 +194,30 @@ export class ConcordServer {
 
     switch (m.type) {
       case "hello": {
-        s.userId = cleanText(m.userId, 40) || crypto.randomUUID();
+        // Identity is claimed exactly once per connection. Without this a
+        // client could re-hello on a live socket to assume another member's
+        // userId (their messages, their prank cooldown) at will.
+        if (s.joined) return;
+
+        // A userId is owned by whoever first claimed it here, proven by a
+        // server-issued token. Present the wrong token and you get a fresh
+        // identity instead of someone else's.
+        const claimed = cleanText(m.userId, 40);
+        const presented = cleanText(m.token, 64);
+        let userId = claimed;
+        if (userId) {
+          const owner = await storage.get(`auth:${userId}`);
+          if (owner && owner !== presented) userId = "";
+        }
+        if (!userId) userId = crypto.randomUUID();
+        let token = await storage.get(`auth:${userId}`);
+        if (!token) {
+          token = crypto.randomUUID();
+          await storage.put(`auth:${userId}`, token);
+        }
+
+        s.userId = userId;
+        s.token = token;
         s.name = cleanText(m.name, 32) || "Wumpus";
         s.color = cleanColor(m.color);
         s.avatar = cleanText(m.avatar, 8) || "🙂";
@@ -211,6 +234,7 @@ export class ConcordServer {
           JSON.stringify({
             type: "welcome",
             you: publicMember(s),
+            token: s.token, // proves this userId is ours on future connects
             meta,
             channels,
             members: this.members(),

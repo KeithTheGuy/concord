@@ -202,19 +202,44 @@ try {
   });
   ok("prank auto-expires (no lingering DOM)");
 
-  // Flash rate must stay under the WCAG 2.3.1 three-per-second threshold.
-  const flashRate = await pageB.evaluate(() => {
+  // Flash safety: sample the real rendered opacity over the element's whole
+  // life (including after the animation ends, where it used to snap to solid
+  // white) and assert both peak brightness and flashes-per-second.
+  const flashProbe = await pageB.evaluate(async () => {
     const probe = document.createElement("div");
     probe.className = "gq-flash";
     document.body.appendChild(probe);
-    const cs = getComputedStyle(probe);
-    const out = { dur: cs.animationDuration, opacityPeak: null };
+    const samples = [];
+    const started = performance.now();
+    await new Promise((resolve) => {
+      const t = setInterval(() => {
+        samples.push([performance.now() - started, parseFloat(getComputedStyle(probe).opacity)]);
+        if (performance.now() - started > 1800) {
+          clearInterval(t);
+          resolve();
+        }
+      }, 20);
+    });
     probe.remove();
-    return out;
+    const values = samples.map((s) => s[1]);
+    // Count rising crossings above a visible-flash threshold.
+    let peaks = 0;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] > 0.15 && values[i - 1] <= 0.15) peaks++;
+    }
+    const spanSeconds = samples[samples.length - 1][0] / 1000;
+    return { max: Math.max(...values), peaks, spanSeconds };
   });
-  const cycleSeconds = parseFloat(flashRate.dur);
-  if (!(cycleSeconds >= 0.333)) bad("flash rate under 3/sec", `${(1 / cycleSeconds).toFixed(2)} flashes/sec`);
-  else ok(`air horn flash is ${(1 / cycleSeconds).toFixed(1)} flashes/sec (WCAG limit 3)`);
+  const perSecond = flashProbe.peaks / flashProbe.spanSeconds;
+  if (flashProbe.max > 0.4)
+    bad("flash never approaches full white", `peak opacity ${flashProbe.max}`);
+  else if (perSecond > 3)
+    bad("flash rate under 3/sec", `${perSecond.toFixed(2)} flashes/sec`);
+  else
+    ok(
+      `air horn flash: ${flashProbe.peaks} flashes over ${flashProbe.spanSeconds.toFixed(1)}s ` +
+        `(${perSecond.toFixed(1)}/sec, WCAG limit 3), peak opacity ${flashProbe.max}`
+    );
 
   // Butter Fingers must never corrupt a message the victim actually sends.
   await pageB.click("#btn-gremlin");
@@ -226,7 +251,15 @@ try {
     { timeout: 8000 }
   );
   await pageA.locator("#input").pressSequentially("integrity check one two", { delay: 15 });
-  const scrambled = await pageA.inputValue("#input");
+  // Emoji-picker insert writes .value programmatically — the path that used
+  // to silently drop characters from the delivered message.
+  await pageA.click("#btn-emoji");
+  await pageA.click("#emoji-picker .emoji-btn");
+  const shown = (await pageA.textContent(".gq-mirror")).trim();
+  const realValue = await pageA.inputValue("#input");
+  if (shown === realValue) bad("butterfingers scrambles the display", `mirror matched the real text`);
+  else ok(`butter fingers display is scrambled ("${shown}")`);
+
   await pageA.press("#input", "Enter");
   await pageB.waitForFunction(
     () => document.querySelector("#messages").textContent.includes("integrity check"),
@@ -236,9 +269,9 @@ try {
     const nodes = [...document.querySelectorAll(".msg-content")];
     return nodes.map((n) => n.textContent.trim()).find((t) => t.includes("integrity check"));
   });
-  if (landed !== "integrity check one two")
-    bad("butterfingers corrupted a sent message", `sent "${landed}" (composer showed "${scrambled}")`);
-  else ok(`butter fingers scrambles the composer ("${scrambled}") but the sent message is intact`);
+  if (landed !== realValue)
+    bad("butterfingers corrupted a sent message", `sent "${landed}", composer held "${realValue}"`);
+  else ok(`sent message is byte-identical to what was typed ("${landed}")`);
 
   // Full-screen pranks must be dismissable, not a lockout.
   const waitLeft = 15500 - (Date.now() - prankSentAt);

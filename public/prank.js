@@ -25,7 +25,10 @@ const KINDS = new Set(PRANKS.map((p) => p.kind));
 export const isPrank = (kind) => KINDS.has(kind);
 
 // Effects that move the viewport; skipped entirely for reduced-motion users.
-const MOTION_KINDS = new Set(["earthquake", "spin", "drunk", "upsidedown"]);
+// emojirain (full-viewport translation) and tiny (whole-UI scale) count too.
+const MOTION_KINDS = new Set([
+  "earthquake", "spin", "drunk", "upsidedown", "emojirain", "tiny",
+]);
 
 const app = () => document.getElementById("app");
 const reduceMotion = () =>
@@ -60,8 +63,11 @@ const CSS = `
 
 #gq-layer { position:fixed; inset:0; pointer-events:none; z-index:9000; overflow:hidden; }
 .gq-drop { position:absolute; top:-8vh; font-size:34px; animation: gq-fall linear forwards; }
+/* opacity:0 in the base rule is load-bearing: without it the element falls
+   back to opacity 1 when the animation ends, producing a solid white frame
+   that is both an extra flash and the largest luminance jump of the lot. */
 .gq-flash { position:fixed; inset:0; background:#fff; z-index:9100; pointer-events:none;
-  animation: gq-flash .34s 4; }
+  opacity: 0; animation: gq-flash .34s 4; }
 .gq-cursor { position:fixed; font-size:88px; z-index:9200; pointer-events:none; transform:translate(-50%,-50%);
   filter: drop-shadow(0 0 12px rgba(0,0,0,.6)); transition: transform .05s linear; }
 
@@ -80,6 +86,11 @@ const CSS = `
 .gq-kick .gq-reveal { background:#5865f2; color:#fff; }
 .gq-dismiss { position:fixed; top:14px; right:18px; font-size:13px; opacity:.75;
   background:rgba(0,0,0,.35); color:#fff; padding:6px 12px; border-radius:6px; }
+
+/* Butter Fingers: a read-only overlay painted over the composer. The real
+   textarea underneath keeps its exact value — this only changes what is drawn. */
+.gq-mirror { position:absolute; pointer-events:none; overflow:hidden; z-index:5;
+  white-space:pre-wrap; overflow-wrap:break-word; box-sizing:border-box; }
 
 /* Toasts must stay visible above prank overlays so the victim always sees
    who did it, even mid-BSOD. */
@@ -252,51 +263,70 @@ function flash() {
   setTimeout(() => s.remove(), 1500);
 }
 
-// Scrambles characters as they appear, but the pristine text is restored the
-// instant the victim commits (Enter) — a prank must never corrupt real data.
+// Butter Fingers scrambles what the victim SEES, never what they typed.
+// The real textarea keeps its exact value and is simply rendered invisible;
+// a mirror element painted over it shows the jumbled text. Because no user
+// data is ever written, every input path — paste, mid-text edits, undo,
+// drag-drop, IME composition, the emoji picker, overlapping pranks — is
+// inherently safe, and the sent message is always byte-identical.
+let butterActive = false;
+
+// Deterministic so the mirror doesn't jitter between repaints: swap each
+// adjacent pair of non-space characters. Length and word shape are preserved.
+const jumble = (s) => s.replace(/(\S)(\S)/g, "$2$1");
+
 function butterFingers(ms) {
   const input = document.getElementById("input");
-  if (!input) return;
+  const composer = document.getElementById("composer");
+  if (!input || !composer || butterActive) return;
+  butterActive = true;
 
-  // `truth` is what the victim actually typed; `shown` is the scrambled text
-  // in the box. Each keystroke is applied to `truth` (never to the already
-  // scrambled text), so the real message is always recoverable intact.
-  let truth = input.value;
-  let shown = input.value;
-  const scrambleOf = (s) =>
-    s.length < 2 ? s : s.slice(0, -2) + s[s.length - 1] + s[s.length - 2];
+  const cs = getComputedStyle(input);
+  const mirror = document.createElement("div");
+  mirror.className = "gq-mirror";
+  for (const prop of [
+    "fontFamily", "fontSize", "fontWeight", "fontStyle", "lineHeight",
+    "letterSpacing", "textIndent", "paddingTop", "paddingRight",
+    "paddingBottom", "paddingLeft",
+  ]) {
+    mirror.style[prop] = cs[prop];
+  }
+  mirror.style.color = cs.color;
 
-  const scramble = () => {
-    const v = input.value;
-    if (v.length > shown.length && v.startsWith(shown)) {
-      truth += v.slice(shown.length); // characters appended
-    } else if (v.length < shown.length && shown.startsWith(v)) {
-      truth = truth.slice(0, v.length); // backspace
-    } else {
-      truth = v; // paste, mid-text edit, or post-send reset: resync
-    }
-    shown = scrambleOf(truth);
-    if (shown !== v) {
-      input.value = shown;
-      input.setSelectionRange(shown.length, shown.length);
-    }
-  };
-  // Registered on document in CAPTURE phase: at the target itself listeners
-  // fire in registration order regardless of the capture flag, and the app's
-  // send handler was registered first — so capturing on an ancestor is the
-  // only way to restore the real text before the message is sent.
-  const restore = (e) => {
-    if (e.target === input && e.key === "Enter" && !e.shiftKey) input.value = truth;
-  };
-  const stop = () => {
-    input.removeEventListener("input", scramble);
-    document.removeEventListener("keydown", restore, true);
-    input.value = truth;
+  const place = () => {
+    mirror.style.left = input.offsetLeft + "px";
+    mirror.style.top = input.offsetTop + "px";
+    mirror.style.width = input.offsetWidth + "px";
+    mirror.style.height = input.offsetHeight + "px";
+    mirror.textContent = jumble(input.value);
+    mirror.scrollTop = input.scrollTop;
   };
 
-  input.addEventListener("input", scramble);
-  document.addEventListener("keydown", restore, true);
-  setTimeout(stop, ms);
+  const prevPosition = composer.style.position;
+  const prevColor = input.style.color;
+  const prevCaret = input.style.caretColor;
+  composer.style.position = "relative";
+  input.style.color = "transparent";
+  input.style.caretColor = cs.color; // caret must stay visible to type by
+  composer.appendChild(mirror);
+  place();
+
+  // An interval (not just the input event) so programmatic writes — the emoji
+  // picker, the post-send clear — stay mirrored without ever being touched.
+  const sync = setInterval(place, 80);
+  input.addEventListener("input", place);
+  input.addEventListener("scroll", place);
+
+  setTimeout(() => {
+    clearInterval(sync);
+    input.removeEventListener("input", place);
+    input.removeEventListener("scroll", place);
+    mirror.remove();
+    composer.style.position = prevPosition;
+    input.style.color = prevColor;
+    input.style.caretColor = prevCaret;
+    butterActive = false;
+  }, ms);
 }
 
 // Only one full-screen prank at a time, and always dismissable.
