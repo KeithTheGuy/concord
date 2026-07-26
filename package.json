@@ -1,0 +1,17 @@
+{
+  "name": "concord",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Discord-knockoff voice + text chat for friends. One Cloudflare Worker, zero regrets.",
+  "scripts": {
+    "dev": "wrangler dev --port 4189",
+    "deploy": "wrangler deploy",
+    "smoke": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.0",
+    "wrangler": "3.114.0",
+    "ws": "^8.18.0"
+  }
+}

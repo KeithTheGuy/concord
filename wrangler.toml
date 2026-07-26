@@ -1,0 +1,21 @@
+name = "concord"
+main = "worker/index.js"
+compatibility_date = "2025-06-01"
+
+# Static client is served from ./public; the Worker runs first only to handle
+# /ws and /api/* itself, delegating everything else to the asset server.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+# One ConcordServer per "server" (guild): channels, messages, presence,
+# voice states, and WebRTC signaling relay.
+[[durable_objects.bindings]]
+name = "SERVERS"
+class_name = "ConcordServer"
+
+[[migrations]]
+tag = "v1-concord"
+new_sqlite_classes = ["ConcordServer"]

@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concord — voice chat for your crew</title>
+<meta name="description" content="Concord: a cozy Discord-knockoff voice & text chat for you and your friends.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎧</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ======================= APP SHELL ======================= -->
+<div id="app" class="hidden">
+
+  <!-- far-left server rail -->
+  <nav id="server-rail">
+    <div id="server-list"></div>
+    <div class="rail-divider"></div>
+    <button id="add-server-btn" class="rail-btn" title="Add a server">+</button>
+  </nav>
+
+  <!-- channel sidebar -->
+  <aside id="sidebar">
+    <header id="server-header" title="Server menu">
+      <span id="server-name">Concord</span>
+      <span id="server-caret">⌄</span>
+    </header>
+    <div id="server-menu" class="menu hidden">
+      <button data-act="invite">Invite People</button>
+      <button data-act="rename">Server Settings</button>
+      <button data-act="leave" class="danger">Leave Server</button>
+    </div>
+
+    <div id="channels">
+      <div class="chan-section">
+        <div class="chan-section-head">
+          <span>Text Channels</span>
+          <button class="chan-add" id="add-text-chan" title="Create text channel">+</button>
+        </div>
+        <div id="text-channels"></div>
+      </div>
+      <div class="chan-section">
+        <div class="chan-section-head">
+          <span>Voice Channels</span>
+          <button class="chan-add" id="add-voice-chan" title="Create voice channel">+</button>
+        </div>
+        <div id="voice-channels"></div>
+      </div>
+    </div>
+
+    <!-- voice connected panel -->
+    <div id="voice-status" class="hidden">
+      <div class="vs-row">
+        <div class="vs-info">
+          <span class="vs-title" id="vs-quality">Voice Connected</span>
+          <span id="vs-channel"></span>
+        </div>
+        <button id="btn-share" title="Share your screen">🖥</button>
+        <button id="btn-hangup" title="Disconnect">✕</button>
+      </div>
+    </div>
+
+    <!-- bottom user panel -->
+    <footer id="user-panel">
+      <div class="avatar" id="me-avatar"></div>
+      <div class="me-info">
+        <span id="me-name"></span>
+        <span id="me-sub">online</span>
+      </div>
+      <button id="btn-mute" title="Mute">🎤</button>
+      <button id="btn-deafen" title="Deafen">🎧</button>
+      <button id="btn-settings" title="User Settings">⚙</button>
+    </footer>
+  </aside>
+
+  <!-- main chat column -->
+  <main id="main">
+    <header id="chat-header">
+      <span id="chan-hash">#</span>
+      <span id="chan-name">general</span>
+      <span id="chan-topic"></span>
+      <div class="header-actions">
+        <button id="btn-invite" class="pill-btn">Invite</button>
+        <button id="btn-members" title="Toggle member list">👥</button>
+      </div>
+    </header>
+
+    <!-- screen-share stage -->
+    <div id="share-stage" class="hidden"></div>
+
+    <div id="messages"></div>
+
+    <div id="reply-bar" class="hidden">
+      <span id="reply-label"></span>
+      <button id="reply-cancel">✕</button>
+    </div>
+
+    <div id="composer">
+      <button id="btn-emoji" title="Emoji">😄</button>
+      <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
+    </div>
+    <div id="typing-bar">&nbsp;</div>
+
+    <div id="emoji-picker" class="hidden"></div>
+  </main>
+
+  <!-- member list -->
+  <aside id="member-list"></aside>
+</div>
+
+<!-- ======================= MODALS ======================= -->
+<div id="modal-backdrop" class="hidden">
+
+  <!-- first-run profile -->
+  <div class="modal hidden" id="onboard-modal">
+    <h1>Welcome to Concord</h1>
+    <p class="modal-sub">It's like Discord, but agreeable. Set up your profile:</p>
+    <label>Display name</label>
+    <input id="ob-name" maxlength="32" placeholder="e.g. Keith the Guy" autocomplete="off">
+    <label>Avatar</label>
+    <div id="ob-avatars" class="emoji-row"></div>
+    <label>Color</label>
+    <div id="ob-colors" class="color-row"></div>
+    <button id="ob-done" class="primary-btn">Continue</button>
+  </div>
+
+  <!-- add / join server -->
+  <div class="modal hidden" id="join-modal">
+    <h1>Add a Server</h1>
+    <p class="modal-sub">Create your own, or join a friend's with an invite code.</p>
+    <div class="join-split">
+      <div class="join-card">
+        <h2>Create My Own</h2>
+        <label>Server name</label>
+        <input id="jm-create-name" maxlength="40" placeholder="Keith's Hangout" autocomplete="off">
+        <label>Icon</label>
+        <div id="jm-icons" class="emoji-row"></div>
+        <button id="jm-create" class="primary-btn">Create Server</button>
+      </div>
+      <div class="join-card">
+        <h2>Join a Friend's</h2>
+        <label>Invite code</label>
+        <input id="jm-code" maxlength="12" placeholder="e.g. XK4PQ2M9" autocomplete="off" style="text-transform:uppercase">
+        <button id="jm-join" class="primary-btn alt">Join Server</button>
+      </div>
+    </div>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- invite -->
+  <div class="modal hidden" id="invite-modal">
+    <h1>Invite your friends</h1>
+    <p class="modal-sub">Send them this link — that's it, that's the whole onboarding.</p>
+    <div class="invite-row"><code id="invite-link"></code><button id="invite-copy" class="primary-btn">Copy</button></div>
+    <p class="modal-sub">Or the code by itself: <b id="invite-code"></b></p>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- settings -->
+  <div class="modal hidden" id="settings-modal">
+    <h1>Settings</h1>
+    <div class="settings-grid">
+      <section>
+        <h2>Profile</h2>
+        <label>Display name</label>
+        <input id="set-name" maxlength="32">
+        <label>Avatar</label>
+        <div id="set-avatars" class="emoji-row"></div>
+        <label>Color</label>
+        <div id="set-colors" class="color-row"></div>
+        <label>Custom status</label>
+        <input id="set-status" maxlength="60" placeholder="playing Sea of Thieves">
+      </section>
+      <section>
+        <h2>Voice</h2>
+        <label>Input device</label>
+        <select id="set-mic"></select>
+        <label class="check-row"><input type="checkbox" id="set-ptt"> Push to talk</label>
+        <div id="ptt-key-row" class="hidden">
+          <label>Push-to-talk key</label>
+          <button id="set-ptt-key" class="pill-btn">Space</button>
+        </div>
+        <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification & voice sounds</label>
+        <label>Output volume <span id="set-vol-label">100%</span></label>
+        <input type="range" id="set-volume" min="0" max="200" value="100">
+      </section>
+    </div>
+    <button id="set-done" class="primary-btn">Done</button>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- generic confirm -->
+  <div class="modal hidden" id="confirm-modal">
+    <h1 id="confirm-title">Are you sure?</h1>
+    <p class="modal-sub" id="confirm-text"></p>
+    <div class="confirm-actions">
+      <button id="confirm-no" class="pill-btn">Cancel</button>
+      <button id="confirm-yes" class="primary-btn danger">Confirm</button>
+    </div>
+  </div>
+
+  <!-- text prompt (rename server / channel, topic) -->
+  <div class="modal hidden" id="prompt-modal">
+    <h1 id="prompt-title">Rename</h1>
+    <input id="prompt-input" maxlength="60" autocomplete="off">
+    <div class="confirm-actions">
+      <button id="prompt-no" class="pill-btn">Cancel</button>
+      <button id="prompt-yes" class="primary-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<div id="ctx-menu" class="menu hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
