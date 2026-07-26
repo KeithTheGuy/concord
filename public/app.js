@@ -1,6 +1,7 @@
 // Concord client — state, WebSocket protocol, and all UI.
 import { VoiceEngine } from "./voice.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
+import { startMascot, stopMascot } from "./mascot.js";
 
 /* ============================== constants =============================== */
 
@@ -39,7 +40,10 @@ const store = {
 const state = {
   profile: store.get("profile", null), // {userId, name, color, avatar, status}
   settings: Object.assign(
-    { micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100, notifs: false, gremlin: true },
+    {
+      micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100,
+      notifs: false, gremlin: true, mascot: true,
+    },
     store.get("settings", {})
   ),
   servers: store.get("servers", []), // [{code, name, icon}]
@@ -1373,6 +1377,7 @@ function openSettings() {
   $("set-sounds").checked = state.settings.sounds;
   $("set-notifs").checked = state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted";
   $("set-gremlin").checked = state.settings.gremlin;
+  $("set-mascot").checked = state.settings.mascot;
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
   populateMics();
@@ -1430,6 +1435,12 @@ $("set-sounds").onchange = (e) => {
 $("set-gremlin").onchange = (e) => {
   state.settings.gremlin = e.target.checked;
   store.set("settings", state.settings);
+};
+$("set-mascot").onchange = (e) => {
+  state.settings.mascot = e.target.checked;
+  store.set("settings", state.settings);
+  if (state.settings.mascot) startMascot({ sounds: () => state.settings.sounds });
+  else stopMascot();
 };
 $("set-notifs").onchange = async (e) => {
   if (e.target.checked) {
@@ -1623,6 +1634,7 @@ window.addEventListener("beforeunload", () => {
 function afterProfileReady() {
   $("app").classList.remove("hidden");
   renderMe();
+  if (state.settings.mascot) startMascot({ sounds: () => state.settings.sounds });
   const params = new URLSearchParams(location.search);
   const joinCode = (params.get("join") || "").toUpperCase();
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
