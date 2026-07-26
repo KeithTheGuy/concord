@@ -241,6 +241,14 @@ export class VoiceEngine {
       peer.audioEl.srcObject = null;
       peer.audioEl.remove();
     }
+    // Detach this peer's WebAudio branch from masterGain (re-dial rebuilds it).
+    for (const node of [peer.srcNode, peer.gainNode, peer.analyser]) {
+      if (node) {
+        try {
+          node.disconnect();
+        } catch {}
+      }
+    }
     this.h.onSpeaking(sid, false);
     this.speakingState.delete(sid);
   }

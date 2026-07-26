@@ -3,7 +3,15 @@
 // calls are never intercepted.
 const CACHE = "concord-v1";
 
-self.addEventListener("install", () => {
+self.addEventListener("install", (event) => {
+  // Precache the shell so offline launch works even if the only prior visit
+  // was a ?join= URL (cache keys include the query string).
+  event.waitUntil(
+    caches
+      .open(CACHE)
+      .then((c) => c.add("/"))
+      .catch(() => {})
+  );
   self.skipWaiting();
 });
 

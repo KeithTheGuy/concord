@@ -84,6 +84,7 @@
       <span id="chan-name">general</span>
       <span id="chan-topic"></span>
       <div class="header-actions">
+        <button id="btn-gremlin" class="pill-btn" title="Gremlin Mode — troll your friends">🃏</button>
         <button id="btn-invite" class="pill-btn">Invite</button>
         <button id="btn-members" title="Toggle member list">👥</button>
       </div>
@@ -186,11 +187,24 @@
         </div>
         <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification & voice sounds</label>
         <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
+        <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
         <label>Output volume <span id="set-vol-label">100%</span></label>
         <input type="range" id="set-volume" min="0" max="200" value="100">
       </section>
     </div>
     <button id="set-done" class="primary-btn">Done</button>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- gremlin mode -->
+  <div class="modal hidden" id="gremlin-modal">
+    <h1>🃏 Gremlin Mode</h1>
+    <p class="modal-sub">Pick a victim, pick a crime. Everything wears off on its own — probably.</p>
+    <label>Victim</label>
+    <select id="gm-target"></select>
+    <label>Weapon of choice</label>
+    <div id="gm-pranks"></div>
+    <p class="gm-warn">15 second cooldown. They will be told it was you. Godspeed.</p>
     <button class="modal-close" data-close>✕</button>
   </div>
 

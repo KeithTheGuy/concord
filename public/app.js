@@ -1,5 +1,6 @@
 // Concord client — state, WebSocket protocol, and all UI.
 import { VoiceEngine } from "./voice.js";
+import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 
 /* ============================== constants =============================== */
 
@@ -38,7 +39,7 @@ const store = {
 const state = {
   profile: store.get("profile", null), // {userId, name, color, avatar, status}
   settings: Object.assign(
-    { micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100, notifs: false },
+    { micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100, notifs: false, gremlin: true },
     store.get("settings", {})
   ),
   servers: store.get("servers", []), // [{code, name, icon}]
@@ -56,6 +57,7 @@ const state = {
   members: new Map(), // sid -> member
   messages: new Map(), // chanId -> msg[]
   historyLoaded: new Set(), // chanIds whose initial history arrived
+  historyPending: new Set(), // chanIds with an in-flight history request
   noMoreHistory: new Set(),
   resume: null, // {code, voiceChan, activeChan} across an unplanned reconnect
   failCount: 0,
@@ -203,6 +205,7 @@ function disconnect() {
   state.members.clear();
   state.messages.clear();
   state.historyLoaded.clear();
+  state.historyPending.clear();
   state.noMoreHistory.clear();
   state.unread.clear();
   state.typing.clear();
@@ -344,6 +347,7 @@ function handleServerMessage(m) {
     }
 
     case "history": {
+      state.historyPending.delete(m.chanId);
       const existing = state.messages.get(m.chanId) || [];
       if (m.before) {
         if (!m.messages.length) state.noMoreHistory.add(m.chanId);
@@ -414,6 +418,7 @@ function handleServerMessage(m) {
       state.channels = state.channels.filter((c) => c.id !== m.chanId);
       state.messages.delete(m.chanId);
       state.historyLoaded.delete(m.chanId);
+      state.historyPending.delete(m.chanId);
       state.noMoreHistory.delete(m.chanId);
       if (state.voiceChan === m.chanId) leaveVoice();
       if (state.activeChan === m.chanId) {
@@ -452,6 +457,27 @@ function handleServerMessage(m) {
       break;
     }
 
+    case "pranked": {
+      if (!state.settings.gremlin) {
+        toast(`🛡️ Blocked a ${m.kind} prank from ${m.name}. Coward mode is on.`);
+        break;
+      }
+      const meta = runPrank(m.kind, m.name);
+      if (meta) toast(`🃏 ${m.name} hit you with ${meta.emoji} ${meta.label}!`);
+      break;
+    }
+
+    case "prank-sent": {
+      const meta = PRANKS.find((p) => p.kind === m.kind);
+      toast(`🃏 ${meta ? meta.emoji + " " + meta.label : "Prank"} deployed. You monster.`);
+      break;
+    }
+
+    case "prank-cooldown": {
+      toast(`Gremlin cooldown — ${m.seconds}s until you can strike again.`, true);
+      break;
+    }
+
     case "error": {
       toast(m.error, true);
       break;
@@ -478,7 +504,9 @@ function pushMessage(msg) {
 function notifyIfNeeded(msg) {
   const mine = msg.author.userId === state.profile.userId;
   if (mine) return;
-  const inactive = msg.chanId !== state.activeChan || document.hidden;
+  // "Inactive" = other channel, tab hidden, OR window visible but not
+  // focused (second monitor while gaming — the whole point of notifications).
+  const inactive = msg.chanId !== state.activeChan || document.hidden || !document.hasFocus();
   if (inactive) {
     if (msg.chanId !== state.activeChan) {
       state.unread.set(msg.chanId, (state.unread.get(msg.chanId) || 0) + 1);
@@ -565,7 +593,8 @@ function renderMarkdown(text) {
   });
   // Links are sentinel-protected too, so the emphasis passes below can never
   // mangle characters inside an emitted href.
-  t = t.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+  // \u0000 excluded so a URL can't swallow an earlier fragment's sentinel.
+  t = t.replace(/(https?:\/\/[^\s<\u0000]+)/g, (url) => {
     codeBlocks.push(`<a href="${url}" target="_blank" rel="noreferrer noopener">${url}</a>`);
     return placeholder(codeBlocks.length - 1);
   });
@@ -961,7 +990,10 @@ function activateChannel(chanId) {
   renderChatHeader();
   renderMessages(true);
   // Live messages may have created the cache entry — that is NOT history.
-  if (!state.historyLoaded.has(chanId)) wsSend({ type: "history", chanId });
+  if (!state.historyLoaded.has(chanId) && !state.historyPending.has(chanId)) {
+    state.historyPending.add(chanId);
+    wsSend({ type: "history", chanId });
+  }
   $("input").focus();
 }
 
@@ -1247,6 +1279,44 @@ function copyText(text, note) {
 }
 $("btn-invite").onclick = openInviteModal;
 
+/* ----------------------------- gremlin mode ------------------------------ */
+
+function openGremlinModal() {
+  const others = [...state.members.values()].filter((m) => m.sid !== state.me?.sid);
+  if (!others.length) {
+    toast("Nobody here to troll yet. Invite some victims first.", true);
+    return;
+  }
+  showModal("gremlin-modal");
+
+  const select = $("gm-target");
+  select.textContent = "";
+  const all = el("option", "", `☠️ EVERYONE (${others.length})`);
+  all.value = "*";
+  select.appendChild(all);
+  for (const m of others) {
+    const o = el("option", "", `${m.avatar} ${m.name}`);
+    o.value = m.sid;
+    select.appendChild(o);
+  }
+
+  const grid = $("gm-pranks");
+  grid.textContent = "";
+  for (const p of PRANKS) {
+    const card = el("button", "gm-card");
+    card.type = "button";
+    card.appendChild(el("span", "gm-emoji", p.emoji));
+    card.appendChild(el("span", "gm-label", p.label));
+    card.appendChild(el("span", "gm-blurb", p.blurb));
+    card.onclick = () => {
+      wsSend({ type: "prank", to: select.value, kind: p.kind });
+      closeModals();
+    };
+    grid.appendChild(card);
+  }
+}
+$("btn-gremlin").onclick = openGremlinModal;
+
 /* ------------------------------- settings ------------------------------- */
 
 function openSettings() {
@@ -1260,6 +1330,7 @@ function openSettings() {
   $("set-ptt-key").textContent = state.settings.pttKey;
   $("set-sounds").checked = state.settings.sounds;
   $("set-notifs").checked = state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted";
+  $("set-gremlin").checked = state.settings.gremlin;
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
   populateMics();
@@ -1312,6 +1383,10 @@ $("set-ptt").onchange = (e) => {
 };
 $("set-sounds").onchange = (e) => {
   state.settings.sounds = e.target.checked;
+  store.set("settings", state.settings);
+};
+$("set-gremlin").onchange = (e) => {
+  state.settings.gremlin = e.target.checked;
   store.set("settings", state.settings);
 };
 $("set-notifs").onchange = async (e) => {
@@ -1446,10 +1521,18 @@ $("btn-emoji").onclick = (e) => {
 
 $("messages").addEventListener("scroll", () => {
   const pane = $("messages");
-  if (pane.scrollTop < 40 && state.activeChan && !state.noMoreHistory.has(state.activeChan)) {
+  if (
+    pane.scrollTop < 40 &&
+    state.activeChan &&
+    !state.noMoreHistory.has(state.activeChan) &&
+    !state.historyPending.has(state.activeChan) // scroll fires per-frame; one request at a time
+  ) {
     const list = state.messages.get(state.activeChan) || [];
     const oldest = list.find((x) => !x.pending);
-    if (oldest) wsSend({ type: "history", chanId: state.activeChan, before: oldest.id });
+    if (oldest) {
+      state.historyPending.add(state.activeChan);
+      wsSend({ type: "history", chanId: state.activeChan, before: oldest.id });
+    }
   }
 });
 
@@ -1525,6 +1608,8 @@ if (state.profile) {
 }
 renderServerRail();
 updateTitle();
+
+installPrankStyles();
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});

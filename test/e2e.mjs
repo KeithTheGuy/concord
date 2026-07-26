@@ -162,6 +162,45 @@ try {
   if (backTo !== "general") bad("notification click switches channel", backTo);
   else ok("notification click switches to that channel");
 
+  // ---- notification for the CURRENT channel while window is unfocused ------------------
+  // Playwright can't take real OS focus from Chromium, so stub hasFocus.
+  await pageA.evaluate(() => {
+    window.__notifs.length = 0;
+    document.hasFocus = () => false;
+  });
+  await pageB.fill("#input", "unfocused window test");
+  await pageB.press("#input", "Enter");
+  await pageA.waitForFunction(() => window.__notifs.length > 0, { timeout: 8000 });
+  const unfocused = await pageA.evaluate(() => window.__notifs[0].opts?.body);
+  if (!/unfocused window test/.test(unfocused)) bad("unfocused notification", unfocused);
+  else ok("notification fires for active channel when window is unfocused");
+  await pageA.evaluate(() => {
+    delete document.hasFocus;
+  });
+
+  // ---- Gremlin Mode: prank travels A -> B and actually renders -------------------------
+  await pageA.click("#btn-gremlin");
+  await pageA.waitForSelector("#gremlin-modal:not(.hidden)");
+  const cards = await pageA.locator(".gm-card").count();
+  if (cards < 10) bad("prank cards rendered", String(cards));
+  else ok(`gremlin modal lists ${cards} pranks`);
+  await pageA.selectOption("#gm-target", { index: 1 }); // the single other member (Bob)
+  await pageA.click('.gm-card:has(.gm-label:text-is("Emoji Rain"))');
+  await pageB.waitForFunction(() => document.querySelectorAll("#gq-layer .gq-drop").length > 3, {
+    timeout: 8000,
+  });
+  ok("prank fired: emoji rain rendered in the victim's client");
+  await pageB.waitForFunction(
+    () => [...document.querySelectorAll(".toast")].some((t) => /E2E Alice/.test(t.textContent)),
+    { timeout: 5000 }
+  );
+  ok("victim is told who pranked them");
+  // Effects must clean themselves up.
+  await pageB.waitForFunction(() => document.querySelectorAll("#gq-layer .gq-drop").length === 0, {
+    timeout: 20000,
+  });
+  ok("prank auto-expires (no lingering DOM)");
+
   // ---- console/page errors ------------------------------------------------------------
   const realErrors = [...errorsA, ...errorsB].filter(
     (e) => !/favicon|Autoplay|net::ERR_/i.test(e)

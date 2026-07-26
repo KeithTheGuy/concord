@@ -7,13 +7,18 @@ const CODE_RE = /^[A-Z0-9]{4,12}$/;
 const MSG_CAP = 300; // messages kept per channel
 const HISTORY_PAGE = 60;
 const MAX_REACTION_KEYS = 20; // distinct emoji per message
+const PRANK_COOLDOWN_MS = 15_000; // per pranker, keeps Gremlin Mode funny not fatal
+const PRANK_KINDS = new Set([
+  "earthquake", "upsidedown", "vaporwave", "emojirain", "fakekick", "airhorn",
+  "drunk", "butterfingers", "cursedcursor", "bluescreen", "tiny", "spin",
+]);
 
 // Everything a client can spam goes through the rate limiter. `rtc` is
 // exempt (ICE candidates legitimately burst) and `hello` runs once.
 const RATE_LIMITED = new Set([
   "msg", "react", "edit", "delete", "typing", "history", "set-profile",
   "create-channel", "update-channel", "delete-channel", "update-server",
-  "voice-join", "voice-leave", "voice-state",
+  "voice-join", "voice-leave", "voice-state", "prank",
 ]);
 
 export default {
@@ -54,6 +59,7 @@ export class ConcordServer {
     this.env = env;
     this.sessions = new Map(); // ws -> session object
     this.rate = new Map(); // sid -> {count, windowStart}
+    this.prankAt = new Map(); // sid -> last prank timestamp
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
     );
@@ -416,6 +422,38 @@ export class ConcordServer {
         break;
       }
 
+      // Gremlin Mode: relay a purely cosmetic, self-expiring prank. The
+      // victim's client decides whether to run it and always sees who sent it.
+      case "prank": {
+        if (!s.joined) return;
+        const kind = cleanText(m.kind, 20);
+        if (!PRANK_KINDS.has(kind)) return;
+
+        const now = Date.now();
+        const last = this.prankAt.get(s.sid) || 0;
+        const waited = now - last;
+        if (waited < PRANK_COOLDOWN_MS) {
+          ws.send(
+            JSON.stringify({
+              type: "prank-cooldown",
+              seconds: Math.ceil((PRANK_COOLDOWN_MS - waited) / 1000),
+            })
+          );
+          return;
+        }
+        this.prankAt.set(s.sid, now);
+
+        const payload = { type: "pranked", from: s.sid, name: s.name, kind };
+        const to = String(m.to || "");
+        if (to === "*") {
+          this.broadcast(payload, ws); // everyone but the gremlin
+        } else if (!this.sendTo(to, payload)) {
+          return;
+        }
+        ws.send(JSON.stringify({ type: "prank-sent", kind }));
+        break;
+      }
+
       case "rtc": {
         if (!s.joined || !s.voice) return;
         const to = String(m.to || "");
@@ -448,7 +486,10 @@ export class ConcordServer {
   dropSession(ws) {
     const s = this.sessions.get(ws);
     this.sessions.delete(ws);
-    if (s) this.rate.delete(s.sid);
+    if (s) {
+      this.rate.delete(s.sid);
+      this.prankAt.delete(s.sid);
+    }
     if (s?.joined) {
       this.broadcast({ type: "member-leave", sid: s.sid });
     }

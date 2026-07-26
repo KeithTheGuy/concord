@@ -186,6 +186,21 @@ await A.expectSilence(
 );
 ok("reactions: capped at 20 distinct keys per message");
 
+// --- 8c. Gremlin Mode prank relay ----------------------------------------------------
+A.send({ type: "prank", to: bobSid, kind: "earthquake" });
+const pranked = await B.expect("Bob gets pranked", (m) => m.type === "pranked");
+if (pranked.kind !== "earthquake" || pranked.name !== "Alice")
+  fail("prank payload", JSON.stringify(pranked));
+await A.expect("Alice gets prank-sent ack", (m) => m.type === "prank-sent" && m.kind === "earthquake");
+await A.expectSilence("pranker never pranks themselves", (m) => m.type === "pranked");
+A.send({ type: "prank", to: bobSid, kind: "bluescreen" });
+const cd = await A.expect("cooldown enforced", (m) => m.type === "prank-cooldown");
+if (!(cd.seconds > 0 && cd.seconds <= 15)) fail("cooldown seconds", JSON.stringify(cd));
+await B.expectSilence("second prank blocked by cooldown", (m) => m.type === "pranked");
+B.send({ type: "prank", to: aliceSid, kind: "not-a-real-prank" });
+await A.expectSilence("unknown prank kinds rejected", (m) => m.type === "pranked");
+ok("gremlin: prank relay, self-exclusion, 15s cooldown, unknown-kind rejection");
+
 // --- 9. disconnect cleanup ------------------------------------------------------------
 B.ws.close();
 await A.expect("member-leave", (m) => m.type === "member-leave" && m.sid === bobSid);

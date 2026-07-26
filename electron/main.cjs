@@ -39,7 +39,11 @@ if (!gotLock) {
       return { action: "deny" };
     });
     win.webContents.on("will-navigate", (event, url) => {
-      if (!url.startsWith(APP_ORIGIN)) {
+      let sameOrigin = false;
+      try {
+        sameOrigin = new URL(url).origin === APP_ORIGIN;
+      } catch {}
+      if (!sameOrigin) {
         event.preventDefault();
         if (/^https?:/i.test(url)) shell.openExternal(url);
       }
@@ -62,8 +66,12 @@ if (!gotLock) {
 
     // Mic + notifications: grant only to our own origin.
     ses.setPermissionRequestHandler((wc, permission, callback, details) => {
-      const trusted =
-        !details.requestingUrl || details.requestingUrl.startsWith(APP_ORIGIN);
+      let trusted = !details.requestingUrl;
+      if (!trusted) {
+        try {
+          trusted = new URL(details.requestingUrl).origin === APP_ORIGIN;
+        } catch {}
+      }
       const allowed = ["media", "audioCapture", "notifications", "display-capture", "clipboard-sanitized-write"];
       callback(trusted && allowed.includes(permission));
     });
@@ -76,9 +84,9 @@ if (!gotLock) {
           .getSources({ types: ["screen"] })
           .then((sources) => {
             if (sources[0]) callback({ video: sources[0] });
-            else callback(null);
+            else callback({}); // cancel per Electron's Streams contract
           })
-          .catch(() => callback(null));
+          .catch(() => callback({}));
       },
       { useSystemPicker: true } // native picker where the OS supports it
     );

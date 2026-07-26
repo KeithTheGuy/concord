@@ -41,6 +41,11 @@ to the server, so only share it with people you want in.
 - **Screen share** — one click, shows as a tile above chat for everyone in voice
 - **Profiles** — name, emoji avatar, color, custom status; channel create/rename/delete;
   server rename; it remembers everything in your browser
+- **🃏 Gremlin Mode** — hit the 🃏 button, pick a victim (or EVERYONE), pick a crime:
+  Earthquake, Upside Down, Vaporwave, Emoji Rain, Fake Kick, Air Horn, Drunk Mode,
+  Butter Fingers, Cursed Cursor, Blue Screen, Tiny Mode, Spin Cycle. Every prank is
+  cosmetic, wears off on its own, and tells the victim exactly who did it. 15 second
+  cooldown per gremlin; anyone can opt out in Settings (cowards welcome)
 
 ## Architecture
 
