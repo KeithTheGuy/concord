@@ -155,12 +155,36 @@ B.send({ type: "rtc", to: "nobody99", data: { kind: "offer" } });
 await B.expect("rtc-gone for missing peer", (m) => m.type === "rtc-gone" && m.sid === "nobody99");
 ok("rtc: addressed relay + rtc-gone for dead peers");
 
+// --- 7b. rtc must not cross voice channels ------------------------------------
+const otherVoice = welcomeA.channels.find((c) => c.type === "voice" && c.id !== voiceChan.id);
+B.send({ type: "voice-join", chanId: otherVoice.id });
+await B.expect("Bob switches voice channel", (m) => m.type === "voice-peers" && m.chanId === otherVoice.id);
+B.send({ type: "rtc", to: aliceSid, data: { kind: "offer", sdp: "cross-channel" } });
+await B.expect("cross-channel rtc rejected", (m) => m.type === "rtc-gone" && m.sid === aliceSid);
+await A.expectSilence("Alice never gets cross-channel rtc", (m) => m.type === "rtc" && m.data?.sdp === "cross-channel");
+ok("rtc: relay refused across different voice channels");
+
 // --- 8. channel create --------------------------------------------------------------
 A.send({ type: "create-channel", name: "Smoke Lounge", chanType: "voice" });
 const created = await B.expect("channel-create", (m) => m.type === "channel-create");
 if (created.channel.name !== "smoke-lounge" || created.channel.type !== "voice")
   fail("channel normalized name", JSON.stringify(created.channel));
 ok("channel create broadcast (name normalized)");
+
+// --- 8b. distinct-reaction cap -----------------------------------------------------
+await new Promise((r) => setTimeout(r, 5200)); // fresh rate-limit window
+const REACTS = "abcdefghijklmnopqrs".split(""); // +👍 from earlier = 20 keys
+for (const e of REACTS) B.send({ type: "react", chanId: textChan.id, msgId, emoji: "r" + e });
+await A.expect(
+  "20th reaction key lands",
+  (m) => m.type === "msg-react" && m.msgId === msgId && Object.keys(m.reactions).length === 20
+);
+B.send({ type: "react", chanId: textChan.id, msgId, emoji: "overflow" });
+await A.expectSilence(
+  "21st distinct reaction rejected",
+  (m) => m.type === "msg-react" && m.reactions && m.reactions["overflow"]
+);
+ok("reactions: capped at 20 distinct keys per message");
 
 // --- 9. disconnect cleanup ------------------------------------------------------------
 B.ws.close();

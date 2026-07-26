@@ -39,6 +39,24 @@ try {
   const ctxA = await browser.newContext({ permissions: ["microphone"] });
   const pageA = await ctxA.newPage();
   track(pageA, "A", errorsA);
+  // Pre-enable desktop notifications and stub the Notification API so we can
+  // observe notifications fired for background-channel messages.
+  await pageA.addInitScript(() => {
+    localStorage.setItem("concord-settings", JSON.stringify({ notifs: true }));
+    window.__notifs = [];
+    window.Notification = class {
+      constructor(title, opts) {
+        this.title = title;
+        this.opts = opts;
+        window.__notifs.push(this);
+      }
+      close() {}
+      static requestPermission() {
+        return Promise.resolve("granted");
+      }
+    };
+    window.Notification.permission = "granted";
+  });
   await pageA.goto(base);
   await onboard(pageA, "E2E Alice");
   await pageA.waitForSelector("#join-modal:not(.hidden)");
@@ -117,6 +135,32 @@ try {
     { timeout: 8000 }
   );
   ok("typing indicator shows on the other side");
+
+  // ---- service worker registered -------------------------------------------------------
+  const swReg = await pageA.evaluate(async () => {
+    if (!("serviceWorker" in navigator)) return "unsupported";
+    const reg = await navigator.serviceWorker.getRegistration();
+    return reg ? "registered" : "none";
+  });
+  if (swReg !== "registered") bad("service worker registered", swReg);
+  else ok("service worker registered");
+
+  // ---- desktop notification for background-channel message -----------------------------
+  await pageA.click("#text-channels .chan-row:nth-child(2)"); // switch A to #random
+  await pageB.fill("#input", "psst, notification test");
+  await pageB.press("#input", "Enter");
+  await pageA.waitForFunction(() => window.__notifs.length > 0, { timeout: 8000 });
+  const notif = await pageA.evaluate(() => ({
+    title: window.__notifs[0].title,
+    body: window.__notifs[0].opts?.body,
+  }));
+  if (!/E2E Bob/.test(notif.title) || !/notification test/.test(notif.body))
+    bad("notification content", JSON.stringify(notif));
+  else ok("desktop notification fired for background channel message");
+  await pageA.evaluate(() => window.__notifs[0].onclick && window.__notifs[0].onclick());
+  const backTo = (await pageA.textContent("#chan-name")).trim();
+  if (backTo !== "general") bad("notification click switches channel", backTo);
+  else ok("notification click switches to that channel");
 
   // ---- console/page errors ------------------------------------------------------------
   const realErrors = [...errorsA, ...errorsB].filter(

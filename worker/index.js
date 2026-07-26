@@ -6,6 +6,15 @@
 const CODE_RE = /^[A-Z0-9]{4,12}$/;
 const MSG_CAP = 300; // messages kept per channel
 const HISTORY_PAGE = 60;
+const MAX_REACTION_KEYS = 20; // distinct emoji per message
+
+// Everything a client can spam goes through the rate limiter. `rtc` is
+// exempt (ICE candidates legitimately burst) and `hello` runs once.
+const RATE_LIMITED = new Set([
+  "msg", "react", "edit", "delete", "typing", "history", "set-profile",
+  "create-channel", "update-channel", "delete-channel", "update-server",
+  "voice-join", "voice-leave", "voice-state",
+]);
 
 export default {
   async fetch(request, env) {
@@ -129,8 +138,10 @@ export class ConcordServer {
       if (s.sid !== sid || !s.joined) continue;
       try {
         ws.send(raw);
-      } catch {}
-      return true;
+        return true;
+      } catch {
+        return false; // dying socket — let the sender get rtc-gone
+      }
     }
     return false;
   }
@@ -167,6 +178,7 @@ export class ConcordServer {
 
   async dispatch(ws, s, m) {
     const storage = this.state.storage;
+    if (RATE_LIMITED.has(m.type) && this.overRate(s.sid)) return;
 
     switch (m.type) {
       case "hello": {
@@ -208,7 +220,7 @@ export class ConcordServer {
       }
 
       case "msg": {
-        if (!s.joined || this.overRate(s.sid)) return;
+        if (!s.joined) return;
         const content = cleanText(m.content, 4000);
         if (!content) return;
         const chanId = String(m.chanId || "");
@@ -292,6 +304,7 @@ export class ConcordServer {
         const msg = await storage.get(key);
         if (!msg) return;
         msg.reactions = msg.reactions || {};
+        if (!msg.reactions[emoji] && Object.keys(msg.reactions).length >= MAX_REACTION_KEYS) return;
         const users = msg.reactions[emoji] || [];
         const i = users.indexOf(s.userId);
         if (i >= 0) users.splice(i, 1);
@@ -405,13 +418,19 @@ export class ConcordServer {
 
       case "rtc": {
         if (!s.joined || !s.voice) return;
-        const delivered = this.sendTo(String(m.to || ""), {
-          type: "rtc",
-          from: s.sid,
-          data: m.data,
-        });
+        const to = String(m.to || "");
+        let target = null;
+        for (const other of this.sessions.values()) {
+          if (other.sid === to && other.joined) {
+            target = other;
+            break;
+          }
+        }
+        // Voice channels are separate rooms — only relay within the same one.
+        const sameRoom = target && target.voice?.chanId === s.voice.chanId;
+        const delivered = sameRoom && this.sendTo(to, { type: "rtc", from: s.sid, data: m.data });
         if (!delivered) {
-          ws.send(JSON.stringify({ type: "rtc-gone", sid: String(m.to || "") }));
+          ws.send(JSON.stringify({ type: "rtc-gone", sid: to }));
         }
         break;
       }
@@ -429,6 +448,7 @@ export class ConcordServer {
   dropSession(ws) {
     const s = this.sessions.get(ws);
     this.sessions.delete(ws);
+    if (s) this.rate.delete(s.sid);
     if (s?.joined) {
       this.broadcast({ type: "member-leave", sid: s.sid });
     }

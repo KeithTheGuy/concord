@@ -140,10 +140,18 @@ export class VoiceEngine {
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-        // If the peer is still supposed to be here, app-level state will
-        // re-establish on their next signal; drop our side cleanly.
+      if (pc.connectionState === "closed") {
         this._closePeer(sid);
+      } else if (pc.connectionState === "failed") {
+        this._closePeer(sid);
+        // Transient ICE failure: the impolite side re-dials if the peer is
+        // still in our channel. Each retry requires a full ICE failure
+        // (tens of seconds), so this cannot spin.
+        if (this.connected && !peer.polite && this.h.inMyChannel?.(sid)) {
+          const fresh = this._ensurePeer(sid);
+          this._attachLocalAudio(fresh);
+          if (this.shareStream) this._attachShare(fresh);
+        }
       }
     };
 
@@ -184,8 +192,9 @@ export class VoiceEngine {
   async handleRtc(from, data) {
     if (!this.connected) return;
     const peer = this._ensurePeer(from);
-    // A peer signaling us means they want our audio too.
+    // A peer signaling us means they want our audio (and screen, if live) too.
     this._attachLocalAudio(peer);
+    if (this.shareStream) this._attachShare(peer);
     const pc = peer.pc;
 
     try {
@@ -260,7 +269,16 @@ export class VoiceEngine {
     }
     peer.audioEl.srcObject = stream;
 
+    // A repeated ontrack for the same peer must not double the audio graph.
+    for (const node of [peer.srcNode, peer.gainNode, peer.analyser]) {
+      if (node) {
+        try {
+          node.disconnect();
+        } catch {}
+      }
+    }
     const src = this.ctx.createMediaStreamSource(stream);
+    peer.srcNode = src;
     peer.gainNode = this.ctx.createGain();
     peer.gainNode.gain.value = peer.userVolume;
     peer.analyser = this.ctx.createAnalyser();
@@ -272,7 +290,13 @@ export class VoiceEngine {
 
   _watchLocalLevel() {
     if (!this.localStream) return;
+    if (this.localSrc) {
+      try {
+        this.localSrc.disconnect();
+      } catch {}
+    }
     const src = this.ctx.createMediaStreamSource(this.localStream);
+    this.localSrc = src;
     this.localAnalyser = this.ctx.createAnalyser();
     this.localAnalyser.fftSize = 512;
     src.connect(this.localAnalyser); // analysis only — never to output (no echo)
@@ -345,9 +369,8 @@ export class VoiceEngine {
 
   setDeafened(deafened) {
     this.deafened = deafened;
-    if (this.masterGain) {
-      this.masterGain.gain.value = deafened ? 0 : this._volumeScalar();
-    }
+    this._ensureCtx(); // masterGain must exist so deafen always takes effect
+    this._applyMasterVolume();
     this._applyTrackEnabled();
     this.playCue(deafened ? "mute" : "unmute");
     this._sendVoiceState();
@@ -358,7 +381,7 @@ export class VoiceEngine {
   }
 
   _applyMasterVolume() {
-    if (this.masterGain && !this.deafened) this.masterGain.gain.value = this._volumeScalar();
+    if (this.masterGain) this.masterGain.gain.value = this.deafened ? 0 : this._volumeScalar();
   }
 
   volumeChanged() {
@@ -379,6 +402,11 @@ export class VoiceEngine {
   getUserVolume(sid) {
     const peer = this.peers.get(sid);
     return peer ? Math.round(peer.userVolume * 100) : 100;
+  }
+
+  // key is a peer sid, or "me" for the local mic.
+  isSpeaking(key) {
+    return !!this.speakingState.get(key)?.speaking;
   }
 
   async setMicDevice() {
@@ -411,8 +439,10 @@ export class VoiceEngine {
     window.addEventListener("keydown", (e) => {
       if (!isPttKey(e)) return;
       const t = e.target;
-      if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) return;
-      e.preventDefault();
+      const typing = t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT");
+      const insertsText = e.key.length === 1 || e.code === "Space";
+      if (typing && insertsText) return; // never eat real typing
+      if (!typing) e.preventDefault();
       if (!this.pttDown) {
         this.pttDown = true;
         this._applyTrackEnabled();

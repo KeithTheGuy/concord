@@ -38,7 +38,7 @@ const store = {
 const state = {
   profile: store.get("profile", null), // {userId, name, color, avatar, status}
   settings: Object.assign(
-    { micId: "", ptt: false, pttKey: "Space", sounds: true, volume: 100 },
+    { micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100, notifs: false },
     store.get("settings", {})
   ),
   servers: store.get("servers", []), // [{code, name, icon}]
@@ -55,7 +55,10 @@ const state = {
   channels: [],
   members: new Map(), // sid -> member
   messages: new Map(), // chanId -> msg[]
+  historyLoaded: new Set(), // chanIds whose initial history arrived
   noMoreHistory: new Set(),
+  resume: null, // {code, voiceChan, activeChan} across an unplanned reconnect
+  failCount: 0,
   activeChan: null,
   unread: new Map(), // chanId -> count
   typing: new Map(), // sid -> {name, chanId, until}
@@ -104,6 +107,7 @@ const voice = new VoiceEngine({
   },
   onError: (t) => toast(t, true),
   settings: () => state.settings,
+  inMyChannel: (sid) => !!state.voiceChan && state.members.get(sid)?.voice?.chanId === state.voiceChan,
 });
 
 /* ============================== websocket =============================== */
@@ -116,6 +120,7 @@ function wsSend(obj) {
 
 function connect(code, intent) {
   disconnect();
+  if (intent?.kind !== "reconnect") state.resume = null;
   state.currentCode = code;
   state.intent = intent || { kind: "reopen", code };
   state.wsState = "connecting";
@@ -164,6 +169,18 @@ function connect(code, intent) {
         if (!state.servers.length) openJoinModal();
         return;
       }
+      // Repeated failures on a saved server: stop hammering, let the user retry.
+      state.failCount++;
+      if (state.failCount >= 5) {
+        state.failCount = 0;
+        state.currentCode = null;
+        toast(`Can't reach server ${code} right now — click it in the rail to retry.`, true);
+        return;
+      }
+    } else {
+      state.failCount = 0;
+      // Remember where we were so the reconnect puts us right back.
+      state.resume = { code, voiceChan: state.voiceChan, activeChan: state.activeChan };
     }
     if (state.voiceChan) leaveVoice({ silent: true });
     if (state.currentCode === code) scheduleReconnect(code);
@@ -185,6 +202,7 @@ function disconnect() {
   if (state.voiceChan) leaveVoice({ silent: true });
   state.members.clear();
   state.messages.clear();
+  state.historyLoaded.clear();
   state.noMoreHistory.clear();
   state.unread.clear();
   state.typing.clear();
@@ -199,7 +217,7 @@ function scheduleReconnect(code) {
   toast("Connection lost — reconnecting…", true);
   state.reconnectTimer = setTimeout(() => {
     state.reconnectDelay = Math.min(state.reconnectDelay * 1.6, 10000);
-    if (state.currentCode === code) connect(code, { kind: "reopen", code });
+    if (state.currentCode === code) connect(code, { kind: "reconnect", code });
   }, state.reconnectDelay);
 }
 
@@ -249,9 +267,18 @@ function handleServerMessage(m) {
       }
       state.intent = null;
 
-      const firstText = state.channels.find((c) => c.type === "text");
+      const resume = state.resume && state.resume.code === state.currentCode ? state.resume : null;
+      state.resume = null;
       renderAll();
-      if (firstText) activateChannel(firstText.id);
+      const firstText = state.channels.find((c) => c.type === "text");
+      const target =
+        resume && state.channels.some((c) => c.id === resume.activeChan && c.type === "text")
+          ? resume.activeChan
+          : firstText?.id;
+      if (target) activateChannel(target);
+      if (resume?.voiceChan && state.channels.some((c) => c.id === resume.voiceChan && c.type === "voice")) {
+        joinVoice(resume.voiceChan); // rejoin the call we were dropped from
+      }
       break;
     }
 
@@ -323,9 +350,12 @@ function handleServerMessage(m) {
         const known = new Set(existing.map((x) => x.id));
         state.messages.set(m.chanId, [...m.messages.filter((x) => !known.has(x.id)), ...existing]);
       } else {
-        // Initial load — keep any optimistic pending messages at the tail.
-        const pending = existing.filter((x) => x.pending);
-        state.messages.set(m.chanId, [...m.messages, ...pending]);
+        // Initial load — keep optimistic pendings and any live messages that
+        // raced in before this response (deduped by id).
+        const known = new Set(m.messages.map((x) => x.id));
+        const extras = existing.filter((x) => x.pending || !known.has(x.id));
+        state.messages.set(m.chanId, [...m.messages, ...extras]);
+        state.historyLoaded.add(m.chanId);
         if (m.messages.length < 60) state.noMoreHistory.add(m.chanId);
       }
       if (m.chanId === state.activeChan) renderMessages(!m.before);
@@ -383,6 +413,8 @@ function handleServerMessage(m) {
     case "channel-delete": {
       state.channels = state.channels.filter((c) => c.id !== m.chanId);
       state.messages.delete(m.chanId);
+      state.historyLoaded.delete(m.chanId);
+      state.noMoreHistory.delete(m.chanId);
       if (state.voiceChan === m.chanId) leaveVoice();
       if (state.activeChan === m.chanId) {
         const first = state.channels.find((c) => c.type === "text");
@@ -454,6 +486,27 @@ function notifyIfNeeded(msg) {
     }
     if (state.settings.sounds) voice.playCue("ping");
     updateTitle();
+    desktopNotify(msg);
+  }
+}
+
+function desktopNotify(msg) {
+  if (!state.settings.notifs) return;
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  const chan = state.channels.find((c) => c.id === msg.chanId);
+  try {
+    const n = new Notification(`${msg.author.name} • #${chan?.name || "?"} — ${state.meta?.name || "Concord"}`, {
+      body: msg.content.slice(0, 140),
+      icon: "/icon-192.png",
+      tag: "concord-" + msg.chanId, // coalesce per channel
+    });
+    n.onclick = () => {
+      window.focus();
+      activateChannel(msg.chanId);
+      n.close();
+    };
+  } catch {
+    // some platforms throw on constructor; nothing to do
   }
 }
 
@@ -498,13 +551,24 @@ function sendCurrentMessage() {
 
 function renderMarkdown(text) {
   const codeBlocks = [];
+  // U+0000 can never appear in user content (the server strips control
+  // chars), so it's a collision-free sentinel for protected fragments.
+  const placeholder = (i) => `\u0000${i}\u0000`;
   let t = esc(text);
   t = t.replace(/```([\s\S]*?)```/g, (_, code) => {
     codeBlocks.push(`<pre><code>${code.replace(/^\n|\n$/g, "")}</code></pre>`);
-    return `\u0000${codeBlocks.length - 1}\u0000`;
+    return placeholder(codeBlocks.length - 1);
   });
-  t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  t = t.replace(/(https?:\/\/[^\s<]+)/g, (url) => `<a href="${url}" target="_blank" rel="noreferrer noopener">${url}</a>`);
+  t = t.replace(/`([^`\n]+)`/g, (_, code) => {
+    codeBlocks.push(`<code>${code}</code>`);
+    return placeholder(codeBlocks.length - 1);
+  });
+  // Links are sentinel-protected too, so the emphasis passes below can never
+  // mangle characters inside an emitted href.
+  t = t.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+    codeBlocks.push(`<a href="${url}" target="_blank" rel="noreferrer noopener">${url}</a>`);
+    return placeholder(codeBlocks.length - 1);
+  });
   t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
@@ -581,6 +645,7 @@ function renderChannels() {
         const av = el("span", "vu-avatar", member.avatar);
         av.style.background = member.color;
         av.dataset.vsid = member.sid;
+        if (voice.isSpeaking(member.sid === state.me?.sid ? "me" : member.sid)) av.classList.add("speaking");
         u.appendChild(av);
         u.appendChild(el("span", "vu-name", member.name));
         const icons = el("span", "vu-icons");
@@ -664,6 +729,7 @@ function renderMembers() {
     const av = el("div", "avatar", member.avatar);
     av.style.background = member.color;
     av.dataset.vsid = member.sid;
+    if (voice.isSpeaking(member.sid === state.me?.sid ? "me" : member.sid)) av.classList.add("speaking");
     row.appendChild(av);
     const col = el("div", "m-col");
     const name = el("div", "m-name", member.name);
@@ -693,6 +759,7 @@ function renderMe() {
   av.textContent = state.profile.avatar;
   av.style.background = state.profile.color;
   if (state.me) av.dataset.vsid = state.me.sid;
+  av.classList.toggle("speaking", voice.isSpeaking("me"));
   $("me-name").textContent = state.profile.name;
   $("me-sub").textContent = state.profile.status || "online";
 }
@@ -892,9 +959,9 @@ function activateChannel(chanId) {
   state.editingId = null;
   renderChannels();
   renderChatHeader();
-  const cached = state.messages.get(chanId);
   renderMessages(true);
-  if (!cached) wsSend({ type: "history", chanId });
+  // Live messages may have created the cache entry — that is NOT history.
+  if (!state.historyLoaded.has(chanId)) wsSend({ type: "history", chanId });
   $("input").focus();
 }
 
@@ -1192,6 +1259,7 @@ function openSettings() {
   $("ptt-key-row").classList.toggle("hidden", !state.settings.ptt);
   $("set-ptt-key").textContent = state.settings.pttKey;
   $("set-sounds").checked = state.settings.sounds;
+  $("set-notifs").checked = state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted";
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
   populateMics();
@@ -1244,6 +1312,23 @@ $("set-ptt").onchange = (e) => {
 };
 $("set-sounds").onchange = (e) => {
   state.settings.sounds = e.target.checked;
+  store.set("settings", state.settings);
+};
+$("set-notifs").onchange = async (e) => {
+  if (e.target.checked) {
+    if (typeof Notification === "undefined") {
+      toast("This browser doesn't support notifications.", true);
+      e.target.checked = false;
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      toast("Notifications blocked — allow them in your browser settings.", true);
+      e.target.checked = false;
+      return;
+    }
+  }
+  state.settings.notifs = e.target.checked;
   store.set("settings", state.settings);
 };
 $("set-volume").oninput = (e) => {
@@ -1440,3 +1525,7 @@ if (state.profile) {
 }
 renderServerRail();
 updateTitle();
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}

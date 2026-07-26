@@ -5,6 +5,21 @@ your friends, small enough to fit in one Cloudflare Worker.
 
 **Live at → https://concord.jeffnugget.workers.dev**
 
+## Get the Windows app 🖥️
+
+Grab it from [**Releases**](https://github.com/KeithTheGuy/concord/releases/latest):
+
+- **Concord-Setup-x.x.x.exe** — installer (Start menu shortcut, one-click)
+- **Concord-x.x.x-portable.exe** — no install, just run it
+
+It's the same trick real Discord uses: a desktop shell around the live app, so it
+updates itself every time you launch it. Native Windows toast notifications and
+one-click screen share included.
+
+> Windows SmartScreen will warn because the exe isn't code-signed (certificates
+> cost money; this is a friends project). Click **More info → Run anyway**.
+> If you'd rather not, the website is the exact same app — you lose nothing.
+
 ## How friends join (the whole onboarding)
 
 1. You: click **Invite** in the app, copy the link (looks like `https://concord.jeffnugget.workers.dev/?join=XK4PQ2M9`).
@@ -30,9 +45,11 @@ to the server, so only share it with people you want in.
 ## Architecture
 
 ```
-public/    static client (vanilla JS, no build step)
+public/    static client (vanilla JS, no build step) — also an installable PWA
 worker/    Cloudflare Worker + ConcordServer Durable Object
-test/      protocol smoke test (node test/smoke.mjs [url])
+electron/  Windows desktop shell (loads the live site, like real Discord)
+test/      smoke.mjs (protocol) · e2e.mjs (two-browser incl. live WebRTC audio)
+           desktop.mjs (Electron) · shot.mjs (screenshots) · icons.mjs (app icons)
 ```
 
 One Durable Object per server holds channels, the last 300 messages per channel,
@@ -45,7 +62,10 @@ peer-to-peer (mesh) — the server never hears you.
 npm install
 npm run dev       # wrangler dev on http://localhost:4189
 npm run smoke     # protocol test against the dev server
-npm run deploy    # ship it
+npm run e2e       # two-browser Playwright test (chat + voice + notifications)
+npm run app       # run the desktop app from source
+npm run dist      # build Windows installer + portable exe into dist/
+npm run deploy    # ship the web app
 ```
 
 Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wrangler 4 works too.
