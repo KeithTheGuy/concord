@@ -8,6 +8,13 @@ const MSG_CAP = 300; // messages kept per channel
 const HISTORY_PAGE = 60;
 const MAX_REACTION_KEYS = 20; // distinct emoji per message
 const PRANK_COOLDOWN_MS = 15_000; // per pranker, keeps Gremlin Mode funny not fatal
+// Per-VICTIM floor. The sender's cooldown can always be dodged by minting a
+// new identity (nothing stops a client opening sockets), so the only bound an
+// attacker cannot rotate is one keyed on the person receiving the prank.
+const PRANK_VICTIM_FLOOR_MS = 5_000;
+const AUTH_TTL_MS = 90 * 24 * 60 * 60 * 1000; // forget dormant identities
+const AUTH_CAP = 300; // ceiling on stored identities per server
+const AUTH_SWEEP_EVERY = 25; // new identities between sweeps
 const PRANK_KINDS = new Set([
   "earthquake", "upsidedown", "vaporwave", "emojirain", "fakekick", "airhorn",
   "drunk", "butterfingers", "cursedcursor", "bluescreen", "tiny", "spin",
@@ -59,7 +66,9 @@ export class ConcordServer {
     this.env = env;
     this.sessions = new Map(); // ws -> session object
     this.rate = new Map(); // sid -> {count, windowStart}
-    this.prankAt = new Map(); // userId -> last prank timestamp (survives reconnects)
+    this.prankAt = new Map(); // userId -> last prank sent (survives reconnects)
+    this.prankedAt = new Map(); // userId -> last prank received
+    this.authWrites = 0;
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
     );
@@ -156,6 +165,40 @@ export class ConcordServer {
     for (const [userId, at] of this.prankAt) {
       if (now - at > PRANK_COOLDOWN_MS) this.prankAt.delete(userId);
     }
+    for (const [key, at] of this.prankedAt) {
+      if (now - at > PRANK_VICTIM_FLOOR_MS) this.prankedAt.delete(key);
+    }
+  }
+
+  victimKey(session) {
+    return session.userId || session.sid;
+  }
+
+  victimShielded(session, now) {
+    return now - (this.prankedAt.get(this.victimKey(session)) || 0) < PRANK_VICTIM_FLOOR_MS;
+  }
+
+  // Identities are stored per server and never expire on their own, so sweep
+  // dormant ones. Anyone currently connected is always kept.
+  async sweepAuth(now) {
+    const rows = await this.state.storage.list({ prefix: "auth:" });
+    const live = new Set();
+    for (const s of this.sessions.values()) {
+      if (s.userId) live.add(`auth:${s.userId}`);
+    }
+    const entries = [];
+    for (const [key, value] of rows) {
+      if (live.has(key)) continue;
+      entries.push([key, typeof value === "string" ? 0 : value?.at || 0]);
+    }
+    const doomed = entries.filter(([, at]) => now - at > AUTH_TTL_MS).map(([k]) => k);
+    const remaining = entries.length - doomed.length;
+    if (remaining > AUTH_CAP) {
+      const dead = new Set(doomed);
+      const rest = entries.filter(([k]) => !dead.has(k)).sort((a, b) => a[1] - b[1]);
+      for (const [key] of rest.slice(0, remaining - AUTH_CAP)) doomed.push(key);
+    }
+    if (doomed.length) await this.state.storage.delete(doomed);
   }
 
   overRate(sid) {
@@ -204,16 +247,20 @@ export class ConcordServer {
         // identity instead of someone else's.
         const claimed = cleanText(m.userId, 40);
         const presented = cleanText(m.token, 64);
+        const tokenOf = (row) => (typeof row === "string" ? row : row?.token);
         let userId = claimed;
         if (userId) {
-          const owner = await storage.get(`auth:${userId}`);
+          const owner = tokenOf(await storage.get(`auth:${userId}`));
           if (owner && owner !== presented) userId = "";
         }
         if (!userId) userId = crypto.randomUUID();
-        let token = await storage.get(`auth:${userId}`);
-        if (!token) {
-          token = crypto.randomUUID();
-          await storage.put(`auth:${userId}`, token);
+        let token = tokenOf(await storage.get(`auth:${userId}`));
+        const isNewIdentity = !token;
+        if (isNewIdentity) token = crypto.randomUUID();
+        // `at` doubles as last-seen so dormant identities can be swept.
+        await storage.put(`auth:${userId}`, { token, at: Date.now() });
+        if (isNewIdentity && ++this.authWrites % AUTH_SWEEP_EVERY === 0) {
+          await this.sweepAuth(Date.now());
         }
 
         s.userId = userId;
@@ -475,14 +522,51 @@ export class ConcordServer {
         }
 
         const payload = { type: "pranked", from: s.sid, name: s.name, kind };
+        const raw = JSON.stringify(payload);
         const to = String(m.to || "");
+        let delivered = 0;
+
         if (to === "*") {
-          this.broadcast(payload, ws); // everyone but the gremlin
-        } else if (!this.sendTo(to, payload)) {
-          // Target vanished — say so and don't charge them the cooldown.
-          ws.send(JSON.stringify({ type: "prank-missed" }));
-          return;
+          for (const [sock, other] of this.sessions) {
+            if (!other.joined || sock === ws || this.victimShielded(other, now)) continue;
+            try {
+              sock.send(raw);
+              this.prankedAt.set(this.victimKey(other), now);
+              delivered++;
+            } catch {}
+          }
+          if (!delivered) {
+            ws.send(JSON.stringify({ type: "prank-shielded" }));
+            return;
+          }
+        } else {
+          let target = null;
+          let targetWs = null;
+          for (const [sock, other] of this.sessions) {
+            if (other.sid === to && other.joined) {
+              target = other;
+              targetWs = sock;
+              break;
+            }
+          }
+          if (!target) {
+            // Target vanished — say so and don't charge them the cooldown.
+            ws.send(JSON.stringify({ type: "prank-missed" }));
+            return;
+          }
+          if (this.victimShielded(target, now)) {
+            ws.send(JSON.stringify({ type: "prank-shielded" }));
+            return;
+          }
+          try {
+            targetWs.send(raw);
+          } catch {
+            ws.send(JSON.stringify({ type: "prank-missed" }));
+            return;
+          }
+          this.prankedAt.set(this.victimKey(target), now);
         }
+
         this.prankAt.set(s.userId, now); // only a delivered prank costs cooldown
         this.prunePranks(now);
         ws.send(JSON.stringify({ type: "prank-sent", kind }));

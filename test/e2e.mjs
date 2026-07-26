@@ -205,31 +205,47 @@ try {
   // Flash safety: sample the real rendered opacity over the element's whole
   // life (including after the animation ends, where it used to snap to solid
   // white) and assert both peak brightness and flashes-per-second.
+  // Fire THREE overlapping air horns through the real code path: a single
+  // probe element can't see layers compositing or running at separate phase,
+  // which is exactly how the rate and brightness got past an earlier check.
   const flashProbe = await pageB.evaluate(async () => {
-    const probe = document.createElement("div");
-    probe.className = "gq-flash";
-    document.body.appendChild(probe);
+    const mod = await import("/prank.js");
     const samples = [];
     const started = performance.now();
+    for (let i = 0; i < 3; i++) {
+      setTimeout(() => {
+        try {
+          mod.runPrank("airhorn", "Tester");
+        } catch {}
+      }, i * 110);
+    }
     await new Promise((resolve) => {
       const t = setInterval(() => {
-        samples.push([performance.now() - started, parseFloat(getComputedStyle(probe).opacity)]);
-        if (performance.now() - started > 1800) {
+        const layers = [...document.querySelectorAll(".gq-flash")];
+        // Alpha of stacked translucent white layers.
+        const composite =
+          1 - layers.reduce((acc, el) => acc * (1 - parseFloat(getComputedStyle(el).opacity)), 1);
+        samples.push([performance.now() - started, composite, layers.length]);
+        if (performance.now() - started > 2000) {
           clearInterval(t);
           resolve();
         }
-      }, 20);
+      }, 16);
     });
-    probe.remove();
     const values = samples.map((s) => s[1]);
-    // Count rising crossings above a visible-flash threshold.
     let peaks = 0;
     for (let i = 1; i < values.length; i++) {
       if (values[i] > 0.15 && values[i - 1] <= 0.15) peaks++;
     }
-    const spanSeconds = samples[samples.length - 1][0] / 1000;
-    return { max: Math.max(...values), peaks, spanSeconds };
+    return {
+      max: Math.max(...values),
+      layers: Math.max(...samples.map((s) => s[2])),
+      peaks,
+      spanSeconds: samples[samples.length - 1][0] / 1000,
+    };
   });
+  if (flashProbe.layers > 1)
+    bad("air horn flashes never stack", `${flashProbe.layers} concurrent flash layers`);
   const perSecond = flashProbe.peaks / flashProbe.spanSeconds;
   if (flashProbe.max > 0.4)
     bad("flash never approaches full white", `peak opacity ${flashProbe.max}`);
@@ -237,8 +253,9 @@ try {
     bad("flash rate under 3/sec", `${perSecond.toFixed(2)} flashes/sec`);
   else
     ok(
-      `air horn flash: ${flashProbe.peaks} flashes over ${flashProbe.spanSeconds.toFixed(1)}s ` +
-        `(${perSecond.toFixed(1)}/sec, WCAG limit 3), peak opacity ${flashProbe.max}`
+      `3 stacked air horns: ${flashProbe.layers} flash layer, ${flashProbe.peaks} flashes over ` +
+        `${flashProbe.spanSeconds.toFixed(1)}s (${perSecond.toFixed(1)}/sec, WCAG limit 3), ` +
+        `peak composite white ${flashProbe.max.toFixed(3)}`
     );
 
   // Butter Fingers must never corrupt a message the victim actually sends.

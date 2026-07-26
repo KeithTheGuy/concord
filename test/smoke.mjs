@@ -264,6 +264,33 @@ if (!afterRehello.messages.find((x) => x.id === msgId))
 ok("identity: re-hello on a live connection is ignored");
 IMP.ws.close();
 
+// --- 8e. anonymous prank flood ---------------------------------------------------------
+// A sender's cooldown is only as good as their identity, and nothing stops a
+// client opening sockets that claim no identity at all. The per-victim floor
+// is what actually bounds this, so drive the attack and count what lands.
+let floodLanded = 0;
+let floodShielded = 0;
+B.ws.on("message", (data) => {
+  if (JSON.parse(data.toString()).type === "pranked") floodLanded++;
+});
+const floodSockets = [];
+for (let i = 0; i < 4; i++) {
+  const F = connect("");
+  floodSockets.push(F);
+  await F.open();
+  F.send({ type: "hello", name: `Anon${i}`, color: "#000000", avatar: "😈" }); // no userId
+  await F.expect(`anon ${i} welcome`, (m) => m.type === "welcome");
+  F.ws.on("message", (data) => {
+    if (JSON.parse(data.toString()).type === "prank-shielded") floodShielded++;
+  });
+  F.send({ type: "prank", to: bobSid, kind: "airhorn" });
+}
+await new Promise((r) => setTimeout(r, 1500));
+for (const F of floodSockets) F.ws.close();
+if (floodLanded > 1) fail("per-victim floor", `${floodLanded} pranks landed on one victim in 1.5s`);
+if (floodShielded < 1) fail("per-victim floor", "no sender was told the victim is shielded");
+ok(`gremlin: anonymous flood bounded — ${floodLanded} landed, ${floodShielded} refused by victim floor`);
+
 // --- 9. disconnect cleanup ------------------------------------------------------------
 B.ws.close();
 await A.expect("member-leave", (m) => m.type === "member-leave" && m.sid === bobSid);

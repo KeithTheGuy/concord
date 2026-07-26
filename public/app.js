@@ -85,9 +85,26 @@ function toast(text, isError = false) {
   $("toasts").appendChild(t);
   setTimeout(() => t.remove(), 4000);
 }
-// The server has the final say on our identity: if our stored userId was
-// already claimed here by someone else, it hands us a fresh one in `welcome`.
-const myUserId = () => state.me?.userId || state.profile?.userId;
+// Identity is per server, not global: the server can hand us a different
+// userId on one server (if ours was already claimed there) without disturbing
+// who we are anywhere else. Stored as {code: {userId, token}}.
+function identityFor(code) {
+  const saved = store.get("identities", {})[code];
+  if (saved) return saved;
+  const legacyToken = store.get("tokens", {})[code]; // pre-per-server clients
+  if (legacyToken && state.profile) return { userId: state.profile.userId, token: legacyToken };
+  return null;
+}
+
+function rememberIdentity(code, userId, token) {
+  if (!code || !userId || !token) return;
+  const all = store.get("identities", {});
+  all[code] = { userId, token };
+  store.set("identities", all);
+}
+
+const myUserId = () =>
+  state.me?.userId || identityFor(state.currentCode)?.userId || state.profile?.userId;
 
 const esc = (s) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -143,8 +160,8 @@ function connect(code, intent) {
     state.wsState = "open";
     wsSend({
       type: "hello",
-      userId: state.profile.userId,
-      token: store.get("tokens", {})[code] || "", // proves this userId is ours
+      userId: identityFor(code)?.userId || state.profile.userId,
+      token: identityFor(code)?.token || "", // proves this userId is ours
       name: state.profile.name,
       color: state.profile.color,
       avatar: state.profile.avatar,
@@ -251,11 +268,7 @@ function handleServerMessage(m) {
       state.gotWelcome = true;
       state.reconnectDelay = 1000;
       state.me = m.you;
-      if (m.token) {
-        const tokens = store.get("tokens", {});
-        tokens[state.currentCode] = m.token;
-        store.set("tokens", tokens);
-      }
+      rememberIdentity(state.currentCode, m.you.userId, m.token);
       state.meta = m.meta;
       state.channels = m.channels;
       state.members = new Map(m.members.map((mm) => [mm.sid, mm]));
@@ -480,6 +493,11 @@ function handleServerMessage(m) {
     case "prank-sent": {
       const meta = PRANKS.find((p) => p.kind === m.kind);
       toast(`🃏 ${meta ? meta.emoji + " " + meta.label : "Prank"} deployed. You monster.`);
+      break;
+    }
+
+    case "prank-shielded": {
+      toast("They're still recovering from the last prank. Give them a few seconds.", true);
       break;
     }
 

@@ -91,6 +91,9 @@ const CSS = `
    textarea underneath keeps its exact value — this only changes what is drawn. */
 .gq-mirror { position:absolute; pointer-events:none; overflow:hidden; z-index:5;
   white-space:pre-wrap; overflow-wrap:break-word; box-sizing:border-box; }
+/* The app's global ::selection sets a colour, which would otherwise render
+   the real (transparent) text visible again the moment it's selected. */
+#input.gq-butter::selection { color: transparent; }
 
 /* Toasts must stay visible above prank overlays so the victim always sees
    who did it, even mid-BSOD. */
@@ -255,12 +258,21 @@ function cursedCursor(ms) {
   }, ms);
 }
 
+// Guarded like every other effect: without this, concurrent air horns
+// composite their white layers and run at independent phase, which pushes
+// both the brightness and the flashes-per-second past the safe limits.
+let flashUp = false;
+
 function flash() {
-  if (reduceMotion()) return;
+  if (reduceMotion() || flashUp) return;
+  flashUp = true;
   const s = document.createElement("div");
   s.className = "gq-flash";
   document.body.appendChild(s);
-  setTimeout(() => s.remove(), 1500);
+  setTimeout(() => {
+    s.remove();
+    flashUp = false;
+  }, 1500);
 }
 
 // Butter Fingers scrambles what the victim SEES, never what they typed.
@@ -271,9 +283,19 @@ function flash() {
 // inherently safe, and the sent message is always byte-identical.
 let butterActive = false;
 
-// Deterministic so the mirror doesn't jitter between repaints: swap each
-// adjacent pair of non-space characters. Length and word shape are preserved.
-const jumble = (s) => s.replace(/(\S)(\S)/g, "$2$1");
+// Deterministic so the mirror doesn't jitter between repaints: swap adjacent
+// pairs of non-space characters. Iterates code points, not UTF-16 units, so
+// emoji are moved whole instead of being split into replacement glyphs.
+const jumble = (s) => {
+  const chars = [...s];
+  for (let i = 0; i + 1 < chars.length; i += 2) {
+    if (/\s/.test(chars[i]) || /\s/.test(chars[i + 1])) continue;
+    const swap = chars[i];
+    chars[i] = chars[i + 1];
+    chars[i + 1] = swap;
+  }
+  return chars.join("");
+};
 
 function butterFingers(ms) {
   const input = document.getElementById("input");
@@ -282,6 +304,10 @@ function butterFingers(ms) {
   butterActive = true;
 
   const cs = getComputedStyle(input);
+  // Read the ink colour NOW: cs is live, so once the textarea is set
+  // transparent below, cs.color would report transparent and the victim
+  // would be left typing with no caret at all.
+  const inkColor = cs.color;
   const mirror = document.createElement("div");
   mirror.className = "gq-mirror";
   for (const prop of [
@@ -291,7 +317,7 @@ function butterFingers(ms) {
   ]) {
     mirror.style[prop] = cs[prop];
   }
-  mirror.style.color = cs.color;
+  mirror.style.color = inkColor;
 
   const place = () => {
     mirror.style.left = input.offsetLeft + "px";
@@ -307,7 +333,8 @@ function butterFingers(ms) {
   const prevCaret = input.style.caretColor;
   composer.style.position = "relative";
   input.style.color = "transparent";
-  input.style.caretColor = cs.color; // caret must stay visible to type by
+  input.style.caretColor = inkColor; // caret must stay visible to type by
+  input.classList.add("gq-butter"); // keeps ::selection from revealing the text
   composer.appendChild(mirror);
   place();
 
@@ -325,6 +352,7 @@ function butterFingers(ms) {
     composer.style.position = prevPosition;
     input.style.color = prevColor;
     input.style.caretColor = prevCaret;
+    input.classList.remove("gq-butter");
     butterActive = false;
   }, ms);
 }
