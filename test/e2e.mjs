@@ -258,6 +258,31 @@ try {
         `peak composite white ${flashProbe.max.toFixed(3)}`
     );
 
+  // Cole Mode: hands must render, never intercept a click, and clean up.
+  const cole = await pageB.evaluate(async () => {
+    const mod = await import("/prank.js");
+    mod.runPrank("colemode", "Cole");
+    await new Promise((r) => setTimeout(r, 900));
+    const hands = [...document.querySelectorAll(".gq-hand")];
+    const blocking = hands.filter((h) => getComputedStyle(h).pointerEvents !== "none").length;
+    // What the browser would hand a click to where a hand is drawn.
+    let hitsHand = false;
+    if (hands[0]) {
+      const box = hands[0].getBoundingClientRect();
+      const at = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      hitsHand = !!at && at.classList.contains("gq-hand");
+    }
+    mod.runPrank("colemode", "Cole"); // must not stack a second set
+    await new Promise((r) => setTimeout(r, 300));
+    return { hands: hands.length, blocking, hitsHand, after: document.querySelectorAll(".gq-hand").length };
+  });
+  if (!cole.hands) bad("Cole Mode renders hands", "no .gq-hand elements appeared");
+  else if (cole.blocking || cole.hitsHand) bad("Cole Mode never eats clicks", "a hand was hit-testable");
+  else if (cole.after > 1) bad("Cole Mode does not stack", `${cole.after} hands after a second trigger`);
+  else ok(`Cole Mode: ${cole.hands} hand(s) poking, click-through, no stacking`);
+  await pageB.waitForFunction(() => !document.querySelector(".gq-hand, .gq-boop"), { timeout: 20000 });
+  ok("Cole Mode cleans up after itself");
+
   // Butter Fingers must never corrupt a message the victim actually sends.
   await pageB.click("#btn-gremlin");
   await pageB.waitForSelector("#gremlin-modal:not(.hidden)");

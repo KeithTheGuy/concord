@@ -19,6 +19,7 @@ export const PRANKS = [
   { kind: "bluescreen", emoji: "💀", label: "Blue Screen", blurb: "Fake Windows crash" },
   { kind: "tiny", emoji: "🐜", label: "Tiny Mode", blurb: "Shrinks the entire UI" },
   { kind: "spin", emoji: "🌀", label: "Spin Cycle", blurb: "Slowly rotates everything" },
+  { kind: "colemode", emoji: "🫳", label: "Cole Mode", blurb: "Hands keep poking them. No personal space." },
 ];
 
 const KINDS = new Set(PRANKS.map((p) => p.kind));
@@ -27,7 +28,7 @@ export const isPrank = (kind) => KINDS.has(kind);
 // Effects that move the viewport; skipped entirely for reduced-motion users.
 // emojirain (full-viewport translation) and tiny (whole-UI scale) count too.
 const MOTION_KINDS = new Set([
-  "earthquake", "spin", "drunk", "upsidedown", "emojirain", "tiny",
+  "earthquake", "spin", "drunk", "upsidedown", "emojirain", "tiny", "colemode",
 ]);
 
 const app = () => document.getElementById("app");
@@ -53,6 +54,19 @@ const CSS = `
 @keyframes gq-fall { to { transform: translateY(105vh) rotate(var(--gq-spin,360deg)); opacity:.15 } }
 @keyframes gq-flash { 0%,100%{opacity:0} 50%{opacity:.35} }
 @keyframes gq-pop { from{transform:scale(.7);opacity:0} to{transform:scale(1);opacity:1} }
+/* Cole Mode: a hand slides in from an edge, pokes twice, and retreats. */
+@keyframes gq-poke {
+  0%   { transform: translate(var(--gq-dx), var(--gq-dy)) scale(1); opacity: 0 }
+  12%  { opacity: 1 }
+  40%  { transform: translate(0,0) scale(1); opacity: 1 }
+  52%  { transform: translate(calc(var(--gq-dx) * .22), calc(var(--gq-dy) * .22)) scale(.93); opacity: 1 }
+  66%  { transform: translate(0,0) scale(1); opacity: 1 }
+  100% { transform: translate(var(--gq-dx), var(--gq-dy)) scale(1); opacity: 0 }
+}
+@keyframes gq-boop {
+  from { transform: translate(-50%,-50%) scale(.3); opacity: .8 }
+  to   { transform: translate(-50%,-50%) scale(2.4); opacity: 0 }
+}
 
 .gq-earthquake { animation: gq-shake .45s infinite; }
 .gq-upsidedown { transform: rotate(180deg); transition: transform .8s ease; }
@@ -70,6 +84,11 @@ const CSS = `
   opacity: 0; animation: gq-flash .34s 4; }
 .gq-cursor { position:fixed; font-size:88px; z-index:9200; pointer-events:none; transform:translate(-50%,-50%);
   filter: drop-shadow(0 0 12px rgba(0,0,0,.6)); transition: transform .05s linear; }
+/* pointer-events:none is load-bearing — a prank must never eat a click. */
+.gq-hand { position:fixed; font-size:72px; line-height:1; z-index:9150; pointer-events:none;
+  filter: drop-shadow(0 6px 12px rgba(0,0,0,.55)); animation: gq-poke 1.9s cubic-bezier(.34,1.1,.64,1) forwards; }
+.gq-boop { position:fixed; width:54px; height:54px; border-radius:50%; z-index:9140; pointer-events:none;
+  border:3px solid #5865f2; animation: gq-boop .55s ease-out forwards; }
 
 .gq-full { position:fixed; inset:0; z-index:9500; display:flex; flex-direction:column;
   align-items:center; justify-content:center; text-align:center; padding:6vw; cursor:pointer;
@@ -258,6 +277,74 @@ function cursedCursor(ms) {
   }, ms);
 }
 
+// Cole Mode: hands reach in from the edges and poke at the victim. Hands are
+// appended to <body> with pointer-events:none so they can never swallow a
+// click, and every element is tracked so expiry cleans up unconditionally.
+let coleUp = false;
+
+const COLE_EDGES = [
+  { emoji: "👉", dx: "-170px", dy: "0px" },
+  { emoji: "👈", dx: "170px", dy: "0px" },
+  { emoji: "🫳", dx: "0px", dy: "-170px" },
+  { emoji: "🤲", dx: "0px", dy: "170px" },
+];
+
+function coleMode(ms) {
+  if (coleUp) return;
+  coleUp = true;
+  const live = new Set();
+
+  const poke = () => {
+    const edge = COLE_EDGES[Math.floor(Math.random() * COLE_EDGES.length)];
+    const hand = document.createElement("div");
+    hand.className = "gq-hand";
+    hand.textContent = edge.emoji;
+    hand.style.setProperty("--gq-dx", edge.dx);
+    hand.style.setProperty("--gq-dy", edge.dy);
+    if (edge.dx !== "0px") {
+      hand.style.left = edge.dx.startsWith("-") ? "5vw" : "calc(95vw - 72px)";
+      hand.style.top = 20 + Math.random() * 52 + "vh";
+    } else {
+      hand.style.left = 12 + Math.random() * 68 + "vw";
+      hand.style.top = edge.dy.startsWith("-") ? "7vh" : "calc(84vh - 72px)";
+    }
+    document.body.appendChild(hand);
+    live.add(hand);
+
+    // Ripple at the fingertip, timed to the contact frame of the animation.
+    const boop = setTimeout(() => {
+      const box = hand.getBoundingClientRect();
+      const ripple = document.createElement("div");
+      ripple.className = "gq-boop";
+      ripple.style.left = box.left + box.width / 2 + "px";
+      ripple.style.top = box.top + box.height / 2 + "px";
+      document.body.appendChild(ripple);
+      live.add(ripple);
+      setTimeout(() => {
+        ripple.remove();
+        live.delete(ripple);
+      }, 600);
+    }, 760);
+
+    setTimeout(() => {
+      clearTimeout(boop);
+      hand.remove();
+      live.delete(hand);
+    }, 2000);
+  };
+
+  poke();
+  const timer = setInterval(poke, 1750);
+  setTimeout(() => {
+    clearInterval(timer);
+    setTimeout(() => {
+      for (const node of live) node.remove();
+      live.clear();
+      coleUp = false;
+    }, 2100);
+  }, ms);
+}
+
 // Guarded like every other effect: without this, concurrent air horns
 // composite their white layers and run at independent phase, which pushes
 // both the brightness and the flashes-per-second past the safe limits.
@@ -440,6 +527,9 @@ export function runPrank(kind, fromName) {
       break;
     case "cursedcursor":
       cursedCursor(10000);
+      break;
+    case "colemode":
+      coleMode(9500);
       break;
     case "butterfingers":
       butterFingers(10000);

@@ -18,6 +18,7 @@ const AUTH_SWEEP_EVERY = 25; // new identities between sweeps
 const PRANK_KINDS = new Set([
   "earthquake", "upsidedown", "vaporwave", "emojirain", "fakekick", "airhorn",
   "drunk", "butterfingers", "cursedcursor", "bluescreen", "tiny", "spin",
+  "colemode",
 ]);
 
 // Everything a client can spam goes through the rate limiter. `rtc` is
