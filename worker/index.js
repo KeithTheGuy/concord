@@ -59,7 +59,7 @@ export class ConcordServer {
     this.env = env;
     this.sessions = new Map(); // ws -> session object
     this.rate = new Map(); // sid -> {count, windowStart}
-    this.prankAt = new Map(); // sid -> last prank timestamp
+    this.prankAt = new Map(); // userId -> last prank timestamp (survives reconnects)
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
     );
@@ -150,6 +150,12 @@ export class ConcordServer {
       }
     }
     return false;
+  }
+
+  prunePranks(now) {
+    for (const [userId, at] of this.prankAt) {
+      if (now - at > PRANK_COOLDOWN_MS) this.prankAt.delete(userId);
+    }
   }
 
   overRate(sid) {
@@ -430,7 +436,9 @@ export class ConcordServer {
         if (!PRANK_KINDS.has(kind)) return;
 
         const now = Date.now();
-        const last = this.prankAt.get(s.sid) || 0;
+        // Keyed on userId, not sid: reconnecting or opening a second tab
+        // must not hand you a fresh cooldown.
+        const last = this.prankAt.get(s.userId) || 0;
         const waited = now - last;
         if (waited < PRANK_COOLDOWN_MS) {
           ws.send(
@@ -441,15 +449,18 @@ export class ConcordServer {
           );
           return;
         }
-        this.prankAt.set(s.sid, now);
 
         const payload = { type: "pranked", from: s.sid, name: s.name, kind };
         const to = String(m.to || "");
         if (to === "*") {
           this.broadcast(payload, ws); // everyone but the gremlin
         } else if (!this.sendTo(to, payload)) {
+          // Target vanished — say so and don't charge them the cooldown.
+          ws.send(JSON.stringify({ type: "prank-missed" }));
           return;
         }
+        this.prankAt.set(s.userId, now); // only a delivered prank costs cooldown
+        this.prunePranks(now);
         ws.send(JSON.stringify({ type: "prank-sent", kind }));
         break;
       }
@@ -486,10 +497,9 @@ export class ConcordServer {
   dropSession(ws) {
     const s = this.sessions.get(ws);
     this.sessions.delete(ws);
-    if (s) {
-      this.rate.delete(s.sid);
-      this.prankAt.delete(s.sid);
-    }
+    // prankAt deliberately survives disconnects (see the prank case); it is
+    // pruned by age instead.
+    if (s) this.rate.delete(s.sid);
     if (s?.joined) {
       this.broadcast({ type: "member-leave", sid: s.sid });
     }

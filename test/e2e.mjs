@@ -195,11 +195,70 @@ try {
     { timeout: 5000 }
   );
   ok("victim is told who pranked them");
+  const prankSentAt = Date.now();
   // Effects must clean themselves up.
   await pageB.waitForFunction(() => document.querySelectorAll("#gq-layer .gq-drop").length === 0, {
     timeout: 20000,
   });
   ok("prank auto-expires (no lingering DOM)");
+
+  // Flash rate must stay under the WCAG 2.3.1 three-per-second threshold.
+  const flashRate = await pageB.evaluate(() => {
+    const probe = document.createElement("div");
+    probe.className = "gq-flash";
+    document.body.appendChild(probe);
+    const cs = getComputedStyle(probe);
+    const out = { dur: cs.animationDuration, opacityPeak: null };
+    probe.remove();
+    return out;
+  });
+  const cycleSeconds = parseFloat(flashRate.dur);
+  if (!(cycleSeconds >= 0.333)) bad("flash rate under 3/sec", `${(1 / cycleSeconds).toFixed(2)} flashes/sec`);
+  else ok(`air horn flash is ${(1 / cycleSeconds).toFixed(1)} flashes/sec (WCAG limit 3)`);
+
+  // Butter Fingers must never corrupt a message the victim actually sends.
+  await pageB.click("#btn-gremlin");
+  await pageB.waitForSelector("#gremlin-modal:not(.hidden)");
+  await pageB.selectOption("#gm-target", { index: 1 });
+  await pageB.click('.gm-card:has(.gm-label:text-is("Butter Fingers"))');
+  await pageA.waitForFunction(
+    () => [...document.querySelectorAll(".toast")].some((t) => /Butter Fingers/.test(t.textContent)),
+    { timeout: 8000 }
+  );
+  await pageA.locator("#input").pressSequentially("integrity check one two", { delay: 15 });
+  const scrambled = await pageA.inputValue("#input");
+  await pageA.press("#input", "Enter");
+  await pageB.waitForFunction(
+    () => document.querySelector("#messages").textContent.includes("integrity check"),
+    { timeout: 8000 }
+  );
+  const landed = await pageB.evaluate(() => {
+    const nodes = [...document.querySelectorAll(".msg-content")];
+    return nodes.map((n) => n.textContent.trim()).find((t) => t.includes("integrity check"));
+  });
+  if (landed !== "integrity check one two")
+    bad("butterfingers corrupted a sent message", `sent "${landed}" (composer showed "${scrambled}")`);
+  else ok(`butter fingers scrambles the composer ("${scrambled}") but the sent message is intact`);
+
+  // Full-screen pranks must be dismissable, not a lockout.
+  const waitLeft = 15500 - (Date.now() - prankSentAt);
+  if (waitLeft > 0) await pageA.waitForTimeout(waitLeft); // A's gremlin cooldown
+  await pageA.click("#btn-gremlin");
+  await pageA.waitForSelector("#gremlin-modal:not(.hidden)");
+  await pageA.selectOption("#gm-target", { index: 1 });
+  await pageA.click('.gm-card:has(.gm-label:text-is("Blue Screen"))');
+  await pageB.waitForSelector(".gq-bsod", { timeout: 8000 });
+  ok("fake blue screen renders on the victim");
+  await pageB.keyboard.press("Escape");
+  await pageB.waitForFunction(() => !document.querySelector(".gq-full"), { timeout: 3000 });
+  ok("victim can dismiss a full-screen prank with Escape (no lockout)");
+  const settingsReachable = await pageB.evaluate(() => {
+    document.getElementById("btn-settings").click();
+    return !document.getElementById("settings-modal").classList.contains("hidden");
+  });
+  if (!settingsReachable) bad("settings reachable after prank", "opt-out is unreachable");
+  else ok("opt-out (Settings) is reachable again after dismissal");
+  await pageB.click("#settings-modal .modal-close");
 
   // ---- console/page errors ------------------------------------------------------------
   const realErrors = [...errorsA, ...errorsB].filter(
@@ -208,7 +267,7 @@ try {
   if (realErrors.length) bad("zero console/page errors", realErrors.join(" | "));
   else ok("no console or page errors on either client");
 } catch (err) {
-  bad("e2e flow", err.message);
+  bad("e2e flow", err.stack || err.message);
 } finally {
   await browser.close();
 }

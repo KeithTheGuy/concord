@@ -201,6 +201,25 @@ B.send({ type: "prank", to: aliceSid, kind: "not-a-real-prank" });
 await A.expectSilence("unknown prank kinds rejected", (m) => m.type === "pranked");
 ok("gremlin: prank relay, self-exclusion, 15s cooldown, unknown-kind rejection");
 
+// Cooldown must be keyed to the person, not the socket: reconnecting (or
+// opening a second tab) must not hand you a fresh prank.
+const A2 = connect("");
+await A2.open();
+A2.send({ type: "hello", userId: "user-alice", name: "Alice", color: "#ff5555", avatar: "🦊" });
+await A2.expect("Alice reconnect welcome", (m) => m.type === "welcome");
+A2.send({ type: "prank", to: bobSid, kind: "airhorn" });
+await A2.expect("cooldown survives reconnect", (m) => m.type === "prank-cooldown");
+await B.expectSilence("no prank slips through on reconnect", (m) => m.type === "pranked");
+A2.ws.close();
+ok("gremlin: cooldown is per-person, survives reconnects and extra tabs");
+
+// A prank aimed at someone who already left refunds the cooldown.
+B.send({ type: "prank", to: "ghost1234", kind: "airhorn" });
+await B.expect("prank-missed for absent target", (m) => m.type === "prank-missed");
+B.send({ type: "prank", to: aliceSid, kind: "tiny" });
+await A.expect("cooldown refunded after a miss", (m) => m.type === "pranked" && m.kind === "tiny");
+ok("gremlin: a prank that lands on nobody doesn't burn the cooldown");
+
 // --- 9. disconnect cleanup ------------------------------------------------------------
 B.ws.close();
 await A.expect("member-leave", (m) => m.type === "member-leave" && m.sid === bobSid);

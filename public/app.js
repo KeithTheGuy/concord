@@ -473,6 +473,11 @@ function handleServerMessage(m) {
       break;
     }
 
+    case "prank-missed": {
+      toast("They vanished before it landed. Cooldown refunded.", true);
+      break;
+    }
+
     case "prank-cooldown": {
       toast(`Gremlin cooldown — ${m.seconds}s until you can strike again.`, true);
       break;
@@ -980,6 +985,18 @@ setInterval(renderTyping, 1500);
 
 /* ------------------------------- channels ------------------------------- */
 
+// One history request per channel at a time (the scroll handler fires every
+// frame). The timeout releases the lock if the server ever drops the request,
+// so a channel can't get permanently stuck without history.
+function requestHistory(chanId, before) {
+  if (state.historyPending.has(chanId)) return;
+  state.historyPending.add(chanId);
+  setTimeout(() => state.historyPending.delete(chanId), 8000);
+  const msg = { type: "history", chanId };
+  if (before) msg.before = before;
+  wsSend(msg);
+}
+
 function activateChannel(chanId) {
   state.activeChan = chanId;
   state.unread.delete(chanId);
@@ -990,10 +1007,7 @@ function activateChannel(chanId) {
   renderChatHeader();
   renderMessages(true);
   // Live messages may have created the cache entry — that is NOT history.
-  if (!state.historyLoaded.has(chanId) && !state.historyPending.has(chanId)) {
-    state.historyPending.add(chanId);
-    wsSend({ type: "history", chanId });
-  }
+  if (!state.historyLoaded.has(chanId)) requestHistory(chanId);
   $("input").focus();
 }
 
@@ -1529,10 +1543,7 @@ $("messages").addEventListener("scroll", () => {
   ) {
     const list = state.messages.get(state.activeChan) || [];
     const oldest = list.find((x) => !x.pending);
-    if (oldest) {
-      state.historyPending.add(state.activeChan);
-      wsSend({ type: "history", chanId: state.activeChan, before: oldest.id });
-    }
+    if (oldest) requestHistory(state.activeChan, oldest.id);
   }
 });
 

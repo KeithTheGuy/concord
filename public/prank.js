@@ -1,7 +1,10 @@
 // GREMLIN MODE — harmless visual/audio pranks you can fire at a friend.
-// Every effect is purely local to the victim's browser, auto-expires, and
-// ends by revealing who did it. Nothing here can destroy data or persist:
-// worst case the victim reloads the page and it's gone.
+// Design rules, all enforced below:
+//   * Purely cosmetic: a prank must never alter data the victim sends.
+//   * Always escapable: full-screen effects are dismissable by click or Esc.
+//   * Safe: flashing stays under the WCAG 2.3.1 three-per-second threshold,
+//     and motion-heavy effects are skipped for prefers-reduced-motion users.
+//   * Self-cleaning: every effect expires on its own and names its sender.
 
 export const PRANKS = [
   { kind: "earthquake", emoji: "🌋", label: "Earthquake", blurb: "Violently shakes their whole app" },
@@ -9,7 +12,7 @@ export const PRANKS = [
   { kind: "vaporwave", emoji: "🌴", label: "Vaporwave", blurb: "A E S T H E T I C overload" },
   { kind: "emojirain", emoji: "🌧️", label: "Emoji Rain", blurb: "Monsoon of emoji" },
   { kind: "fakekick", emoji: "🚪", label: "Fake Kick", blurb: "'You were removed' … psych" },
-  { kind: "airhorn", emoji: "📣", label: "Air Horn", blurb: "MLG airhorn + strobe" },
+  { kind: "airhorn", emoji: "📣", label: "Air Horn", blurb: "MLG airhorn + flash" },
   { kind: "drunk", emoji: "🍺", label: "Drunk Mode", blurb: "Wobbly, blurry, questionable" },
   { kind: "butterfingers", emoji: "🧈", label: "Butter Fingers", blurb: "Scrambles what they type" },
   { kind: "cursedcursor", emoji: "👁️", label: "Cursed Cursor", blurb: "Something follows their mouse" },
@@ -21,11 +24,20 @@ export const PRANKS = [
 const KINDS = new Set(PRANKS.map((p) => p.kind));
 export const isPrank = (kind) => KINDS.has(kind);
 
+// Effects that move the viewport; skipped entirely for reduced-motion users.
+const MOTION_KINDS = new Set(["earthquake", "spin", "drunk", "upsidedown"]);
+
 const app = () => document.getElementById("app");
+const reduceMotion = () =>
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 let audioCtx = null;
 
 /* ------------------------------ styles ---------------------------------- */
 
+// Flash timing note: 0.34s per cycle = 2.9 flashes/sec, below the WCAG 2.3.1
+// general flash threshold of 3/sec, and peak opacity is kept well under full
+// white so the luminance swing stays modest.
 const CSS = `
 @keyframes gq-shake { 0%,100%{transform:translate(0,0) rotate(0)} 10%{transform:translate(-9px,4px) rotate(-1deg)}
  20%{transform:translate(8px,-6px) rotate(1deg)} 30%{transform:translate(-7px,-4px) rotate(-1.2deg)}
@@ -36,7 +48,7 @@ const CSS = `
 @keyframes gq-wobble { 0%,100%{transform:rotate(-1.5deg) skewX(-2deg)} 50%{transform:rotate(1.5deg) skewX(2deg)} }
 @keyframes gq-spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
 @keyframes gq-fall { to { transform: translateY(105vh) rotate(var(--gq-spin,360deg)); opacity:.15 } }
-@keyframes gq-strobe { 0%,100%{opacity:0} 50%{opacity:.85} }
+@keyframes gq-flash { 0%,100%{opacity:0} 50%{opacity:.35} }
 @keyframes gq-pop { from{transform:scale(.7);opacity:0} to{transform:scale(1);opacity:1} }
 
 .gq-earthquake { animation: gq-shake .45s infinite; }
@@ -48,12 +60,13 @@ const CSS = `
 
 #gq-layer { position:fixed; inset:0; pointer-events:none; z-index:9000; overflow:hidden; }
 .gq-drop { position:absolute; top:-8vh; font-size:34px; animation: gq-fall linear forwards; }
-.gq-strobe { position:fixed; inset:0; background:#fff; z-index:9100; pointer-events:none; animation: gq-strobe .12s 14; }
+.gq-flash { position:fixed; inset:0; background:#fff; z-index:9100; pointer-events:none;
+  animation: gq-flash .34s 4; }
 .gq-cursor { position:fixed; font-size:88px; z-index:9200; pointer-events:none; transform:translate(-50%,-50%);
   filter: drop-shadow(0 0 12px rgba(0,0,0,.6)); transition: transform .05s linear; }
 
 .gq-full { position:fixed; inset:0; z-index:9500; display:flex; flex-direction:column;
-  align-items:center; justify-content:center; text-align:center; padding:6vw;
+  align-items:center; justify-content:center; text-align:center; padding:6vw; cursor:pointer;
   font-family:"Segoe UI",system-ui,sans-serif; animation: gq-pop .18s ease; }
 .gq-kick { background:#1e1f22; color:#f2f3f5; }
 .gq-kick h1 { font-size:clamp(24px,4vw,42px); margin:0 0 12px; color:#f23f43; }
@@ -65,6 +78,12 @@ const CSS = `
 .gq-reveal { margin-top:28px; font-size:clamp(18px,2.4vw,30px); font-weight:800; color:#5865f2;
   background:#fff; padding:10px 22px; border-radius:10px; animation: gq-pop .2s ease; }
 .gq-kick .gq-reveal { background:#5865f2; color:#fff; }
+.gq-dismiss { position:fixed; top:14px; right:18px; font-size:13px; opacity:.75;
+  background:rgba(0,0,0,.35); color:#fff; padding:6px 12px; border-radius:6px; }
+
+/* Toasts must stay visible above prank overlays so the victim always sees
+   who did it, even mid-BSOD. */
+#toasts { z-index: 9600 !important; }
 
 /* gremlin picker UI */
 #gm-pranks { display:grid; grid-template-columns:repeat(auto-fill,minmax(148px,1fr)); gap:8px; margin-top:8px; }
@@ -100,19 +119,38 @@ function layer() {
   return node;
 }
 
-// Applies a class to #app for `ms`, cleaning up even if pranks overlap.
+function dropLayerIfEmpty() {
+  const node = document.getElementById("gq-layer");
+  if (node && !node.childNodes.length) node.remove();
+}
+
+/* --------------------- one transform prank at a time --------------------- */
+
+// Transform-based effects can't compose (upsidedown + tiny would fight over
+// the same property), and two of the same kind would truncate each other's
+// timer. So the newest one replaces whatever is running.
+let activeTransform = null; // {cls, timer}
+
 function timedClass(cls, ms) {
   const root = app();
   if (!root) return;
+  if (activeTransform) {
+    clearTimeout(activeTransform.timer);
+    root.classList.remove(activeTransform.cls);
+  }
   root.classList.add(cls);
-  setTimeout(() => root.classList.remove(cls), ms);
+  const timer = setTimeout(() => {
+    root.classList.remove(cls);
+    if (activeTransform && activeTransform.timer === timer) activeTransform = null;
+  }, ms);
+  activeTransform = { cls, timer };
 }
 
 /* ------------------------------- sounds --------------------------------- */
 
 function ctx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === "suspended") audioCtx.resume();
+  if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
   return audioCtx;
 }
 
@@ -181,7 +219,10 @@ function emojiRain(ms) {
   const timer = setInterval(spawn, 70);
   setTimeout(() => {
     clearInterval(timer);
-    setTimeout(() => drops.forEach((d) => d.remove()), 4200);
+    setTimeout(() => {
+      drops.forEach((d) => d.remove());
+      dropLayerIfEmpty();
+    }, 4200);
   }, ms);
 }
 
@@ -203,52 +244,118 @@ function cursedCursor(ms) {
   }, ms);
 }
 
-function strobe() {
+function flash() {
+  if (reduceMotion()) return;
   const s = document.createElement("div");
-  s.className = "gq-strobe";
+  s.className = "gq-flash";
   document.body.appendChild(s);
-  setTimeout(() => s.remove(), 1800);
+  setTimeout(() => s.remove(), 1500);
 }
 
-// Scrambles characters as they're typed — reverted on expiry, and the real
-// text is never sent scrambled (we restore before the timer ends).
+// Scrambles characters as they appear, but the pristine text is restored the
+// instant the victim commits (Enter) — a prank must never corrupt real data.
 function butterFingers(ms) {
   const input = document.getElementById("input");
   if (!input) return;
+
+  // `truth` is what the victim actually typed; `shown` is the scrambled text
+  // in the box. Each keystroke is applied to `truth` (never to the already
+  // scrambled text), so the real message is always recoverable intact.
+  let truth = input.value;
+  let shown = input.value;
+  const scrambleOf = (s) =>
+    s.length < 2 ? s : s.slice(0, -2) + s[s.length - 1] + s[s.length - 2];
+
   const scramble = () => {
     const v = input.value;
-    if (v.length < 2) return;
-    const i = Math.max(0, v.length - 2);
-    input.value = v.slice(0, i) + v[i + 1] + v[i] + v.slice(i + 2);
+    if (v.length > shown.length && v.startsWith(shown)) {
+      truth += v.slice(shown.length); // characters appended
+    } else if (v.length < shown.length && shown.startsWith(v)) {
+      truth = truth.slice(0, v.length); // backspace
+    } else {
+      truth = v; // paste, mid-text edit, or post-send reset: resync
+    }
+    shown = scrambleOf(truth);
+    if (shown !== v) {
+      input.value = shown;
+      input.setSelectionRange(shown.length, shown.length);
+    }
   };
+  // Registered on document in CAPTURE phase: at the target itself listeners
+  // fire in registration order regardless of the capture flag, and the app's
+  // send handler was registered first — so capturing on an ancestor is the
+  // only way to restore the real text before the message is sent.
+  const restore = (e) => {
+    if (e.target === input && e.key === "Enter" && !e.shiftKey) input.value = truth;
+  };
+  const stop = () => {
+    input.removeEventListener("input", scramble);
+    document.removeEventListener("keydown", restore, true);
+    input.value = truth;
+  };
+
   input.addEventListener("input", scramble);
-  setTimeout(() => input.removeEventListener("input", scramble), ms);
+  document.addEventListener("keydown", restore, true);
+  setTimeout(stop, ms);
 }
 
+// Only one full-screen prank at a time, and always dismissable.
+let fullScreenUp = false;
+
 function fullScreenPrank({ className, build, revealText, ms }) {
+  if (fullScreenUp) return false;
+  fullScreenUp = true;
+
   const node = document.createElement("div");
   node.className = `gq-full ${className}`;
   build(node);
+
+  const hint = document.createElement("div");
+  hint.className = "gq-dismiss";
+  hint.textContent = "click anywhere or press Esc to dismiss";
+  node.appendChild(hint);
+
+  let revealTimer = null;
+  const close = () => {
+    if (!fullScreenUp) return;
+    fullScreenUp = false;
+    clearTimeout(revealTimer);
+    clearTimeout(autoTimer);
+    window.removeEventListener("keydown", onKey, true);
+    node.remove();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") close();
+  };
+
+  node.addEventListener("click", close);
+  window.addEventListener("keydown", onKey, true);
   document.body.appendChild(node);
-  setTimeout(() => {
+
+  revealTimer = setTimeout(() => {
     const reveal = document.createElement("div");
     reveal.className = "gq-reveal";
     reveal.textContent = revealText;
     node.appendChild(reveal);
   }, Math.max(900, ms - 1600));
-  setTimeout(() => node.remove(), ms);
+  const autoTimer = setTimeout(close, ms);
+  return true;
 }
 
 /* ------------------------------ dispatcher ------------------------------- */
 
 /**
  * Run a prank locally. `fromName` is the culprit, revealed to the victim.
- * Returns the human label so the caller can toast it.
+ * Returns the prank's metadata (so the caller can toast it), or null if the
+ * effect was skipped (unknown kind, reduced-motion, or one already on screen).
  */
 export function runPrank(kind, fromName) {
   ensureStyle();
   const meta = PRANKS.find((p) => p.kind === kind);
   if (!meta) return null;
+  // Respect the OS-level motion preference — the toast still reveals the
+  // sender, so the joke lands without the vestibular hit.
+  if (MOTION_KINDS.has(kind) && reduceMotion()) return meta;
   const who = fromName || "Someone";
 
   switch (kind) {
@@ -281,7 +388,7 @@ export function runPrank(kind, fromName) {
       break;
     case "airhorn":
       airhornBlast();
-      strobe();
+      flash();
       break;
     case "fakekick":
       fullScreenPrank({
@@ -319,7 +426,7 @@ export function runPrank(kind, fromName) {
           const t = setInterval(() => {
             n = Math.min(99, n + Math.ceil(Math.random() * 11));
             pct.textContent = `${n}% complete`;
-            if (n >= 99) clearInterval(t);
+            if (n >= 99 || !node.isConnected) clearInterval(t);
           }, 260);
         },
       });
