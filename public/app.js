@@ -1,7 +1,7 @@
 // Concord client — state, WebSocket protocol, and all UI.
 import { VoiceEngine } from "./voice.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
-import { startMascot, stopMascot } from "./mascot.js";
+import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
 
 /* ============================== constants =============================== */
 
@@ -18,6 +18,16 @@ const EMOJIS = (
   "🚀 🛸 🌙 ☀️ 🌊 🍀 🌵 ⛺ 🗿 💎 🔑 🛠️ 📌 ✅ ❌ ❓ ‼️ 💤"
 ).split(" ").filter(Boolean);
 const QUICK_REACTS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+
+// Voice changer presets, in semitones of pitch shift.
+const VOICE_FX = [
+  { id: "off", label: "Off — your actual voice", emoji: "🎙️", semis: 0 },
+  { id: "fem", label: "Feminine", emoji: "💁‍♀️", semis: 5 },
+  { id: "anime", label: "Anime girl", emoji: "🌸", semis: 8 },
+  { id: "chipmunk", label: "Chipmunk", emoji: "🐿️", semis: 12 },
+  { id: "deep", label: "Deeper", emoji: "🗿", semis: -5 },
+  { id: "demon", label: "Demon", emoji: "👹", semis: -9 },
+];
 
 /* =============================== storage ================================ */
 
@@ -42,7 +52,7 @@ const state = {
   settings: Object.assign(
     {
       micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100,
-      notifs: false, gremlin: true, mascot: true,
+      notifs: false, gremlin: true, mascot: true, fx: "off", fxPitch: 0, gorbHits: 0,
     },
     store.get("settings", {})
   ),
@@ -1378,6 +1388,17 @@ function openSettings() {
   $("set-notifs").checked = state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted";
   $("set-gremlin").checked = state.settings.gremlin;
   $("set-mascot").checked = state.settings.mascot;
+
+  const fxSelect = $("set-fx");
+  fxSelect.textContent = "";
+  for (const fx of VOICE_FX) {
+    const option = el("option", "", `${fx.emoji} ${fx.label}`);
+    option.value = fx.id;
+    if (fx.id === state.settings.fx) option.selected = true;
+    fxSelect.appendChild(option);
+  }
+  $("set-fx-pitch").value = state.settings.fxPitch;
+  $("set-fx-label").textContent = fmtSemis(state.settings.fxPitch);
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
   populateMics();
@@ -1436,10 +1457,78 @@ $("set-gremlin").onchange = (e) => {
   state.settings.gremlin = e.target.checked;
   store.set("settings", state.settings);
 };
+function launchMascot() {
+  startMascot({
+    sounds: () => state.settings.sounds,
+    hits: state.settings.gorbHits,
+    onHits(n) {
+      state.settings.gorbHits = n;
+      store.set("settings", state.settings);
+      if (n >= 5) toast("💤 Gorb is out cold. Revive him in Settings if you feel bad.");
+    },
+    onSquirt(on) {
+      $("btn-squirt").classList.toggle("on", on);
+    },
+  });
+}
+
+$("btn-squirt").onclick = () => {
+  if (!state.settings.mascot) {
+    toast("Gorb is switched off in Settings — nothing to spray.", true);
+    return;
+  }
+  const armed = setSquirt(!$("btn-squirt").classList.contains("on"));
+  $("btn-squirt").classList.toggle("on", armed);
+  if (armed) {
+    toast(mascotDown() ? "💦 Squirt gun out. He's already down." : "💦 Squirt gun out. Click to spray. Esc to stop.");
+  }
+};
+
+$("set-revive").onclick = () => {
+  reviveMascot();
+  toast("Gorb lives.");
+};
+
+const fmtSemis = (n) => (n > 0 ? `+${n}` : String(n));
+
+// Applies live — mid-sentence, even — because the shifter always sits in the
+// outgoing path and only its pitch parameter moves.
+function applyVoiceFx(id, pitch) {
+  state.settings.fx = id;
+  state.settings.fxPitch = pitch;
+  store.set("settings", state.settings);
+  voice.setEffect(pitch);
+  const preset = VOICE_FX.find((f) => f.id === id);
+  $("btn-fx").classList.toggle("on", pitch !== 0);
+  $("btn-fx").title = `Voice changer: ${preset ? preset.label : fmtSemis(pitch) + " semitones"}`;
+}
+
+$("set-fx").onchange = (e) => {
+  const preset = VOICE_FX.find((f) => f.id === e.target.value) || VOICE_FX[0];
+  applyVoiceFx(preset.id, preset.semis);
+  $("set-fx-pitch").value = preset.semis;
+  $("set-fx-label").textContent = fmtSemis(preset.semis);
+};
+$("set-fx-pitch").oninput = (e) => {
+  const pitch = +e.target.value;
+  const match = VOICE_FX.find((f) => f.semis === pitch);
+  applyVoiceFx(match ? match.id : "custom", pitch);
+  $("set-fx-label").textContent = fmtSemis(pitch);
+  if (match) $("set-fx").value = match.id;
+};
+
+// Quick cycle from the voice panel, for mid-call bits.
+$("btn-fx").onclick = () => {
+  const i = VOICE_FX.findIndex((f) => f.id === state.settings.fx);
+  const next = VOICE_FX[(i + 1) % VOICE_FX.length];
+  applyVoiceFx(next.id, next.semis);
+  toast(`${next.emoji} Voice: ${next.label}`);
+};
+
 $("set-mascot").onchange = (e) => {
   state.settings.mascot = e.target.checked;
   store.set("settings", state.settings);
-  if (state.settings.mascot) startMascot({ sounds: () => state.settings.sounds });
+  if (state.settings.mascot) launchMascot();
   else stopMascot();
 };
 $("set-notifs").onchange = async (e) => {
@@ -1634,7 +1723,7 @@ window.addEventListener("beforeunload", () => {
 function afterProfileReady() {
   $("app").classList.remove("hidden");
   renderMe();
-  if (state.settings.mascot) startMascot({ sounds: () => state.settings.sounds });
+  if (state.settings.mascot) launchMascot();
   const params = new URLSearchParams(location.search);
   const joinCode = (params.get("join") || "").toUpperCase();
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
@@ -1661,6 +1750,7 @@ renderServerRail();
 updateTitle();
 
 installPrankStyles();
+applyVoiceFx(state.settings.fx, state.settings.fxPitch); // restore the saved voice
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});

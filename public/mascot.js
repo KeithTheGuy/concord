@@ -8,6 +8,7 @@
 const SIZE = 150; // px tall — "big", as requested
 const GROUND = 12; // px above the bottom edge
 const SPEED = 78; // px per second
+const KO_AT = 5; // squirts before Gorb gives up on life
 
 const ACTIONS = ["wave", "spit", "dance", "nap", "look", "tap"];
 const LINES = {
@@ -59,7 +60,25 @@ const CSS = `
   font-family:"Segoe UI",system-ui,sans-serif; white-space:nowrap; box-shadow:0 6px 18px rgba(0,0,0,.45);
   animation: gorb-say 2.1s ease-out forwards; }
 
-@media (prefers-reduced-motion: reduce) { #gorb { display:none } }
+/* --- squirt gun --- */
+@keyframes gorb-squirt { to { transform: translate(var(--sx), var(--sy)) scale(.45); opacity: .1 } }
+@keyframes gorb-splash { from { transform: translate(-50%,-50%) scale(.3); opacity: 1 }
+                         to   { transform: translate(-50%,-50%) scale(1.9); opacity: 0 } }
+@keyframes gorb-flinch { 0%,100%{ filter:none } 50%{ filter: brightness(1.6) saturate(.4) } }
+
+body.gorb-armed, body.gorb-armed * { cursor: crosshair !important; }
+#gorb-gun { position:fixed; left:50%; bottom:-14px; z-index:8850; pointer-events:none;
+  font-size:58px; transform-origin:50% 78%; transition: transform .06s linear;
+  filter: drop-shadow(0 4px 10px rgba(0,0,0,.5)); }
+.gorb-drop { position:fixed; width:11px; height:11px; border-radius:50%; z-index:8830; pointer-events:none;
+  background:#8ddcff; box-shadow:0 0 9px rgba(141,220,255,.9); animation: gorb-squirt .3s linear forwards; }
+.gorb-splash { position:fixed; z-index:8840; pointer-events:none; font-size:40px;
+  animation: gorb-splash .5s ease-out forwards; }
+#gorb.soggy { filter: brightness(.84) saturate(.6); }
+#gorb.hit { animation: gorb-flinch .22s ease-in-out 2; }
+#gorb.ko .torso, #gorb.ko .leg-l, #gorb.ko .leg-r { animation: none !important; }
+
+@media (prefers-reduced-motion: reduce) { #gorb, #gorb-gun { display:none } }
 `;
 
 // Static markup — no user content is ever interpolated into it.
@@ -82,6 +101,10 @@ const BODY = `
     <ellipse cx="57" cy="46" rx="13" ry="14.5" fill="#fff"/>
     <circle class="pupil" data-eye="l" cx="30" cy="47" r="5.6" fill="#12261a"/>
     <circle class="pupil" data-eye="r" cx="57" cy="47" r="5.6" fill="#12261a"/>
+    <g class="ko-eyes" opacity="0" stroke="#12261a" stroke-width="4.2" stroke-linecap="round">
+      <path d="M23 39 L37 53 M37 39 L23 53"/>
+      <path d="M50 39 L64 53 M64 39 L50 53"/>
+    </g>
     <path class="mouth" d="M30 68 Q43 80 56 68" stroke="#12261a" stroke-width="4.5" fill="none" stroke-linecap="round"/>
   </g>
 </svg>`;
@@ -166,6 +189,13 @@ const SOUNDS = {
     for (let i = 0; i < 3; i++) tone({ type: "square", from: 190, to: 120, dur: 0.06, gain: 0.05, when: i * 0.16 });
   },
   step: () => tone({ type: "sine", from: 110, to: 70, dur: 0.05, gain: 0.022 }),
+  squirt: () => {
+    noiseBurst(0.2, 0.055);
+    tone({ from: 880, to: 1750, dur: 0.17, gain: 0.03 });
+  },
+  splash: () => noiseBurst(0.24, 0.05),
+  yelp: () => tone({ type: "square", from: 700, to: 1250, dur: 0.14, gain: 0.06 }),
+  ko: () => tone({ type: "sawtooth", from: 420, to: 68, dur: 0.85, gain: 0.06 }),
 };
 
 /* ------------------------------- helpers -------------------------------- */
@@ -256,8 +286,16 @@ function frame(now) {
   const dt = Math.min(0.05, (now - (lastFrame || now)) / 1000);
   lastFrame = now;
 
+  if (walker.mode === "ko") {
+    // Out cold: he stays where he fell, lying on his side.
+    el.style.transform = `translate(${walker.x}px, 0px) rotate(90deg)`;
+    raf = requestAnimationFrame(frame);
+    return;
+  }
+
   if (walker.mode === "walk") {
-    walker.x += SPEED * walker.dir * dt;
+    // Every soaking slows him down a little.
+    walker.x += SPEED * Math.max(0.45, 1 - hits * 0.13) * walker.dir * dt;
     const maxX = innerWidth - SIZE * 0.86;
     if (walker.x < 4) {
       walker.x = 4;
@@ -298,7 +336,151 @@ function frame(now) {
 
 const trackPointer = (e) => {
   pointer = { x: e.clientX, y: e.clientY };
+  aimGun();
 };
+
+/* ------------------------------ squirt gun ------------------------------- */
+
+let armed = false;
+let gun = null;
+let hits = 0;
+let koTimer = null;
+
+const GUN_X = () => innerWidth / 2;
+const GUN_Y = () => innerHeight - 34;
+
+function aimGun() {
+  if (!gun) return;
+  const angle = (Math.atan2(pointer.y - innerHeight, pointer.x - GUN_X()) * 180) / Math.PI;
+  // The water-pistol glyph points left, so undo that 180 to aim it.
+  gun.style.transform = `translateX(-50%) rotate(${angle - 180}deg)`;
+}
+
+function fire(e) {
+  if (!armed || !running) return;
+  const gx = GUN_X();
+  const gy = GUN_Y();
+  const tx = e.clientX;
+  const ty = e.clientY;
+  SOUNDS.squirt();
+  const jitter = () => (Math.random() - 0.5) * 24;
+  for (let i = 0; i < 9; i++) {
+    const drop = document.createElement("div");
+    drop.className = "gorb-drop";
+    drop.style.left = gx + jitter() * 0.4 + "px";
+    drop.style.top = gy + "px";
+    drop.style.setProperty("--sx", tx - gx + jitter() + "px");
+    drop.style.setProperty("--sy", ty - gy + jitter() + "px");
+    drop.style.animationDelay = i * 14 + "ms";
+    document.body.appendChild(drop);
+    setTimeout(() => drop.remove(), 500 + i * 14);
+  }
+  // Hit is tested when the water lands, not when you click — so he can dodge.
+  setTimeout(() => impact(tx, ty), 300);
+}
+
+function impact(x, y) {
+  const splash = document.createElement("div");
+  splash.className = "gorb-splash";
+  splash.textContent = "💦";
+  splash.style.left = x + "px";
+  splash.style.top = y + "px";
+  document.body.appendChild(splash);
+  setTimeout(() => splash.remove(), 520);
+  SOUNDS.splash();
+
+  if (!el || walker.mode === "ko") return;
+  const box = el.getBoundingClientRect();
+  const pad = 14;
+  const hit =
+    x >= box.left - pad && x <= box.right + pad && y >= box.top - pad && y <= box.bottom + pad;
+  if (hit) registerHit();
+}
+
+function registerHit() {
+  hits++;
+  hooks.onHits?.(hits);
+  SOUNDS.yelp();
+  el.classList.add("hit");
+  setTimeout(() => el?.classList.remove("hit"), 480);
+  if (hits >= 2) el.classList.add("soggy");
+
+  if (hits >= KO_AT) {
+    knockOut();
+    return;
+  }
+  say(pick(["HEY", "ow", "stop it", "rude!", "that's WATER", "im telling", "not the face"]));
+  // Bolt in the other direction — he's not going to stand there and take it.
+  walker.mode = "walk";
+  walker.dir = pointer.x > el.getBoundingClientRect().left ? -1 : 1;
+  walker.until = performance.now() + rand(2200, 3800);
+}
+
+function knockOut(silent = false) {
+  walker.mode = "ko";
+  walker.until = Infinity;
+  el.classList.add("ko", "soggy");
+  el.style.transformOrigin = "50% 100%";
+  setMouth(MOUTH_FLAT);
+  el.querySelector(".ko-eyes")?.setAttribute("opacity", "1");
+  for (const pupil of el.querySelectorAll(".pupil")) pupil.setAttribute("opacity", "0");
+  if (!silent) {
+    say("goodnight");
+    SOUNDS.ko();
+  }
+  zzz();
+  if (koTimer) clearInterval(koTimer);
+  koTimer = setInterval(zzz, 1700);
+}
+
+export function setSquirt(on) {
+  armed = !!on;
+  document.body.classList.toggle("gorb-armed", armed);
+  if (armed) {
+    if (!gun) {
+      gun = document.createElement("div");
+      gun.id = "gorb-gun";
+      gun.textContent = "🔫";
+      document.body.appendChild(gun);
+    }
+    aimGun();
+    // Capture phase, but nothing is prevented — the app stays fully usable.
+    window.addEventListener("click", fire, true);
+    window.addEventListener("keydown", escDisarm, true);
+  } else {
+    gun?.remove();
+    gun = null;
+    window.removeEventListener("click", fire, true);
+    window.removeEventListener("keydown", escDisarm, true);
+  }
+  return armed;
+}
+
+function escDisarm(e) {
+  if (e.key !== "Escape") return;
+  setSquirt(false);
+  hooks.onSquirt?.(false);
+}
+
+export function reviveMascot() {
+  hits = 0;
+  hooks.onHits?.(0);
+  if (koTimer) {
+    clearInterval(koTimer);
+    koTimer = null;
+  }
+  if (!el) return;
+  el.classList.remove("ko", "soggy", "hit");
+  el.style.transformOrigin = "";
+  el.querySelector(".ko-eyes")?.setAttribute("opacity", "0");
+  for (const pupil of el.querySelectorAll(".pupil")) pupil.setAttribute("opacity", "1");
+  setMouth(MOUTH_GRIN);
+  walker.mode = "walk";
+  walker.until = performance.now() + 1400;
+  say("i'm back");
+}
+
+export const mascotDown = () => walker.mode === "ko";
 
 /* --------------------------------- api ---------------------------------- */
 
@@ -331,17 +513,29 @@ export function startMascot(opts = {}) {
   running = true;
   lastFrame = 0;
   raf = requestAnimationFrame(frame);
-  setTimeout(() => running && say("i live here now"), 900);
+
+  // Restore how soaked he was last time; if he was out, he stays out.
+  hits = Math.max(0, Number(opts.hits) || 0);
+  if (hits >= 2) el.classList.add("soggy");
+  if (hits >= KO_AT) knockOut(true);
+  else setTimeout(() => running && walker.mode !== "ko" && say("i live here now"), 900);
 }
 
 export function stopMascot() {
   running = false;
   if (raf) cancelAnimationFrame(raf);
   raf = null;
+  if (koTimer) {
+    clearInterval(koTimer);
+    koTimer = null;
+  }
+  setSquirt(false);
   window.removeEventListener("mousemove", trackPointer);
   el?.remove();
   el = null;
-  for (const leftover of document.querySelectorAll(".gorb-spit, .gorb-zzz, .gorb-say")) leftover.remove();
+  for (const leftover of document.querySelectorAll(".gorb-spit, .gorb-zzz, .gorb-say, .gorb-drop, .gorb-splash")) {
+    leftover.remove();
+  }
 }
 
 export const mascotRunning = () => running;

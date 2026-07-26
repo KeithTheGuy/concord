@@ -59,6 +59,7 @@
           <span class="vs-title" id="vs-quality">Voice Connected</span>
           <span id="vs-channel"></span>
         </div>
+        <button id="btn-fx" title="Voice changer — click to switch">🎭</button>
         <button id="btn-share" title="Share your screen">🖥</button>
         <button id="btn-hangup" title="Disconnect">✕</button>
       </div>
@@ -84,6 +85,7 @@
       <span id="chan-name">general</span>
       <span id="chan-topic"></span>
       <div class="header-actions">
+        <button id="btn-squirt" class="pill-btn" title="Squirt gun — spray Gorb (Esc to put it away)">💦</button>
         <button id="btn-gremlin" class="pill-btn" title="Gremlin Mode — troll your friends">🃏</button>
         <button id="btn-invite" class="pill-btn">Invite</button>
         <button id="btn-members" title="Toggle member list">👥</button>
@@ -180,6 +182,10 @@
         <h2>Voice</h2>
         <label>Input device</label>
         <select id="set-mic"></select>
+        <label>Voice changer</label>
+        <select id="set-fx"></select>
+        <label>Pitch <span id="set-fx-label">+0</span> semitones</label>
+        <input type="range" id="set-fx-pitch" min="-12" max="12" step="1" value="0">
         <label class="check-row"><input type="checkbox" id="set-ptt"> Push to talk</label>
         <div id="ptt-key-row" class="hidden">
           <label>Push-to-talk key</label>
@@ -189,6 +195,7 @@
         <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
         <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
         <label class="check-row"><input type="checkbox" id="set-mascot" checked> Let Gorb wander the app</label>
+        <button id="set-revive" class="pill-btn">Revive Gorb</button>
         <label>Output volume <span id="set-vol-label">100%</span></label>
         <input type="range" id="set-volume" min="0" max="200" value="100">
       </section>

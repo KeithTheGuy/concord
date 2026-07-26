@@ -38,6 +38,9 @@ to the server, so only share it with people you want in.
 - **Voice channels** — real-time group voice (WebRTC mesh), speaking indicators,
   mute / deafen, push-to-talk with a bindable key, per-user volume (right-click someone
   in voice), input-device picker, join/leave sounds
+- **Voice changer** — real-time pitch shifting on your mic before it reaches the
+  call: Feminine, Anime girl, Chipmunk, Deeper, Demon, or dial any shift from
+  -12 to +12 semitones. Hit 🎭 in the voice panel to swap mid-sentence
 - **Screen share** — one click, shows as a tile above chat for everyone in voice
 - **Profiles** — name, emoji avatar, color, custom status; channel create/rename/delete;
   server rename; it remembers everything in your browser

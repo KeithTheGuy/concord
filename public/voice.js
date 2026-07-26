@@ -41,6 +41,12 @@ export class VoiceEngine {
     this.speakTimer = null;
     this.speakingState = new Map(); // sid -> {speaking, lastLoud}
     this._keyHandlersInstalled = false;
+    // Voice changer: mic -> pitch shifter -> the track peers actually receive.
+    this.fxReady = false;
+    this.fxSource = null;
+    this.fxNode = null;
+    this.fxDest = null;
+    this.outTrack = null;
   }
 
   get connected() {
@@ -61,6 +67,7 @@ export class VoiceEngine {
       throw err;
     }
     this.chanId = chanId;
+    await this._buildFxChain();
     this._applyTrackEnabled();
     this._watchLocalLevel();
     this._installPttHandlers();
@@ -83,6 +90,13 @@ export class VoiceEngine {
     for (const sid of [...this.peers.keys()]) this._closePeer(sid);
     this.peers.clear();
     if (this.shareStream) this._stopShareTracks();
+    if (this.fxSource) {
+      try {
+        this.fxSource.disconnect();
+      } catch {}
+      this.fxSource = null;
+    }
+    this.outTrack = null; // fxNode/fxDest are reused on the next join
     if (this.localStream) {
       for (const t of this.localStream.getTracks()) t.stop();
       this.localStream = null;
@@ -182,11 +196,51 @@ export class VoiceEngine {
   }
 
   _attachLocalAudio(peer) {
-    if (!this.localStream) return;
-    const track = this.localStream.getAudioTracks()[0];
+    const track = this._outgoingTrack();
     if (!track) return;
     const already = peer.pc.getSenders().some((s) => s.track && s.track.kind === "audio");
     if (!already) peer.pc.addTrack(track, this.localStream);
+  }
+
+  // What peers hear: the pitch-shifted output when the changer is available,
+  // otherwise the raw mic.
+  _outgoingTrack() {
+    return this.outTrack || this.localStream?.getAudioTracks()[0] || null;
+  }
+
+  async _buildFxChain() {
+    this.outTrack = null;
+    if (!this.localStream || !this.ctx?.audioWorklet) return;
+    try {
+      if (!this.fxReady) {
+        await this.ctx.audioWorklet.addModule("/voicefx-worklet.js");
+        this.fxReady = true;
+      }
+      if (this.fxSource) {
+        try {
+          this.fxSource.disconnect();
+        } catch {}
+      }
+      this.fxSource = this.ctx.createMediaStreamSource(this.localStream);
+      if (!this.fxNode) {
+        this.fxNode = new AudioWorkletNode(this.ctx, "voice-fx");
+        this.fxDest = this.ctx.createMediaStreamDestination();
+        this.fxNode.connect(this.fxDest);
+      }
+      this.fxSource.connect(this.fxNode);
+      this.setEffect(this.h.settings().fxPitch || 0);
+      this.outTrack = this.fxDest.stream.getAudioTracks()[0] || null;
+    } catch (err) {
+      console.warn("voice changer unavailable, sending raw mic", err);
+      this.outTrack = null;
+    }
+  }
+
+  // Live: changing this mid-call is heard immediately, no renegotiation,
+  // because the track peers hold is the shifter's output either way.
+  setEffect(semitones) {
+    const param = this.fxNode?.parameters.get("semitones");
+    if (param) param.value = Math.max(-24, Math.min(24, Number(semitones) || 0));
   }
 
   async handleRtc(from, data) {
@@ -423,14 +477,18 @@ export class VoiceEngine {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: this._micConstraints() });
       const newTrack = stream.getAudioTracks()[0];
       const old = this.localStream.getAudioTracks()[0];
-      for (const peer of this.peers.values()) {
-        const sender = peer.pc.getSenders().find((s) => s.track === old);
-        if (sender) await sender.replaceTrack(newTrack);
-      }
       old.stop();
       this.localStream.removeTrack(old);
       this.localStream.addTrack(newTrack);
       this._applyTrackEnabled();
+      // Rebind the shifter to the new mic. With the changer active the track
+      // peers hold is unchanged, so this usually needs no renegotiation.
+      await this._buildFxChain();
+      const outgoing = this._outgoingTrack();
+      for (const peer of this.peers.values()) {
+        const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === "audio");
+        if (sender && sender.track !== outgoing) await sender.replaceTrack(outgoing);
+      }
       this._watchLocalLevel();
     } catch {
       this.h.onError("Couldn't switch microphone.");
