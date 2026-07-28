@@ -36,6 +36,9 @@ to the server, so only share it with people you want in.
 - **Direct messages** — full 1:1 chat with history, reactions, edits, replies, pins,
   and **DM voice calls** (the 📞 button). Unread counts survive being offline.
   Click anyone in a server's member list to see their profile and DM them
+- **Group chats** — 👥 in the DM sidebar. Up to 10 people, rename it, add friends,
+  leave whenever. Unnamed groups name themselves after whoever's in them. Group
+  voice calls work identically, because a group is the same machinery as a 1:1
 - **A call is independent of what you're looking at.** Every server keeps its own live
   connection, so you can browse other servers, read DMs and chat anywhere while a voice
   call carries on untouched. The rail shows a green ring on whichever server holds it,
@@ -99,11 +102,18 @@ public/voicefx.js   the voice FX rack — presets are plain descriptions of a
                     signal chain, and buildFxGraph turns them into WebAudio
 public/flair.js     themes, turbo effects, XP curve, achievements
 test/      smoke.mjs (protocol) · e2e.mjs (two-browser incl. live WebRTC audio)
-           social.mjs (friends + DMs) · multirealm.mjs (a call surviving you
-           wandering off) · flair.mjs (offline-renders every voice preset to
-           prove it changes the signal) · voicefx.mjs (measures actual pitch)
-           desktop.mjs (Electron) · shot.mjs · icons.mjs
+           social.mjs (friends + DMs) · groups.mjs (group chats across three
+           browsers) · multirealm.mjs (a call surviving you wandering off)
+           flair.mjs (offline-renders every voice preset to prove it changes
+           the signal) · voicefx.mjs (measures actual pitch) · desktop.mjs
+           (Electron) · shot.mjs · icons.mjs
 ```
+
+A **group chat** is the same shape as a 1:1: the hub owns the membership list and
+mints one secret code, and the conversation is an ordinary ConcordServer that only
+members are ever told the code for. Membership is enforced hub-side — you can only
+add people you're actually friends with, and a bogus id is refused regardless of
+what the UI sends.
 
 One **ConcordServer** Durable Object per server holds channels, the last 300 messages
 per channel, pins, live presence and voice state, and relays WebRTC signaling. Voice

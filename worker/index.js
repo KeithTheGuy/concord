@@ -765,13 +765,21 @@ export class ConcordServer {
 
 const TAG_RE = /^[a-z0-9_.]{2,20}$/;
 const FRIEND_CAP = 250;
+const GDM_MAX_MEMBERS = 10;
+const GDM_CAP = 20; // group conversations per person
 const HUB_RATE_LIMITED = new Set([
   "hello", "friend-add", "friend-accept", "friend-decline", "friend-remove",
   "presence", "set-tag", "dm-open", "dm-nudge", "dm-read", "poke",
+  "gdm-create", "gdm-open", "gdm-leave", "gdm-add", "gdm-rename",
 ]);
 
 const frKey = (a, b) => `fr:${a}:${b}`;
+// Group ids start with "g" and user ids are UUIDs, so one unread namespace
+// serves both without any chance of collision.
 const unreadKey = (owner, other) => `unread:${owner}:${other}`;
+const groupKey = (id) => `gdm:${id}`;
+const userGroupKey = (uid, id) => `ugdm:${uid}:${id}`;
+const GDM_ID_RE = /^g[a-f0-9]{12}$/;
 
 export class ConcordHub {
   constructor(state, env) {
@@ -910,6 +918,46 @@ export class ConcordHub {
     }
   }
 
+  /* ------------------------------- groups -------------------------------- */
+  // A group DM is the same idea as a 1:1 one: the hub owns the membership list
+  // and the secret code, and the conversation itself is an ordinary
+  // ConcordServer that only the members are ever told the code for.
+
+  async loadGroup(id) {
+    if (!GDM_ID_RE.test(id)) return null;
+    return await this.state.storage.get(groupKey(id));
+  }
+
+  async publicGroup(group) {
+    const members = [];
+    for (const uid of group.members) {
+      const acct = await this.state.storage.get(`user:${uid}`);
+      members.push(this.publicUser(uid, acct));
+    }
+    return {
+      id: group.id,
+      code: group.code,
+      name: group.name,
+      icon: group.icon,
+      owner: group.owner,
+      members,
+    };
+  }
+
+  // Tells every current member something, optionally skipping one uid.
+  async tellGroup(group, payload, skipUid = null) {
+    for (const uid of group.members) {
+      if (uid === skipUid) continue;
+      this.sendToUser(uid, payload);
+    }
+  }
+
+  async saveGroup(group) {
+    const writes = { [groupKey(group.id)]: group };
+    for (const uid of group.members) writes[userGroupKey(uid, group.id)] = 1;
+    await this.state.storage.put(writes);
+  }
+
   async webSocketMessage(ws, raw) {
     if (typeof raw !== "string" || raw.length > 8000) return;
     let m;
@@ -993,6 +1041,17 @@ export class ConcordHub {
           else if (row.state === "out") outgoing.push(user);
         }
 
+        // Group conversations this account belongs to.
+        const groups = [];
+        const groupRows = await storage.list({ prefix: `ugdm:${uid}:` });
+        for (const key of groupRows.keys()) {
+          const group = await storage.get(groupKey(key.slice(`ugdm:${uid}:`.length)));
+          if (!group || !group.members.includes(uid)) continue;
+          const unread = (await storage.get(unreadKey(uid, group.id))) || 0;
+          if (unread) dmUnread[group.id] = unread;
+          groups.push(await this.publicGroup(group));
+        }
+
         ws.send(
           JSON.stringify({
             type: "hub-welcome",
@@ -1001,6 +1060,7 @@ export class ConcordHub {
             friends,
             incoming,
             outgoing,
+            groups,
             dmUnread,
           })
         );
@@ -1149,18 +1209,41 @@ export class ConcordHub {
       // their sidebar — and what survives until they're back online.
       case "dm-nudge": {
         if (!s.uid) return;
+        const acct = await this.account(s.uid);
+        const preview = cleanText(m.preview, 120);
+
+        // Group flavour: fan out to everyone else in the group.
+        if (m.gdm) {
+          const group = await this.loadGroup(cleanText(m.gdm, 40));
+          if (!group || !group.members.includes(s.uid)) return;
+          for (const uid of group.members) {
+            if (uid === s.uid) continue;
+            const key = unreadKey(uid, group.id);
+            const count = Math.min(((await storage.get(key)) || 0) + 1, 999);
+            await storage.put(key, count);
+            this.sendToUser(uid, {
+              type: "dm-nudge",
+              gdm: group.id,
+              name: acct?.name || "Someone",
+              groupName: group.name,
+              preview,
+              count,
+            });
+          }
+          break;
+        }
+
         const other = cleanText(m.uid, 40);
         const row = await storage.get(frKey(s.uid, other));
         if (row?.state !== "friend") return;
         const key = unreadKey(other, s.uid);
         const count = ((await storage.get(key)) || 0) + 1;
         await storage.put(key, Math.min(count, 999));
-        const acct = await this.account(s.uid);
         this.sendToUser(other, {
           type: "dm-nudge",
           uid: s.uid,
           name: acct?.name || "Someone",
-          preview: cleanText(m.preview, 120),
+          preview,
           count: Math.min(count, 999),
         });
         break;
@@ -1169,6 +1252,106 @@ export class ConcordHub {
       case "dm-read": {
         if (!s.uid) return;
         await storage.delete(unreadKey(s.uid, cleanText(m.uid, 40)));
+        break;
+      }
+
+      case "gdm-create": {
+        if (!s.uid) return;
+        const wanted = Array.isArray(m.uids) ? m.uids.map((u) => cleanText(u, 40)).filter(Boolean) : [];
+        // You can only pull in people you're actually friends with.
+        const invited = [];
+        for (const uid of wanted) {
+          if (uid === s.uid || invited.includes(uid)) continue;
+          const row = await storage.get(frKey(s.uid, uid));
+          if (row?.state === "friend") invited.push(uid);
+        }
+        if (!invited.length) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "Pick at least one friend for the group." }));
+          return;
+        }
+        if (invited.length + 1 > GDM_MAX_MEMBERS) {
+          ws.send(JSON.stringify({ type: "hub-error", error: `Groups cap out at ${GDM_MAX_MEMBERS} people.` }));
+          return;
+        }
+        const mine = await storage.list({ prefix: `ugdm:${s.uid}:` });
+        if (mine.size >= GDM_CAP) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "That's a lot of group chats. Leave one first." }));
+          return;
+        }
+        const members = [s.uid, ...invited];
+        const group = {
+          id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 12),
+          code: newServerCode() + newServerCode().slice(0, 4),
+          name: cleanText(m.name, 40) || "",
+          icon: cleanText(m.icon, 8) || "👥",
+          owner: s.uid,
+          members,
+          at: Date.now(),
+        };
+        await this.saveGroup(group);
+        const pub = await this.publicGroup(group);
+        await this.tellGroup(group, { type: "gdm-added", group: pub });
+        break;
+      }
+
+      case "gdm-open": {
+        if (!s.uid) return;
+        const group = await this.loadGroup(cleanText(m.id, 40));
+        if (!group || !group.members.includes(s.uid)) return;
+        await storage.delete(unreadKey(s.uid, group.id));
+        ws.send(JSON.stringify({ type: "gdm-ready", group: await this.publicGroup(group) }));
+        break;
+      }
+
+      case "gdm-add": {
+        if (!s.uid) return;
+        const group = await this.loadGroup(cleanText(m.id, 40));
+        if (!group || !group.members.includes(s.uid)) return;
+        const uid = cleanText(m.uid, 40);
+        if (!uid || group.members.includes(uid)) return;
+        const row = await storage.get(frKey(s.uid, uid));
+        if (row?.state !== "friend") {
+          ws.send(JSON.stringify({ type: "hub-error", error: "You can only add your own friends." }));
+          return;
+        }
+        if (group.members.length >= GDM_MAX_MEMBERS) {
+          ws.send(JSON.stringify({ type: "hub-error", error: `Groups cap out at ${GDM_MAX_MEMBERS} people.` }));
+          return;
+        }
+        group.members.push(uid);
+        await this.saveGroup(group);
+        const pub = await this.publicGroup(group);
+        await this.tellGroup(group, { type: "gdm-added", group: pub });
+        break;
+      }
+
+      case "gdm-rename": {
+        if (!s.uid) return;
+        const group = await this.loadGroup(cleanText(m.id, 40));
+        if (!group || !group.members.includes(s.uid)) return;
+        if (m.name !== undefined) group.name = cleanText(m.name, 40);
+        if (m.icon !== undefined) group.icon = cleanText(m.icon, 8) || group.icon;
+        await this.saveGroup(group);
+        await this.tellGroup(group, { type: "gdm-added", group: await this.publicGroup(group) });
+        break;
+      }
+
+      case "gdm-leave": {
+        if (!s.uid) return;
+        const group = await this.loadGroup(cleanText(m.id, 40));
+        if (!group || !group.members.includes(s.uid)) return;
+        group.members = group.members.filter((u) => u !== s.uid);
+        await storage.delete([userGroupKey(s.uid, group.id), unreadKey(s.uid, group.id)]);
+        ws.send(JSON.stringify({ type: "gdm-removed", id: group.id }));
+        if (group.members.length < 2) {
+          // Nobody left to talk to — drop the record entirely.
+          const leftovers = group.members.map((u) => userGroupKey(u, group.id));
+          await storage.delete([groupKey(group.id), ...leftovers]);
+          await this.tellGroup(group, { type: "gdm-removed", id: group.id });
+          break;
+        }
+        await storage.put(groupKey(group.id), group);
+        await this.tellGroup(group, { type: "gdm-added", group: await this.publicGroup(group) });
         break;
       }
 

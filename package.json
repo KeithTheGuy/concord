@@ -16,7 +16,8 @@
     "app": "electron .",
     "dist": "electron-builder --win",
     "multirealm": "node test/multirealm.mjs",
-    "flair": "node test/flair.mjs"
+    "flair": "node test/flair.mjs",
+    "groups": "node test/groups.mjs"
   },
   "devDependencies": {
     "electron": "^33.4.11",

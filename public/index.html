@@ -13,6 +13,24 @@
 </head>
 <body>
 
+<!-- =======================  SPLASH  =======================
+     Shown until the app is genuinely ready. Pure CSS so it paints on the very
+     first frame, before any script has parsed. -->
+<div id="splash">
+  <div class="splash-orbit">
+    <span class="splash-ring"></span>
+    <span class="splash-ring two"></span>
+    <span class="splash-ring three"></span>
+    <span class="splash-logo">🎧</span>
+    <span class="splash-dot d1"></span>
+    <span class="splash-dot d2"></span>
+    <span class="splash-dot d3"></span>
+  </div>
+  <div class="splash-word">CONCORD</div>
+  <div class="splash-sub" id="splash-sub">warming up the servers…</div>
+  <div class="splash-bar"><span class="splash-bar-fill"></span></div>
+</div>
+
 <!-- ======================= APP SHELL ======================= -->
 <div id="app" class="hidden">
 
@@ -65,6 +83,7 @@
       </button>
       <div class="chan-section-head">
         <span>Direct Messages</span>
+        <button class="chan-add" id="dm-group-btn" title="New group chat">👥</button>
         <button class="chan-add" id="dm-add-btn" title="Add a friend">+</button>
       </div>
       <div id="dm-list"></div>
@@ -314,6 +333,18 @@
     <input id="search-input" maxlength="100" placeholder="Search messages…" autocomplete="off">
     <label class="check-row"><input type="checkbox" id="search-all"> Search every channel in this server</label>
     <div id="search-results"></div>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- new group chat -->
+  <div class="modal hidden" id="group-modal">
+    <h1>👥 New Group Chat</h1>
+    <p class="modal-sub">Pick some friends. Group calls work exactly like any other voice channel.</p>
+    <label>Group name <span class="hint">— optional, it'll name itself otherwise</span></label>
+    <input id="gdm-name" maxlength="40" placeholder="The Council" autocomplete="off">
+    <label>Friends <span class="hint" id="gdm-count">1 of 10</span></label>
+    <div id="gdm-friends"></div>
+    <button id="gdm-create" class="primary-btn">Create Group</button>
     <button class="modal-close" data-close>✕</button>
   </div>
 

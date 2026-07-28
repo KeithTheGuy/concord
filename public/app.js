@@ -2,7 +2,7 @@
 import { VoiceEngine } from "./voice.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
-import { HubConnection } from "./hub.js";
+import { HubConnection, groupTitle } from "./hub.js";
 import { SOUNDBOARD, playSound } from "./sounds.js";
 import { VOICE_FX, FX_BY_ID } from "./voicefx.js";
 import {
@@ -185,6 +185,7 @@ function makeRealm(code, kind) {
     code,
     kind, // "guild" | "dm"
     peer: null, // the friend, when kind === "dm"
+    group: null, // the group record, when kind === "group"
     ws: null,
     wsState: "idle", // idle | connecting | open
     gotWelcome: false,
@@ -270,6 +271,36 @@ function el(tag, cls, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
+/* -------------------------------- splash --------------------------------- */
+// The splash is markup + CSS that paints before this file has even parsed.
+// All the JS does is narrate progress and take it away.
+
+let splashDone = false;
+
+function splashSay(text) {
+  const node = document.getElementById("splash-sub");
+  if (node && !splashDone) node.textContent = text;
+}
+
+function hideSplash(delay = 0) {
+  if (splashDone) return;
+  splashDone = true;
+  setTimeout(() => {
+    const node = document.getElementById("splash");
+    if (!node) return;
+    node.classList.add("gone");
+    setTimeout(() => node.remove(), 700);
+  }, delay);
+}
+
+// A stuck connection must never trap you behind a loading screen.
+setTimeout(() => {
+  if (!splashDone) {
+    splashSay("taking longer than usual…");
+    hideSplash(600);
+  }
+}, 6000);
+
 function toast(text, isError = false) {
   const t = el("div", "toast" + (isError ? " error" : ""), text);
   $("toasts").appendChild(t);
@@ -392,8 +423,25 @@ const hub = new HubConnection({
   onDmReady(uid, code, user) {
     openDmRealm(uid, code, user);
   },
-  onDmNudge(uid, name, preview) {
-    const code = hub.dmCodes.get(uid);
+  onGroupReady(group) {
+    openGroupRealm(group);
+  },
+  onGroupRemoved(id, group) {
+    if (group) toast(`You left "${groupTitle(group, hub.me?.uid)}".`);
+    const code = group?.code;
+    if (code) {
+      const wasActive = state.activeCode === code;
+      closeRealm(code);
+      if (wasActive) {
+        state.activeCode = state.servers[0]?.code || null;
+        goHome();
+      }
+    }
+    renderDmList();
+  },
+  onDmNudge(key, name, preview, isGroup) {
+    const uid = key;
+    const code = isGroup ? hub.groups.get(key)?.code : hub.dmCodes.get(key);
     const realm = code ? state.realms.get(code) : null;
     if (realm && realm.code === state.activeCode && state.view === "dm" && !document.hidden && document.hasFocus()) {
       hub.markDmRead(uid); // we're literally looking at it
@@ -408,8 +456,11 @@ const hub = new HubConnection({
     if (state.settings.sounds) voice.playCue("mention");
     updateTitle();
     if (notificationsReady()) {
+      const where = isGroup
+        ? `${name} • ${groupTitle(hub.groups.get(key) || {}, hub.me?.uid)}`
+        : `${name} — direct message`;
       try {
-        const n = new Notification(`🔔 ${name} — direct message`, {
+        const n = new Notification(`🔔 ${where}`, {
           body: preview || "(no preview)",
           icon: "/icon-192.png",
           tag: "concord-dm-" + uid,
@@ -417,7 +468,8 @@ const hub = new HubConnection({
         });
         n.onclick = () => {
           window.focus();
-          openDm(uid);
+          if (isGroup) openGroup(key);
+          else openDm(uid);
           n.close();
         };
       } catch {}
@@ -479,7 +531,7 @@ function openRealm(code, kind, intent) {
 
 function evictStaleDms() {
   const dms = [...state.realms.values()].filter(
-    (r) => r.kind === "dm" && r.code !== state.activeCode && r.code !== state.voiceCode
+    (r) => isDirect(r) && r.code !== state.activeCode && r.code !== state.voiceCode
   );
   if (dms.length <= MAX_DM_REALMS) return;
   dms.sort((a, b) => a.touched - b.touched);
@@ -496,7 +548,7 @@ function connectRealm(realm, intent) {
   let url = `${location.origin.replace(/^http/, "ws")}/ws?server=${encodeURIComponent(code)}`;
   if (intent?.kind === "create") {
     url += `&create=1&name=${encodeURIComponent(intent.name)}&icon=${encodeURIComponent(intent.icon)}`;
-  } else if (realm.kind === "dm") {
+  } else if (isDirect(realm)) {
     // The DM's Durable Object is created lazily the first time either friend
     // opens it; create=1 is a no-op once it exists.
     url += `&create=1&kind=dm&name=${encodeURIComponent("DM")}&icon=${encodeURIComponent("💬")}`;
@@ -541,6 +593,7 @@ function connectRealm(realm, intent) {
 
     if (!hadWelcome) {
       if (realm.intent?.kind === "join") {
+        hideSplash();
         toast("Couldn't join — double-check the invite code.", true);
         state.servers = state.servers.filter((s) => s.code !== code);
         store.set("servers", state.servers);
@@ -554,6 +607,7 @@ function connectRealm(realm, intent) {
       realm.failCount++;
       if (realm.failCount >= 5) {
         realm.failCount = 0;
+        hideSplash();
         toast(`Can't reach ${realm.meta?.name || code} right now — click it in the rail to retry.`, true);
         return;
       }
@@ -639,12 +693,13 @@ function handleServerMessage(realm, m) {
       realm.intent = null;
 
       // A DM is a ConcordServer too, but it never belongs in the server rail.
-      if (realm.kind === "dm") {
+      if (isDirect(realm)) {
         const chan = realm.channels.find((c) => c.type === "text");
         if (chan && !realm.activeChan) realm.activeChan = chan.id;
         if (live) {
           renderAll();
           if (realm.activeChan) activateChannel(realm.activeChan);
+          hideSplash(150);
         } else if (realm.activeChan && !realm.historyLoaded.has(realm.activeChan)) {
           requestHistoryIn(realm, realm.activeChan);
         }
@@ -684,6 +739,7 @@ function handleServerMessage(realm, m) {
         store.set("lastServer", realm.code);
         renderAll();
         if (target) activateChannel(target);
+        hideSplash(150);
       } else {
         renderServerRail();
         // Load enough to know whether anything in here needs your attention.
@@ -814,7 +870,7 @@ function handleServerMessage(realm, m) {
       if (live) renderTyping();
       // A friend typing at you shows up in the DM list even when you're
       // reading something else.
-      else if (realm.kind === "dm") renderDmList();
+      else if (isDirect(realm)) renderDmList();
       break;
     }
 
@@ -998,7 +1054,7 @@ const realmUserId = (realm) =>
 
 function notifyIfNeeded(realm, msg) {
   if (msg.author.userId === realmUserId(realm)) return;
-  const isDm = realm.kind === "dm";
+  const isDm = isDirect(realm);
   const pinged = isDm || mentionsMe(msg, realm);
   const looking =
     realm.code === state.activeCode &&
@@ -1173,8 +1229,11 @@ function sendCurrentMessage() {
   wsSend({ type: "msg", chanId: state.activeChan, content, nonce, replyTo: state.replyTo?.id });
   // The other half of a DM isn't connected to its Durable Object unless they
   // have it open, so the hub is what lights up their sidebar.
-  if (state.realmKind === "dm" && state.dmPeer) {
-    hub.nudgeDm(state.dmPeer.uid, content.slice(0, 120));
+  const realm = R();
+  if (realm?.kind === "dm" && realm.peer) {
+    hub.nudgeDm(realm.peer.uid, content.slice(0, 120));
+  } else if (realm?.kind === "group" && realm.group) {
+    hub.nudgeGroup(realm.group.id, content.slice(0, 120));
   }
   state.lastTypingSent = 0; // sending ends "typing"; next keystroke signals fresh
   input.value = "";
@@ -1325,7 +1384,7 @@ function switchToRealm(code) {
   if (!realm) return null;
   state.activeCode = code;
   realm.touched = Date.now();
-  state.view = realm.kind === "dm" ? "dm" : "server";
+  state.view = isDirect(realm) ? "dm" : "server";
   if (realm.kind === "guild") store.set("lastServer", code);
   realm.mentions = 0;
   applyView();
@@ -1360,6 +1419,106 @@ function openDmRealm(uid, code, user) {
   realm.peer = friend;
   switchToRealm(code);
   renderDmList();
+}
+
+/* ------------------------------ group DMs -------------------------------- */
+// A group is the same machinery as a 1:1 DM — the hub owns the membership and
+// the secret code, the conversation is an ordinary ConcordServer — so group
+// voice calls work for free too.
+
+function openGroup(id) {
+  const group = hub.groups.get(id);
+  if (!group) return;
+  if (group.code) openGroupRealm(group);
+  else hub.openGroup(id); // hub replies with gdm-ready, which lands here again
+}
+
+function openGroupRealm(group) {
+  hub.markDmRead(group.id);
+  const realm = openRealm(group.code, "group", { kind: "dm", code: group.code, gdm: group.id });
+  realm.group = group;
+  realm.peer = null;
+  switchToRealm(group.code);
+  renderDmList();
+}
+
+// Both flavours of direct conversation behave the same nearly everywhere.
+const isDirect = (realm) => realm?.kind === "dm" || realm?.kind === "group";
+
+function openNewGroupModal(seedUid) {
+  const friends = [...hub.friends.values()];
+  if (friends.length < 1) {
+    toast("You need at least one friend to start a group. Add someone first.", true);
+    return;
+  }
+  showModal("group-modal");
+  $("gdm-name").value = "";
+  const list = $("gdm-friends");
+  list.textContent = "";
+  const chosen = new Set(seedUid ? [seedUid] : []);
+  for (const f of friends) {
+    const row = el("label", "gdm-pick");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = chosen.has(f.uid);
+    box.onchange = () => {
+      if (box.checked) chosen.add(f.uid);
+      else chosen.delete(f.uid);
+      $("gdm-count").textContent = `${chosen.size + 1} of 10`;
+    };
+    const av = el("span", "avatar small", f.avatar);
+    av.style.background = f.color;
+    row.append(box, av, el("span", "gdm-pick-name", f.name));
+    list.appendChild(row);
+  }
+  $("gdm-count").textContent = `${chosen.size + 1} of 10`;
+  $("gdm-create").onclick = () => {
+    if (!chosen.size) {
+      toast("Pick at least one friend.", true);
+      return;
+    }
+    hub.createGroup($("gdm-name").value.trim(), [...chosen]);
+    closeModals();
+  };
+}
+
+function groupMenu(x, y, group) {
+  ctxMenu(x, y, [
+    { label: "Open", onClick: () => openGroup(group.id) },
+    {
+      label: "Rename Group",
+      onClick: () =>
+        promptModal("Group name", group.name || "", (v) => hub.renameGroup(group.id, v)),
+    },
+    { label: "Add Friend to Group", onClick: () => openAddToGroup(group) },
+    {
+      label: "Leave Group",
+      danger: true,
+      onClick: () =>
+        confirmModal(
+          `Leave "${groupTitle(group, hub.me?.uid)}"?`,
+          "You'll stop getting messages from it. The others carry on without you.",
+          () => hub.leaveGroup(group.id)
+        ),
+    },
+  ]);
+}
+
+function openAddToGroup(group) {
+  const inGroup = new Set(group.members.map((m) => m.uid));
+  const candidates = [...hub.friends.values()].filter((f) => !inGroup.has(f.uid));
+  if (!candidates.length) {
+    toast("Everyone you know is already in there.", true);
+    return;
+  }
+  ctxMenu(
+    window.innerWidth / 2 - 110,
+    140,
+    candidates.slice(0, 12).map((f) => ({
+      label: `${f.avatar} ${f.name}`,
+      onClick: () => hub.addToGroup(group.id, f.uid),
+    }))
+  );
 }
 
 /* -------------------------------- DM list -------------------------------- */
@@ -1397,7 +1556,30 @@ function renderDmList() {
     if (oa !== ob) return oa - ob;
     return a.name.localeCompare(b.name);
   });
-  if (!friends.length) {
+  // Groups sit above the 1:1 list, most-recently-noisy first.
+  const groups = [...hub.groups.values()].sort(
+    (a, b) => (hub.unread.get(b.id) || 0) - (hub.unread.get(a.id) || 0)
+  );
+  for (const g of groups) {
+    const active = state.view === "dm" && R()?.group?.id === g.id;
+    const row = el("div", "dm-row" + (active ? " active" : ""));
+    const icon = el("div", "avatar small group", g.icon || "👥");
+    row.appendChild(icon);
+    const col = el("div", "dm-col");
+    col.appendChild(el("span", "dm-name", groupTitle(g, hub.me?.uid)));
+    col.appendChild(el("span", "dm-sub", `${g.members.length} members`));
+    row.appendChild(col);
+    const gUnread = hub.unread.get(g.id);
+    if (gUnread) row.appendChild(el("span", "chan-badge", String(Math.min(gUnread, 99))));
+    row.onclick = () => openGroup(g.id);
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      groupMenu(e.clientX, e.clientY, g);
+    };
+    wrap.appendChild(row);
+  }
+
+  if (!friends.length && !groups.length) {
     const empty = el("div", "dm-empty", "No friends yet. Hit + to add someone by their tag.");
     wrap.appendChild(empty);
     return;
@@ -1432,6 +1614,7 @@ function renderDmList() {
 function friendMenu(x, y, f) {
   ctxMenu(x, y, [
     { label: "Message", onClick: () => openDm(f.uid) },
+    { label: "👥 Start Group With…", onClick: () => openNewGroupModal(f.uid) },
     { label: "Poke 👉", onClick: () => hub.poke(f.uid) },
     { label: "Copy Tag", onClick: () => copyText("@" + f.tag, "Tag copied") },
     {
@@ -1861,7 +2044,29 @@ function renderMe() {
   $("me-presence").title = pres.label;
 }
 
+// Until a conversation's socket has handed us its channels there is nowhere
+// for a message to go, and sendCurrentMessage would silently drop it. Lock the
+// composer instead, so the state is visible rather than quietly lossy.
+function syncComposer() {
+  const ready = !!state.activeChan && state.view !== "home";
+  const box = $("input");
+  box.disabled = !ready;
+  box.classList.toggle("waiting", !ready);
+  if (!ready && state.view !== "home") box.placeholder = "Connecting…";
+}
+
 function renderChatHeader() {
+  syncComposer();
+  const realm = R();
+  if (state.view === "dm" && realm?.kind === "group" && realm.group) {
+    const group = hub.groups.get(realm.group.id) || realm.group;
+    $("chan-hash").textContent = group.icon || "👥";
+    $("chan-name").textContent = groupTitle(group, hub.me?.uid);
+    const online = group.members.filter((m) => m.online && m.presence !== "invisible").length;
+    $("chan-topic").textContent = `${group.members.length} members · ${online} online`;
+    $("input").placeholder = `Message ${groupTitle(group, hub.me?.uid)}`;
+    return;
+  }
   if (state.view === "dm" && state.dmPeer) {
     const f = hub.friends.get(state.dmPeer.uid) || state.dmPeer;
     $("chan-hash").textContent = f.avatar || "💬";
@@ -2058,10 +2263,15 @@ function msgActions(msg) {
     reply.onclick = () => setReply(msg);
     actions.appendChild(reply);
     const pin = el("button", "", "📌");
-    pin.title = msg.pinned ? "Unpin" : "Pin to channel";
+    pin.title = msg.pinned ? "Unpin" : "Pin";
     pin.onclick = () => wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id });
     actions.appendChild(pin);
+    const copy = el("button", "", "📋");
+    copy.title = "Copy text";
+    copy.onclick = () => copyText(msg.content, "Message copied");
+    actions.appendChild(copy);
     if (msg.author.userId === myUserId()) {
+      actions.appendChild(el("span", "sep"));
       const edit = el("button", "", "✏");
       edit.title = "Edit";
       edit.onclick = () => {
@@ -2186,11 +2396,13 @@ function activateChannel(chanId) {
   if (!realm.unread.size) realm.mentions = 0;
   renderServerRail();
   if (realm.kind === "dm" && realm.peer) hub.markDmRead(realm.peer.uid);
+  if (realm.kind === "group" && realm.group) hub.markDmRead(realm.group.id);
   updateTitle();
   clearReply();
   state.editingId = null;
   renderChannels();
   renderChatHeader();
+  syncComposer();
   renderMessages(true);
   // Live messages may have created the cache entry — that is NOT history.
   if (!state.historyLoaded.has(chanId)) requestHistory(chanId);
@@ -2420,6 +2632,7 @@ function pickerRow(container, options, selected, onPick, isColor = false) {
 }
 
 function openOnboard() {
+  hideSplash(); // nothing to load for a first-time visitor
   showModal("onboard-modal");
   pickerRow($("ob-avatars"), AVATARS, obAvatar, (v) => (obAvatar = v));
   pickerRow($("ob-colors"), COLORS, obColor, (v) => (obColor = v), true);
@@ -3081,6 +3294,7 @@ $("dm-add-btn").onclick = () => {
   state.fvTab = "add";
   renderFriendsView();
 };
+$("dm-group-btn").onclick = () => openNewGroupModal();
 document.querySelectorAll("#fv-tabs button").forEach((b) => {
   b.onclick = () => {
     state.fvTab = b.dataset.tab;
@@ -3818,6 +4032,7 @@ function afterProfileReady() {
 
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
     history.replaceState(null, "", location.pathname);
+    splashSay("joining the server…");
     openRealm(joinCode, "guild", { kind: "join", code: joinCode });
     state.activeCode = joinCode;
     state.view = "server";
@@ -3829,11 +4044,13 @@ function afterProfileReady() {
   if (target) {
     state.activeCode = target.code;
     state.view = "server";
+    splashSay(`connecting to ${target.name || target.code}…`);
     renderAll();
   } else {
     state.view = "home";
     renderAll();
     renderFriendsView();
+    hideSplash();
     openJoinModal();
   }
 }
@@ -3858,4 +4075,4 @@ if ("serviceWorker" in navigator) {
 
 // Handle for the browser tests (and for poking at things in the console).
 // Everything here is client-side state the user already owns.
-window.__concord = { state, hub, voice, R, voiceRealm, switchToRealm, openDm };
+window.__concord = { state, hub, voice, R, voiceRealm, switchToRealm, openDm, openGroup };

@@ -2943,3 +2943,301 @@ body.turbo .mention.me {
 .achievement-title { font-weight: 800; font-size: 11px; letter-spacing: 0.08em; opacity: 0.85; }
 .achievement-name { font-weight: 700; font-size: 15px; }
 .achievement-desc { font-size: 12px; opacity: 0.9; }
+
+/* =========================================================================
+   SPLASH
+   Deliberately CSS-only so it paints on the first frame, before app.js has
+   even parsed. JS only ever removes it.
+   ========================================================================= */
+
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: radial-gradient(120% 120% at 50% 0%, #2b2d55 0%, var(--bg-rail) 62%);
+  transition: opacity 0.45s ease, visibility 0.45s ease;
+}
+
+#splash.gone {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.splash-orbit {
+  position: relative;
+  width: 132px;
+  height: 132px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.splash-logo {
+  font-size: 46px;
+  animation: splash-bob 2.4s ease-in-out infinite;
+  filter: drop-shadow(0 6px 18px rgba(88, 101, 242, 0.6));
+}
+
+@keyframes splash-bob {
+  0%, 100% { transform: translateY(-3px) scale(1); }
+  50% { transform: translateY(3px) scale(1.06); }
+}
+
+.splash-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--blurple);
+  animation: splash-spin 1.5s linear infinite;
+}
+
+.splash-ring.two {
+  inset: 14px;
+  border-top-color: transparent;
+  border-right-color: var(--green);
+  animation-duration: 2.1s;
+  animation-direction: reverse;
+}
+
+.splash-ring.three {
+  inset: 28px;
+  border-top-color: transparent;
+  border-left-color: var(--red);
+  animation-duration: 2.9s;
+}
+
+@keyframes splash-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Three dots riding the outer ring. */
+.splash-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: var(--blurple);
+  animation: splash-orbit 2.6s linear infinite;
+}
+
+.splash-dot.d2 { background: var(--green); animation-delay: -0.87s; }
+.splash-dot.d3 { background: var(--red); animation-delay: -1.73s; }
+
+@keyframes splash-orbit {
+  from { transform: rotate(0deg) translateX(64px); }
+  to { transform: rotate(360deg) translateX(64px); }
+}
+
+.splash-word {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: 0.38em;
+  text-indent: 0.38em;
+  color: var(--text-header);
+  animation: splash-fade 2.6s ease-in-out infinite;
+}
+
+@keyframes splash-fade {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+
+.splash-sub {
+  font-size: 13px;
+  color: var(--text-muted);
+  min-height: 18px;
+}
+
+.splash-bar {
+  width: 190px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.splash-bar-fill {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--blurple), transparent);
+  animation: splash-sweep 1.25s ease-in-out infinite;
+}
+
+@keyframes splash-sweep {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(320%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash-logo,
+  .splash-ring,
+  .splash-dot,
+  .splash-word,
+  .splash-bar-fill {
+    animation: none;
+  }
+  .splash-bar-fill { width: 100%; }
+}
+
+/* =========================================================================
+   Message hover toolbar
+   ========================================================================= */
+
+.msg-actions {
+  /* Kept mounted rather than display:none so it can animate in, and so the
+     buttons keep their hover targets while the mouse travels to them. */
+  display: flex;
+  opacity: 0;
+  transform: translateY(3px) scale(0.96);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  padding: 2px;
+  gap: 1px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-sidebar) 96%, transparent);
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(8px);
+  overflow: visible;
+  top: -18px;
+}
+
+.msg:hover .msg-actions,
+.msg-actions:focus-within {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.msg-actions button {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  position: relative;
+}
+
+.msg-actions button:hover {
+  background: var(--bg-active);
+  color: var(--text-header);
+  transform: translateY(-1px);
+}
+
+.msg-actions button:active {
+  transform: translateY(0) scale(0.92);
+}
+
+/* Little label above each action. */
+.msg-actions button::after {
+  content: attr(title);
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: var(--bg-rail);
+  color: var(--text-header);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+  z-index: 5;
+}
+
+.msg-actions button:hover::after {
+  opacity: 1;
+}
+
+.msg-actions .sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 2px;
+  background: rgba(255, 255, 255, 0.09);
+  flex: 0 0 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-actions,
+  .msg-actions button,
+  .msg-actions button::after {
+    transition: none;
+  }
+}
+
+/* =========================================================================
+   Group DMs
+   ========================================================================= */
+
+.avatar.group {
+  background: var(--bg-active) !important;
+  font-size: 15px;
+}
+
+.dm-col {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+
+.dm-col .dm-name { flex: 0 0 auto; }
+
+.dm-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#gdm-friends {
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 6px 0 12px;
+  border-radius: 8px;
+  background: var(--bg-rail);
+  padding: 6px;
+}
+
+.gdm-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.gdm-pick:hover { background: var(--bg-hover); }
+
+.gdm-pick input { width: 16px; height: 16px; accent-color: var(--blurple); }
+
+.gdm-pick-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#input:disabled {
+  cursor: default;
+  opacity: 0.6;
+}

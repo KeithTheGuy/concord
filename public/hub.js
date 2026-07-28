@@ -3,6 +3,16 @@
 // alongside the server/DM socket in app.js, so friend presence and DM pings
 // keep arriving no matter which server you happen to be looking at.
 
+// An unnamed group is titled by whoever is in it, like Discord does — which
+// means it renames itself as people come and go, and that's fine.
+export function groupTitle(group, myUid) {
+  if (group.name) return group.name;
+  const others = (group.members || []).filter((m) => m.uid !== myUid).map((m) => m.name);
+  if (!others.length) return "Empty group";
+  if (others.length <= 3) return others.join(", ");
+  return `${others.slice(0, 3).join(", ")} +${others.length - 3}`;
+}
+
 export class HubConnection {
   constructor(handlers) {
     this.h = handlers;
@@ -16,8 +26,12 @@ export class HubConnection {
     this.friends = new Map(); // uid -> {..user, dm}
     this.incoming = new Map(); // uid -> user (they asked you)
     this.outgoing = new Map(); // uid -> user (you asked them)
-    this.unread = new Map(); // uid -> count of unread DMs
+    // Unread is keyed by conversation: a friend's uid for a 1:1, a group id
+    // for a group. The two namespaces can't collide (group ids start with "g",
+    // user ids are UUIDs), so one map covers both.
+    this.unread = new Map();
     this.dmCodes = new Map(); // uid -> conversation code
+    this.groups = new Map(); // group id -> {id, code, name, icon, owner, members}
   }
 
   /* ------------------------------ transport ------------------------------ */
@@ -115,6 +129,7 @@ export class HubConnection {
         for (const f of m.friends) if (f.dm) this.dmCodes.set(f.uid, f.dm);
         this.incoming = new Map(m.incoming.map((u) => [u.uid, u]));
         this.outgoing = new Map(m.outgoing.map((u) => [u.uid, u]));
+        this.groups = new Map((m.groups || []).map((g) => [g.id, g]));
         this.unread = new Map(Object.entries(m.dmUnread || {}));
         this.h.onWelcome(m.you);
         this.h.onChange();
@@ -193,10 +208,35 @@ export class HubConnection {
         break;
       }
 
-      case "dm-nudge": {
-        this.unread.set(m.uid, m.count);
+      case "gdm-added": {
+        const known = this.groups.has(m.group.id);
+        this.groups.set(m.group.id, m.group);
         this.h.onChange();
-        this.h.onDmNudge(m.uid, m.name, m.preview);
+        if (!known) this.h.toast(`👥 You're in "${groupTitle(m.group, this.me?.uid)}".`);
+        break;
+      }
+
+      case "gdm-ready": {
+        this.groups.set(m.group.id, m.group);
+        this.unread.delete(m.group.id);
+        this.h.onGroupReady(m.group);
+        break;
+      }
+
+      case "gdm-removed": {
+        const group = this.groups.get(m.id);
+        this.groups.delete(m.id);
+        this.unread.delete(m.id);
+        this.h.onChange();
+        this.h.onGroupRemoved(m.id, group);
+        break;
+      }
+
+      case "dm-nudge": {
+        const key = m.gdm || m.uid;
+        this.unread.set(key, m.count);
+        this.h.onChange();
+        this.h.onDmNudge(key, m.name, m.preview, !!m.gdm);
         break;
       }
 
@@ -240,14 +280,34 @@ export class HubConnection {
   openDm(uid) {
     this.send({ type: "dm-open", uid });
   }
-  markDmRead(uid) {
-    if (!this.unread.has(uid)) return;
-    this.unread.delete(uid);
-    this.send({ type: "dm-read", uid });
+  // `key` is a friend's uid or a group id — same unread namespace either way.
+  markDmRead(key) {
+    if (!this.unread.has(key)) return;
+    this.unread.delete(key);
+    this.send({ type: "dm-read", uid: key });
     this.h.onChange();
   }
   nudgeDm(uid, preview) {
     this.send({ type: "dm-nudge", uid, preview });
+  }
+
+  createGroup(name, uids) {
+    this.send({ type: "gdm-create", name, uids });
+  }
+  openGroup(id) {
+    this.send({ type: "gdm-open", id });
+  }
+  addToGroup(id, uid) {
+    this.send({ type: "gdm-add", id, uid });
+  }
+  renameGroup(id, name) {
+    this.send({ type: "gdm-rename", id, name });
+  }
+  leaveGroup(id) {
+    this.send({ type: "gdm-leave", id });
+  }
+  nudgeGroup(id, preview) {
+    this.send({ type: "dm-nudge", gdm: id, preview });
   }
   pushProfile() {
     const p = this.h.profile();
