@@ -57,12 +57,29 @@ to the server, so only share it with people you want in.
 - **Inline previews** for image links and YouTube, **auto-idle** after 6 minutes (never
   overrides an explicit DND/Invisible), optional **read-aloud** for incoming messages,
   and per-person volume that's remembered forever, keyed to the person not the session
+- **Themes** — Midnight, Synthwave, Vaporwave, Nord, Matrix, Gold, Blossom. Every colour
+  in the app comes from a custom property, so a theme is just a different set of them
+- **⚡ TURBO MODE** — opt-in aurora background, glass panels, glowing speaking rings,
+  messages that slide in, and a burst of light every time you hit send. Purely
+  decorative, and the whole thing stands down under `prefers-reduced-motion`
+- **Polls** — `/poll Pizza tonight? | Yes | Absolutely` renders a real poll with live
+  bars. Voting is the reaction system underneath, so there's no new storage and one
+  vote each; switching your answer moves it rather than adding another
+- **Levels & achievements** — 23 of them, from First Word to Hydro Homicide. Entirely
+  local: your XP is never transmitted, so nobody can farm it, rank it, or judge you by it
 - **Voice channels** — real-time group voice (WebRTC mesh), speaking indicators,
   mute / deafen, push-to-talk with a bindable key, per-user volume (right-click someone
   in voice), input-device picker, join/leave sounds
-- **Voice changer** — real-time pitch shifting on your mic before it reaches the
-  call: Feminine, Anime girl, Chipmunk, Deeper, Demon, or dial any shift from
-  -12 to +12 semitones. Hit 🎭 in the voice panel to swap mid-sentence
+- **Voice changer** — a full FX rack on your mic before it reaches the call, not
+  just a pitch knob. **FredsVoice (ASMR)** is the headline: pitched down slightly,
+  presence-lifted around 8kHz, heavily compressed so breaths come up to meet the
+  loud bits, with a 17ms stereo ping-pong that puts it beside your head rather
+  than in a hallway. Also CB Radio, Telephone, Robot, Megaphone, Underwater,
+  Alien, Cavern, Ghost, Demon, Feminine, Anime, Chipmunk, Deeper — plus a pitch
+  slider that nudges any preset without losing its character. Hit 🎭 to swap
+  mid-sentence; nothing renegotiates, so nobody hears a gap
+- **Video** — 📹 turns your camera on, 🖥 shares your screen. Click any tile to
+  make it fill the stage
 - **Screen share** — one click, shows as a tile above chat for everyone in voice
 - **Profiles** — name, emoji avatar, color, custom status; channel create/rename/delete;
   server rename; it remembers everything in your browser
@@ -78,9 +95,14 @@ to the server, so only share it with people you want in.
 public/    static client (vanilla JS, no build step) — also an installable PWA
 worker/    Cloudflare Worker + ConcordServer and ConcordHub Durable Objects
 electron/  Windows desktop shell (loads the live site, like real Discord)
+public/voicefx.js   the voice FX rack — presets are plain descriptions of a
+                    signal chain, and buildFxGraph turns them into WebAudio
+public/flair.js     themes, turbo effects, XP curve, achievements
 test/      smoke.mjs (protocol) · e2e.mjs (two-browser incl. live WebRTC audio)
-           social.mjs (friends + DMs across two browsers) · desktop.mjs (Electron)
-           shot.mjs (screenshots) · icons.mjs (app icons)
+           social.mjs (friends + DMs) · multirealm.mjs (a call surviving you
+           wandering off) · flair.mjs (offline-renders every voice preset to
+           prove it changes the signal) · voicefx.mjs (measures actual pitch)
+           desktop.mjs (Electron) · shot.mjs · icons.mjs
 ```
 
 One **ConcordServer** Durable Object per server holds channels, the last 300 messages

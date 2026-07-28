@@ -1,7 +1,9 @@
-// Concord voice engine — WebRTC mesh audio + screen share.
+// Concord voice engine — WebRTC mesh audio + screen/camera video.
 // One RTCPeerConnection per remote peer in the same voice channel, signaled
 // over the server's addressed `rtc` relay using the perfect-negotiation
 // pattern (polite side = lexicographically smaller sid).
+
+import { buildFxGraph } from "./voicefx.js";
 
 const ICE = {
   iceServers: [
@@ -12,6 +14,10 @@ const ICE = {
 
 const SPEAK_THRESHOLD = 0.024;
 const SPEAK_HOLD_MS = 250;
+
+// Compares two FX specs ignoring pitch, so moving the pitch slider doesn't
+// tear down and rebuild the whole rack on every input event.
+const stripSemis = ({ semis, ...rest }) => rest;
 
 export class VoiceEngine {
   /**
@@ -47,6 +53,9 @@ export class VoiceEngine {
     this.fxNode = null;
     this.fxDest = null;
     this.outTrack = null;
+    this.rack = null; // the FX graph after the shifter
+    this.fxSpec = null; // the preset description currently applied
+    this.shareKind = null; // "screen" | "camera" | null
   }
 
   get connected() {
@@ -95,6 +104,10 @@ export class VoiceEngine {
         this.fxSource.disconnect();
       } catch {}
       this.fxSource = null;
+    }
+    if (this.rack) {
+      this.rack.dispose(); // oscillators in the rack must actually be stopped
+      this.rack = null;
     }
     this.outTrack = null; // fxNode/fxDest are reused on the next join
     if (this.localStream) {
@@ -208,6 +221,9 @@ export class VoiceEngine {
     return this.outTrack || this.localStream?.getAudioTracks()[0] || null;
   }
 
+  // mic -> pitch shifter (worklet) -> FX rack -> the track peers receive.
+  // fxDest never gets rebuilt, so swapping presets mid-call needs no
+  // renegotiation: the track everyone holds stays the same object.
   async _buildFxChain() {
     this.outTrack = null;
     if (!this.localStream || !this.ctx?.audioWorklet) return;
@@ -225,10 +241,9 @@ export class VoiceEngine {
       if (!this.fxNode) {
         this.fxNode = new AudioWorkletNode(this.ctx, "voice-fx");
         this.fxDest = this.ctx.createMediaStreamDestination();
-        this.fxNode.connect(this.fxDest);
       }
       this.fxSource.connect(this.fxNode);
-      this.setEffect(this.h.settings().fxPitch || 0);
+      this._rebuildRack();
       this.outTrack = this.fxDest.stream.getAudioTracks()[0] || null;
     } catch (err) {
       console.warn("voice changer unavailable, sending raw mic", err);
@@ -236,8 +251,40 @@ export class VoiceEngine {
     }
   }
 
-  // Live: changing this mid-call is heard immediately, no renegotiation,
-  // because the track peers hold is the shifter's output either way.
+  _rebuildRack() {
+    if (!this.fxNode || !this.fxDest) return;
+    try {
+      this.fxNode.disconnect();
+    } catch {}
+    if (this.rack) {
+      this.rack.dispose();
+      this.rack = null;
+    }
+    const spec = this.fxSpec || {};
+    const hasRack = Object.keys(spec).some((k) => k !== "semis");
+    if (!hasRack) {
+      this.fxNode.connect(this.fxDest); // pitch only
+      return;
+    }
+    this.rack = buildFxGraph(this.ctx, spec);
+    this.fxNode.connect(this.rack.input);
+    this.rack.output.connect(this.fxDest);
+  }
+
+  /**
+   * Applies a full voice preset. `pitchOverride` lets the settings slider nudge
+   * the pitch without abandoning the rest of the character.
+   * Live: heard immediately, mid-sentence.
+   */
+  setVoice(spec, pitchOverride) {
+    const next = { ...(spec || {}) };
+    if (typeof pitchOverride === "number") next.semis = pitchOverride;
+    const rackChanged = JSON.stringify(stripSemis(next)) !== JSON.stringify(stripSemis(this.fxSpec || {}));
+    this.fxSpec = next;
+    this.setEffect(next.semis || 0);
+    if (rackChanged && this.ctx) this._rebuildRack();
+  }
+
   setEffect(semitones) {
     const param = this.fxNode?.parameters.get("semitones");
     if (param) param.value = Math.max(-24, Math.min(24, Number(semitones) || 0));
@@ -549,6 +596,7 @@ export class VoiceEngine {
       muted: this.muted,
       deafened: this.deafened,
       sharing: !!this.shareStream,
+      shareKind: this.shareKind,
     });
   }
 
@@ -564,8 +612,30 @@ export class VoiceEngine {
     } catch {
       return; // user cancelled the picker
     }
+    this.shareKind = "screen";
     const track = this.shareStream.getVideoTracks()[0];
     track.onended = () => this.stopShare(); // browser "Stop sharing" button
+    for (const peer of this.peers.values()) this._attachShare(peer);
+    this._sendVoiceState();
+  }
+
+  // Camera rides the exact same transceiver as screen share — one outgoing
+  // video track per person, so you're either on camera or sharing a screen,
+  // never both. That keeps the receiving side unambiguous.
+  async startCamera() {
+    if (!this.connected || this.shareStream) return;
+    try {
+      this.shareStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        audio: false,
+      });
+    } catch {
+      this.h.onError("Camera blocked — check browser permissions.");
+      return;
+    }
+    this.shareKind = "camera";
+    const track = this.shareStream.getVideoTracks()[0];
+    track.onended = () => this.stopShare();
     for (const peer of this.peers.values()) this._attachShare(peer);
     this._sendVoiceState();
   }
@@ -595,6 +665,7 @@ export class VoiceEngine {
   _stopShareTracks() {
     for (const t of this.shareStream.getTracks()) t.stop();
     this.shareStream = null;
+    this.shareKind = null;
   }
 
   // ----------------------------------------------------------------- sounds

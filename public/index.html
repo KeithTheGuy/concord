@@ -78,6 +78,7 @@
           <span id="vs-channel"></span>
         </div>
         <button id="btn-fx" title="Voice changer — click to switch">🎭</button>
+        <button id="btn-camera" title="Turn on your camera">📹</button>
         <button id="btn-share" title="Share your screen">🖥</button>
         <button id="btn-hangup" title="Disconnect">✕</button>
       </div>
@@ -236,6 +237,25 @@
           <option value="dnd">⛔ Do Not Disturb</option>
           <option value="invisible">⚫ Invisible</option>
         </select>
+        <h2>Appearance</h2>
+        <label>Theme</label>
+        <select id="set-theme">
+          <option value="midnight">🌑 Midnight (default)</option>
+          <option value="synthwave">🌆 Synthwave</option>
+          <option value="vapor">🫧 Vaporwave</option>
+          <option value="nord">🧊 Nord</option>
+          <option value="matrix">🖥️ Matrix</option>
+          <option value="gold">🏆 Gold</option>
+          <option value="blossom">🌸 Blossom</option>
+        </select>
+        <label class="check-row"><input type="checkbox" id="set-turbo"> ⚡ TURBO MODE (aurora, glow, animations)</label>
+        <label>Your progress</label>
+        <div id="level-row">
+          <span class="level-badge" id="level-badge">1</span>
+          <span id="level-text">0 XP</span>
+        </div>
+        <div id="xp-bar"><div id="xp-fill" style="width:0%"></div></div>
+        <button id="set-achievements" class="pill-btn">🏅 Achievements</button>
       </section>
       <section>
         <h2>Voice</h2>
@@ -243,6 +263,7 @@
         <select id="set-mic"></select>
         <label>Voice changer</label>
         <select id="set-fx"></select>
+        <p class="fx-blurb" id="set-fx-blurb"></p>
         <label>Pitch <span id="set-fx-label">+0</span> semitones</label>
         <input type="range" id="set-fx-pitch" min="-12" max="12" step="1" value="0">
         <label class="check-row"><input type="checkbox" id="set-ptt"> Push to talk</label>
@@ -293,6 +314,14 @@
     <input id="search-input" maxlength="100" placeholder="Search messages…" autocomplete="off">
     <label class="check-row"><input type="checkbox" id="search-all"> Search every channel in this server</label>
     <div id="search-results"></div>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- achievements -->
+  <div class="modal hidden" id="achievements-modal">
+    <h1>🏅 Achievements</h1>
+    <p class="modal-sub" id="ach-sub">Entirely pointless. Collect them anyway.</p>
+    <div id="ach-list"></div>
     <button class="modal-close" data-close>✕</button>
   </div>
 

@@ -15,7 +15,8 @@
     "voicefx": "node test/voicefx.mjs",
     "app": "electron .",
     "dist": "electron-builder --win",
-    "multirealm": "node test/multirealm.mjs"
+    "multirealm": "node test/multirealm.mjs",
+    "flair": "node test/flair.mjs"
   },
   "devDependencies": {
     "electron": "^33.4.11",

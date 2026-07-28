@@ -597,7 +597,7 @@ export class ConcordServer {
         const chanId = String(m.chanId || "");
         const channels = (await storage.get("channels")) || [];
         if (!channels.some((c) => c.id === chanId && c.type === "voice")) return;
-        s.voice = { chanId, muted: !!m.muted, deafened: !!m.deafened, sharing: false };
+        s.voice = { chanId, muted: !!m.muted, deafened: !!m.deafened, sharing: false, shareKind: null };
         this.saveSession(ws, s);
         // Tell the joiner who is already in the room; the joiner initiates offers.
         const peers = [];
@@ -624,6 +624,11 @@ export class ConcordServer {
         if (m.muted !== undefined) s.voice.muted = !!m.muted;
         if (m.deafened !== undefined) s.voice.deafened = !!m.deafened;
         if (m.sharing !== undefined) s.voice.sharing = !!m.sharing;
+        // "screen" or "camera" — one outgoing video track each, so this tells
+        // the other clients how to label the tile.
+        if (m.shareKind !== undefined) {
+          s.voice.shareKind = m.shareKind === "camera" ? "camera" : m.shareKind === "screen" ? "screen" : null;
+        }
         this.saveSession(ws, s);
         this.broadcast({ type: "member-update", member: publicMember(s) });
         break;

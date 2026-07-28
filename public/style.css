@@ -2526,3 +2526,420 @@ body.mentioned #app { animation: mention-glow 0.9s ease-out; }
   color: var(--red);
   font-weight: 700;
 }
+
+/* =========================================================================
+   THEMES
+   Every colour in the app already comes from a custom property, so a theme is
+   just a different set of them on <html data-theme="...">. Nothing else in the
+   stylesheet needs to know a theme system exists.
+   ========================================================================= */
+
+html[data-theme="synthwave"] {
+  --bg-chat: #1b1033;
+  --bg-sidebar: #150c2a;
+  --bg-rail: #0d0720;
+  --bg-input: #241645;
+  --bg-hover: #2b1a52;
+  --bg-active: #3a2270;
+  --blurple: #ff2e97;
+  --blurple-hover: #d81f7c;
+  --green: #22e0c0;
+  --red: #ff3b6b;
+  --yellow: #ffcc44;
+  --text: #e9dcff;
+  --text-muted: #9d86c9;
+  --text-header: #fff3ff;
+  --glow: 0 0 12px rgba(255, 46, 151, 0.55);
+}
+
+html[data-theme="nord"] {
+  --bg-chat: #2e3440;
+  --bg-sidebar: #2b303b;
+  --bg-rail: #242933;
+  --bg-input: #3b4252;
+  --bg-hover: #3b4252;
+  --bg-active: #434c5e;
+  --blurple: #88c0d0;
+  --blurple-hover: #6fa8ba;
+  --green: #a3be8c;
+  --red: #bf616a;
+  --yellow: #ebcb8b;
+  --text: #e5e9f0;
+  --text-muted: #8d97a8;
+  --text-header: #eceff4;
+  --glow: 0 0 10px rgba(136, 192, 208, 0.4);
+}
+
+html[data-theme="vapor"] {
+  --bg-chat: #241b3a;
+  --bg-sidebar: #1e1631;
+  --bg-rail: #171126;
+  --bg-input: #322551;
+  --bg-hover: #3a2b5e;
+  --bg-active: #4a3676;
+  --blurple: #7af5ff;
+  --blurple-hover: #55d6e0;
+  --green: #9dffb0;
+  --red: #ff7ad9;
+  --yellow: #ffe66d;
+  --text: #f0e6ff;
+  --text-muted: #a795cc;
+  --text-header: #ffffff;
+  --glow: 0 0 14px rgba(122, 245, 255, 0.5);
+}
+
+html[data-theme="matrix"] {
+  --bg-chat: #071108;
+  --bg-sidebar: #050d06;
+  --bg-rail: #030803;
+  --bg-input: #0d1f0f;
+  --bg-hover: #102a13;
+  --bg-active: #16391a;
+  --blurple: #22ff7a;
+  --blurple-hover: #17d963;
+  --green: #22ff7a;
+  --red: #ff4444;
+  --yellow: #d7ff3b;
+  --text: #b6ffc8;
+  --text-muted: #4f9b62;
+  --text-header: #e6ffe9;
+  --font: "Cascadia Code", "Consolas", "SF Mono", ui-monospace, monospace;
+  --glow: 0 0 10px rgba(34, 255, 122, 0.5);
+}
+
+html[data-theme="gold"] {
+  --bg-chat: #17130c;
+  --bg-sidebar: #120f09;
+  --bg-rail: #0c0a06;
+  --bg-input: #241d10;
+  --bg-hover: #2e2514;
+  --bg-active: #3d301a;
+  --blurple: #e8b64c;
+  --blurple-hover: #c99a37;
+  --green: #94c973;
+  --red: #d9614c;
+  --yellow: #ffd479;
+  --text: #f0e4cd;
+  --text-muted: #a3917059;
+  --text-muted: #a39170;
+  --text-header: #fff6e4;
+  --glow: 0 0 12px rgba(232, 182, 76, 0.45);
+}
+
+html[data-theme="blossom"] {
+  --bg-chat: #2a1f26;
+  --bg-sidebar: #241a20;
+  --bg-rail: #1c1319;
+  --bg-input: #3a2b33;
+  --bg-hover: #45333d;
+  --bg-active: #55404b;
+  --blurple: #ff8fb1;
+  --blurple-hover: #e6738f;
+  --green: #8fd9a8;
+  --red: #ff6b8a;
+  --yellow: #ffd28f;
+  --text: #f7e6ee;
+  --text-muted: #bd9dab;
+  --text-header: #fff5fa;
+  --glow: 0 0 12px rgba(255, 143, 177, 0.45);
+}
+
+/* =========================================================================
+   TURBO MODE
+   Opt-in. Everything below is decoration only — it never changes what any
+   control does, and it all switches off under prefers-reduced-motion.
+   ========================================================================= */
+
+/* A slow aurora behind the whole app. Sits under everything, ignores clicks. */
+body.turbo #app::before {
+  content: "";
+  position: fixed;
+  inset: -30%;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  background:
+    radial-gradient(38% 44% at 18% 22%, var(--blurple) 0%, transparent 62%),
+    radial-gradient(34% 38% at 82% 26%, var(--green) 0%, transparent 60%),
+    radial-gradient(42% 46% at 46% 88%, var(--red) 0%, transparent 62%);
+  filter: blur(70px) saturate(140%);
+  animation: turbo-aurora 26s ease-in-out infinite alternate;
+}
+
+@keyframes turbo-aurora {
+  0% { transform: translate3d(-4%, -3%, 0) scale(1); }
+  50% { transform: translate3d(5%, 4%, 0) scale(1.12); }
+  100% { transform: translate3d(-3%, 5%, 0) scale(1.04); }
+}
+
+/* Keep the real UI above the aurora and let it show through. */
+body.turbo #server-rail,
+body.turbo #sidebar,
+body.turbo #main,
+body.turbo #member-list {
+  position: relative;
+  z-index: 1;
+  background-color: color-mix(in srgb, var(--bg-sidebar) 82%, transparent);
+  backdrop-filter: blur(14px) saturate(120%);
+}
+
+body.turbo #main {
+  background-color: color-mix(in srgb, var(--bg-chat) 78%, transparent);
+}
+
+body.turbo #server-rail {
+  background-color: color-mix(in srgb, var(--bg-rail) 84%, transparent);
+}
+
+/* Glow on the things that matter. */
+body.turbo .server-bubble.active,
+body.turbo .rail-btn.home.active {
+  box-shadow: var(--glow, 0 0 12px rgba(88, 101, 242, 0.6));
+}
+
+body.turbo .avatar.speaking,
+body.turbo .vu-avatar.speaking {
+  box-shadow: 0 0 0 2px var(--green), 0 0 16px var(--green);
+  animation: turbo-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes turbo-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--green), 0 0 10px var(--green); }
+  50% { box-shadow: 0 0 0 3px var(--green), 0 0 22px var(--green); }
+}
+
+body.turbo #composer {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--blurple) 45%, transparent), var(--glow, none);
+}
+
+body.turbo .primary-btn {
+  box-shadow: var(--glow, none);
+}
+
+/* New messages slide in instead of appearing. */
+body.turbo .msg-group {
+  animation: turbo-in 0.28s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+@keyframes turbo-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.995); }
+  to { opacity: 1; transform: none; }
+}
+
+body.turbo .mention.me {
+  animation: turbo-mention 2.4s ease-in-out infinite;
+}
+
+@keyframes turbo-mention {
+  0%, 100% { box-shadow: 0 0 0 rgba(240, 178, 50, 0); }
+  50% { box-shadow: 0 0 10px rgba(240, 178, 50, 0.7); }
+}
+
+/* The send burst — a ring that expands out of the composer. */
+.turbo-burst {
+  position: fixed;
+  z-index: 9000;
+  pointer-events: none;
+  border-radius: 50%;
+  border: 2px solid var(--blurple);
+  animation: turbo-burst 0.5s ease-out forwards;
+}
+
+@keyframes turbo-burst {
+  from { width: 8px; height: 8px; opacity: 0.9; transform: translate(-50%, -50%); }
+  to { width: 220px; height: 220px; opacity: 0; transform: translate(-50%, -50%); }
+}
+
+/* Confetti, for the moments that deserve it. */
+.confetti-bit {
+  position: fixed;
+  top: -20px;
+  z-index: 9000;
+  width: 9px;
+  height: 14px;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: confetti-fall linear forwards;
+}
+
+@keyframes confetti-fall {
+  from { transform: translateY(-10vh) rotate(0deg); opacity: 1; }
+  to { transform: translateY(105vh) rotate(720deg); opacity: 0.9; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.turbo #app::before,
+  body.turbo .msg-group,
+  body.turbo .avatar.speaking,
+  body.turbo .vu-avatar.speaking,
+  body.turbo .mention.me,
+  .turbo-burst,
+  .confetti-bit {
+    animation: none;
+  }
+  .turbo-burst,
+  .confetti-bit { display: none; }
+}
+
+/* =========================================================================
+   Video tiles (camera + screen)
+   ========================================================================= */
+
+.share-tile { cursor: pointer; }
+
+.share-tile.mirrored video {
+  transform: scaleX(-1); /* a self-view that doesn't feel inside-out */
+}
+
+#share-stage.has-focus .share-tile:not(.focused) {
+  display: none;
+}
+
+#share-stage.has-focus .share-tile.focused {
+  flex: 1 1 100%;
+  max-width: 100%;
+}
+
+#share-stage.has-focus .share-tile.focused video {
+  max-height: 60vh;
+}
+
+.fx-blurb {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* =========================================================================
+   Level badge
+   ========================================================================= */
+
+.level-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--blurple);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  flex: 0 0 auto;
+}
+
+#xp-bar {
+  height: 3px;
+  background: var(--bg-rail);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 3px;
+}
+
+#xp-fill {
+  height: 100%;
+  background: var(--blurple);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+/* =========================================================================
+   Polls
+   ========================================================================= */
+
+.poll {
+  margin-top: 6px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-input) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--blurple) 30%, transparent);
+  max-width: 460px;
+}
+
+.poll-q {
+  font-weight: 700;
+  color: var(--text-header);
+  margin-bottom: 10px;
+}
+
+.poll-opt {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: var(--bg-rail);
+  color: var(--text);
+  font-size: 14px;
+  text-align: left;
+  overflow: hidden;
+}
+
+.poll-opt:hover { background: var(--bg-hover); }
+
+.poll-opt.mine {
+  box-shadow: inset 0 0 0 1px var(--blurple);
+}
+
+.poll-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--blurple) 32%, transparent);
+  transition: width 0.4s ease;
+  pointer-events: none;
+}
+
+.poll-emoji,
+.poll-text,
+.poll-count {
+  position: relative;
+  z-index: 1;
+}
+
+.poll-text { flex: 1 1 auto; }
+
+.poll-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.poll-foot {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* =========================================================================
+   Achievement toast
+   ========================================================================= */
+
+.achievement {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--blurple), var(--bg-active));
+  color: #fff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  animation: achievement-in 0.4s cubic-bezier(0.2, 0.9, 0.3, 1.3);
+}
+
+@keyframes achievement-in {
+  from { opacity: 0; transform: translateX(40px) scale(0.9); }
+  to { opacity: 1; transform: none; }
+}
+
+.achievement-emoji { font-size: 28px; }
+.achievement-title { font-weight: 800; font-size: 11px; letter-spacing: 0.08em; opacity: 0.85; }
+.achievement-name { font-weight: 700; font-size: 15px; }
+.achievement-desc { font-size: 12px; opacity: 0.9; }

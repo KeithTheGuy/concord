@@ -4,6 +4,11 @@ import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
 import { HubConnection } from "./hub.js";
 import { SOUNDBOARD, playSound } from "./sounds.js";
+import { VOICE_FX, FX_BY_ID } from "./voicefx.js";
+import {
+  THEMES, applyTheme, applyTurbo, burst, confetti,
+  levelFromXp, ACHIEVEMENTS, ACH_BY_ID, achievementToast,
+} from "./flair.js";
 
 /* ============================== constants =============================== */
 
@@ -82,21 +87,38 @@ const SLASH = [
       fireSound("airhorn");
       return rest ? `📢 **${rest.toUpperCase()}**` : null;
     } },
+  { name: "poll", args: "<question> | <option> | <option>", help: "Start a poll", run: (rest) => {
+      const built = buildPollMessage(rest);
+      if (built) unlock("pollster");
+      return built;
+    } },
+  { name: "confetti", args: "", help: "Throw confetti at yourself", run: () => {
+      confetti(120);
+      return null;
+    } },
+  { name: "theme", args: "<name>", help: "Switch theme", run: (rest) => {
+      const wanted = rest.trim().toLowerCase();
+      const theme = THEMES.find((t) => t.id === wanted);
+      if (!theme) { toast(`Themes: ${THEMES.map((t) => t.id).join(", ")}`, true); return null; }
+      setTheme(theme.id);
+      return null;
+    } },
+  { name: "voice", args: "<name>", help: "Switch voice preset", run: (rest) => {
+      const wanted = rest.trim().toLowerCase();
+      const preset = FX_BY_ID.get(wanted);
+      if (!preset) { toast(`Voices: ${VOICE_FX.map((f) => f.id).join(", ")}`, true); return null; }
+      applyVoiceFx(preset.id, preset.spec.semis || 0);
+      toast(`${preset.emoji} Voice: ${preset.label}`);
+      return null;
+    } },
   { name: "help", args: "", help: "List every command", run: () => {
       toast("Commands: " + SLASH.map((c) => "/" + c.name).join(", "));
       return null;
     } },
 ];
 
-// Voice changer presets, in semitones of pitch shift.
-const VOICE_FX = [
-  { id: "off", label: "Off — your actual voice", emoji: "🎙️", semis: 0 },
-  { id: "fem", label: "Feminine", emoji: "💁‍♀️", semis: 5 },
-  { id: "anime", label: "Anime girl", emoji: "🌸", semis: 8 },
-  { id: "chipmunk", label: "Chipmunk", emoji: "🐿️", semis: 12 },
-  { id: "deep", label: "Deeper", emoji: "🗿", semis: -5 },
-  { id: "demon", label: "Demon", emoji: "👹", semis: -9 },
-];
+// Voice presets live in voicefx.js — each one is a whole signal chain, not
+// just a pitch number.
 
 /* =============================== storage ================================ */
 
@@ -127,6 +149,10 @@ const state = {
       userVolumes: {}, // userId -> 0..200, remembered forever
       muted: {}, // server code -> true, silences pings from that server
       embeds: true, tts: false, autoIdle: true,
+      theme: "midnight", turbo: false,
+      // Local-only progression. Never sent anywhere, so it can't be farmed,
+      // compared, or used to judge anyone.
+      xp: 0, stats: {}, achievements: [], seenThemes: [], triedVoices: [],
     },
     store.get("settings", {})
   ),
@@ -287,7 +313,10 @@ const voice = new VoiceEngine({
     document.querySelectorAll(`[data-vsid="${key}"]`).forEach((n) => n.classList.toggle("speaking", speaking));
   },
   onShareStart(sid, stream) {
-    addShareTile(sid, stream, voiceRealm()?.members.get(sid)?.name || "Someone");
+    const member = voiceRealm()?.members.get(sid);
+    const who = member?.name || "Someone";
+    const camera = member?.voice?.shareKind === "camera";
+    addShareTile(sid, stream, camera ? who : `${who}'s screen`);
   },
   onShareEnd(sid) {
     removeShareTile(sid);
@@ -295,6 +324,7 @@ const voice = new VoiceEngine({
   onLocalShareEnd() {
     removeShareTile("me");
     $("btn-share").classList.remove("on");
+    $("btn-camera").classList.remove("on");
   },
   onError: (t) => toast(t, true),
   settings: () => state.settings,
@@ -339,6 +369,8 @@ const hub = new HubConnection({
     renderHomeBadge();
     renderDmList();
     if (state.view === "home") renderFriendsView();
+    if (hub.friends.size >= 1) unlock("friendly");
+    if (hub.friends.size >= 5) unlock("popular");
   },
   onRequest(user) {
     toast(`👋 ${user.name} (@${user.tag}) wants to be your friend.`);
@@ -845,6 +877,7 @@ function handleServerMessage(realm, m) {
       if (live && m.chanId === realm.activeChan) {
         renderMessages();
         toast(m.pinned ? `📌 ${m.by} pinned a message.` : `${m.by} unpinned a message.`);
+        if (m.pinned) unlock("pinned");
       }
       break;
     }
@@ -898,6 +931,9 @@ function handleServerMessage(realm, m) {
     case "prank-sent": {
       const meta = PRANKS.find((p) => p.kind === m.kind);
       toast(`🃏 ${meta ? meta.emoji + " " + meta.label : "Prank"} deployed. You monster.`);
+      unlock("gremlin");
+      if (bumpStat("pranks") >= 25) unlock("menace");
+      addXp(6);
       break;
     }
 
@@ -1143,9 +1179,23 @@ function sendCurrentMessage() {
   state.lastTypingSent = 0; // sending ends "typing"; next keystroke signals fresh
   input.value = "";
   autoGrow(input);
+  updateCharCount();
   hideAutocomplete();
   clearReply();
   renderMessages();
+
+  // Progression + the little burst of light, both entirely local.
+  const sent = bumpStat("messages");
+  addXp(4);
+  if (sent === 1) unlock("first-word");
+  if (sent === 100) unlock("chatterbox");
+  if (sent === 1000) unlock("novelist");
+  const hour = new Date().getHours();
+  if (hour >= 3 && hour < 5) unlock("night-owl");
+  if (state.settings.turbo) {
+    const box = $("composer").getBoundingClientRect();
+    burst(box.right - 40, box.top + box.height / 2);
+  }
 }
 
 /* ============================ markdown-lite ============================= */
@@ -1656,7 +1706,7 @@ function renderChannels() {
         const icons = el("span", "vu-icons");
         if (member.voice.muted) icons.append("🔇");
         if (member.voice.deafened) icons.append("🎧");
-        if (member.voice.sharing) icons.append("🖥");
+        if (member.voice.sharing) icons.append(member.voice.shareKind === "camera" ? "📹" : "🖥");
         u.appendChild(icons);
         // Volume controls only make sense for people you can actually hear,
         // i.e. when the call is in the realm you're looking at.
@@ -1950,6 +2000,14 @@ function buildMsgNode(msg) {
     return node;
   }
 
+  // Polls render as their own widget; the reactions underneath ARE the votes.
+  const poll = parsePoll(msg.content);
+  if (poll) {
+    node.appendChild(buildPollNode(msg, poll));
+    if (!msg.pending) node.appendChild(msgActions(msg));
+    return node;
+  }
+
   const content = el("div", "msg-content");
   content.innerHTML = renderMarkdown(msg.content);
   content.querySelectorAll(".spoiler").forEach((s) => {
@@ -1974,7 +2032,13 @@ function buildMsgNode(msg) {
     node.appendChild(row);
   }
 
-  if (!msg.pending) {
+  if (!msg.pending) node.appendChild(msgActions(msg));
+  return node;
+}
+
+// The hover toolbar on a message.
+function msgActions(msg) {
+  {
     const actions = el("div", "msg-actions");
     for (const q of QUICK_REACTS.slice(0, 3)) {
       const b = el("button", "", q);
@@ -2013,9 +2077,8 @@ function buildMsgNode(msg) {
         );
       actions.appendChild(del);
     }
-    node.appendChild(actions);
+    return actions;
   }
-  return node;
 }
 
 /* -------------------------------- embeds --------------------------------- */
@@ -2180,6 +2243,7 @@ function leaveVoice({ silent } = {}) {
   realm?.send({ type: "voice-leave" });
   $("voice-status").classList.add("hidden");
   $("btn-share").classList.remove("on");
+  $("btn-camera").classList.remove("on");
   $("btn-call").classList.remove("on");
   clearShareStage();
   renderChannels();
@@ -2210,10 +2274,10 @@ function renderVoicePanel() {
   $("btn-call").classList.toggle("on", realm.code === state.activeCode);
 }
 
-function addShareTile(key, stream, label) {
+function addShareTile(key, stream, label, mirror = false) {
   removeShareTile(key);
   const stage = $("share-stage");
-  const tile = el("div", "share-tile");
+  const tile = el("div", "share-tile" + (mirror ? " mirrored" : ""));
   tile.dataset.share = key;
   const video = document.createElement("video");
   video.autoplay = true;
@@ -2222,6 +2286,13 @@ function addShareTile(key, stream, label) {
   video.srcObject = stream;
   tile.appendChild(video);
   tile.appendChild(el("div", "share-label", label));
+  // Click any tile to blow it up to fill the stage.
+  tile.onclick = () => {
+    const wasBig = tile.classList.contains("focused");
+    stage.querySelectorAll(".share-tile").forEach((t) => t.classList.remove("focused"));
+    stage.classList.toggle("has-focus", !wasBig);
+    if (!wasBig) tile.classList.add("focused");
+  };
   stage.appendChild(tile);
   stage.classList.remove("hidden");
 }
@@ -2518,6 +2589,9 @@ function openSettings() {
   $("set-embeds").checked = state.settings.embeds !== false;
   $("set-tts").checked = !!state.settings.tts;
   $("set-autoidle").checked = state.settings.autoIdle !== false;
+  $("set-theme").value = state.settings.theme || "midnight";
+  $("set-turbo").checked = !!state.settings.turbo;
+  renderLevel();
   $("set-tag").value = hub.me?.tag || state.account?.tag || "";
   $("set-presence").value = state.settings.presence || "online";
 
@@ -2529,6 +2603,7 @@ function openSettings() {
     if (fx.id === state.settings.fx) option.selected = true;
     fxSelect.appendChild(option);
   }
+  $("set-fx-blurb").textContent = FX_BY_ID.get(state.settings.fx)?.blurb || "Custom pitch";
   $("set-fx-pitch").value = state.settings.fxPitch;
   $("set-fx-label").textContent = fmtSemis(state.settings.fxPitch);
   $("set-volume").value = state.settings.volume;
@@ -2609,6 +2684,33 @@ $("set-autoidle").onchange = (e) => {
   store.set("settings", state.settings);
   if (!e.target.checked) noteActivity();
 };
+
+function setTheme(id) {
+  const applied = applyTheme(id);
+  state.settings.theme = applied;
+  const seen = new Set(state.settings.seenThemes || []);
+  seen.add(applied);
+  state.settings.seenThemes = [...seen];
+  store.set("settings", state.settings);
+  const meta = THEMES.find((t) => t.id === applied);
+  if (meta) toast(`${meta.emoji} Theme: ${meta.label}`);
+  if (seen.size >= THEMES.length) unlock("themed");
+  const select = $("set-theme");
+  if (select) select.value = applied;
+}
+
+$("set-theme").onchange = (e) => setTheme(e.target.value);
+
+$("set-turbo").onchange = (e) => {
+  state.settings.turbo = e.target.checked;
+  store.set("settings", state.settings);
+  applyTurbo(e.target.checked);
+  if (e.target.checked) {
+    unlock("turbo");
+    confetti(80);
+    toast("⚡ TURBO MODE. There is no off-switch. (There is, it's right there.)");
+  }
+};
 $("set-ptt").onchange = (e) => {
   state.settings.ptt = e.target.checked;
   store.set("settings", state.settings);
@@ -2630,7 +2732,10 @@ function launchMascot() {
     onHits(n) {
       state.settings.gorbHits = n;
       store.set("settings", state.settings);
-      if (n >= 5) toast("💤 Gorb is out cold. Revive him in Settings if you feel bad.");
+      if (n >= 5) {
+        toast("💤 Gorb is out cold. Revive him in Settings if you feel bad.");
+        unlock("gorb-menace");
+      }
     },
     onSquirt(on) {
       $("btn-squirt").classList.toggle("on", on);
@@ -2651,44 +2756,60 @@ $("btn-squirt").onclick = () => {
 };
 
 $("set-revive").onclick = () => {
+  const wasDown = mascotDown();
   reviveMascot();
   toast("Gorb lives.");
+  if (wasDown) unlock("gorb-friend");
 };
 
 const fmtSemis = (n) => (n > 0 ? `+${n}` : String(n));
 
-// Applies live — mid-sentence, even — because the shifter always sits in the
-// outgoing path and only its pitch parameter moves.
+// Applies live — mid-sentence, even. The rack is rebuilt behind the same
+// outgoing track, so nothing renegotiates and nobody hears a gap.
 function applyVoiceFx(id, pitch) {
+  const preset = FX_BY_ID.get(id);
+  const spec = preset ? preset.spec : {};
+  const semis = typeof pitch === "number" ? pitch : spec.semis || 0;
   state.settings.fx = id;
-  state.settings.fxPitch = pitch;
+  state.settings.fxPitch = semis;
   store.set("settings", state.settings);
-  voice.setEffect(pitch);
-  const preset = VOICE_FX.find((f) => f.id === id);
-  $("btn-fx").classList.toggle("on", pitch !== 0);
-  $("btn-fx").title = `Voice changer: ${preset ? preset.label : fmtSemis(pitch) + " semitones"}`;
+  voice.setVoice(spec, semis);
+  const changed = id !== "off" || semis !== 0;
+  if (changed) unlock("voice-crack");
+  if (id === "freds") unlock("asmr");
+  if (preset) {
+    const tried = new Set(state.settings.triedVoices || []);
+    tried.add(id);
+    state.settings.triedVoices = [...tried];
+    store.set("settings", state.settings);
+    if (tried.size >= VOICE_FX.length) unlock("full-rack");
+  }
+  $("btn-fx").classList.toggle("on", changed);
+  $("btn-fx").title = `Voice changer: ${preset ? preset.label : fmtSemis(semis) + " semitones"}`;
+  const blurb = $("set-fx-blurb");
+  if (blurb) blurb.textContent = preset ? preset.blurb : "Custom pitch";
 }
 
 $("set-fx").onchange = (e) => {
-  const preset = VOICE_FX.find((f) => f.id === e.target.value) || VOICE_FX[0];
-  applyVoiceFx(preset.id, preset.semis);
-  $("set-fx-pitch").value = preset.semis;
-  $("set-fx-label").textContent = fmtSemis(preset.semis);
+  const preset = FX_BY_ID.get(e.target.value) || VOICE_FX[0];
+  const semis = preset.spec.semis || 0;
+  applyVoiceFx(preset.id, semis);
+  $("set-fx-pitch").value = semis;
+  $("set-fx-label").textContent = fmtSemis(semis);
 };
+// The slider nudges pitch while keeping the preset's character.
 $("set-fx-pitch").oninput = (e) => {
   const pitch = +e.target.value;
-  const match = VOICE_FX.find((f) => f.semis === pitch);
-  applyVoiceFx(match ? match.id : "custom", pitch);
+  applyVoiceFx(state.settings.fx || "off", pitch);
   $("set-fx-label").textContent = fmtSemis(pitch);
-  if (match) $("set-fx").value = match.id;
 };
 
 // Quick cycle from the voice panel, for mid-call bits.
 $("btn-fx").onclick = () => {
   const i = VOICE_FX.findIndex((f) => f.id === state.settings.fx);
   const next = VOICE_FX[(i + 1) % VOICE_FX.length];
-  applyVoiceFx(next.id, next.semis);
-  toast(`${next.emoji} Voice: ${next.label}`);
+  applyVoiceFx(next.id, next.spec.semis || 0);
+  toast(`${next.emoji} Voice: ${next.label} — ${next.blurb}`);
 };
 
 $("set-mascot").onchange = (e) => {
@@ -2906,13 +3027,32 @@ $("btn-deafen").onclick = () => {
 $("btn-hangup").onclick = () => leaveVoice();
 $("btn-share").onclick = async () => {
   if (voice.shareStream) {
+    const wasCamera = voice.shareKind === "camera";
     voice.stopShare();
-  } else {
-    await voice.startShare();
-    if (voice.shareStream) {
-      $("btn-share").classList.add("on");
-      addShareTile("me", voice.shareStream, "Your screen");
-    }
+    if (!wasCamera) return; // toggling the screen off is all they asked for
+  }
+  await voice.startShare();
+  if (voice.shareStream) {
+    $("btn-share").classList.add("on");
+    $("btn-camera").classList.remove("on");
+    addShareTile("me", voice.shareStream, "Your screen");
+    unlock("presenting");
+  }
+};
+
+// One outgoing video track per person, so camera and screen take turns.
+$("btn-camera").onclick = async () => {
+  if (voice.shareStream) {
+    const wasCamera = voice.shareKind === "camera";
+    voice.stopShare();
+    if (wasCamera) return;
+  }
+  await voice.startCamera();
+  if (voice.shareStream) {
+    $("btn-camera").classList.add("on");
+    $("btn-share").classList.remove("on");
+    addShareTile("me", voice.shareStream, "You", true);
+    unlock("on-air");
   }
 };
 $("jump-present").onclick = () => {
@@ -3346,6 +3486,8 @@ function hideProfile() {
 function fireSound(id) {
   if (!SOUNDBOARD.some((s) => s.id === id)) return;
   playSound(id, (state.settings.volume || 100) / 100);
+  unlock("noisy");
+  if (bumpStat("sounds") >= 50) unlock("dj");
   // Goes to the call, wherever the call is — not to whatever you're reading.
   if (state.voiceCode) voiceRealm()?.send({ type: "sound", sound: id });
   else toast("Nobody heard that — join a voice channel first.", true);
@@ -3491,6 +3633,145 @@ const EMOJI_NAMES = [
   ["sleeping", "💤"], ["wave", "👋"], ["muscle", "💪"], ["brain", "🧠"], ["trophy", "🏆"],
 ];
 
+/* ========================= progress & achievements ======================= */
+// All of this lives in localStorage and is never transmitted. It exists to be
+// a small pleasant thing for you, not a leaderboard.
+
+function bumpStat(key, by = 1) {
+  const stats = { ...(state.settings.stats || {}) };
+  stats[key] = (stats[key] || 0) + by;
+  state.settings.stats = stats;
+  store.set("settings", state.settings);
+  return stats[key];
+}
+
+function statOf(key) {
+  return state.settings.stats?.[key] || 0;
+}
+
+function addXp(amount) {
+  const before = levelFromXp(state.settings.xp || 0).level;
+  state.settings.xp = (state.settings.xp || 0) + amount;
+  store.set("settings", state.settings);
+  const after = levelFromXp(state.settings.xp).level;
+  if (after > before) {
+    toast(`⬆️ Level ${after}!`);
+    if (state.settings.turbo) confetti(70);
+    if (state.settings.sounds) playSound("applause", 0.5);
+    if (after >= 10) unlock("level-10");
+    if (after >= 25) unlock("level-25");
+  }
+  renderLevel();
+}
+
+function unlock(id) {
+  const ach = ACH_BY_ID.get(id);
+  if (!ach) return;
+  const have = state.settings.achievements || [];
+  if (have.includes(id)) return;
+  state.settings.achievements = [...have, id];
+  store.set("settings", state.settings);
+  achievementToast(ach, $("toasts"));
+  if (state.settings.sounds) playSound("wow", 0.5);
+  if (state.settings.turbo) confetti(50);
+  addXp(25);
+}
+
+function renderLevel() {
+  const badge = $("level-badge");
+  if (!badge) return;
+  const { level, into, need } = levelFromXp(state.settings.xp || 0);
+  badge.textContent = String(level);
+  $("level-text").textContent = `${into} / ${need} XP to level ${level + 1}`;
+  $("xp-fill").style.width = Math.min(100, (into / need) * 100) + "%";
+}
+
+function openAchievements() {
+  showModal("achievements-modal");
+  const have = new Set(state.settings.achievements || []);
+  $("ach-sub").textContent = `${have.size} of ${ACHIEVEMENTS.length} unlocked. Entirely pointless. Collect them anyway.`;
+  const list = $("ach-list");
+  list.textContent = "";
+  for (const a of ACHIEVEMENTS) {
+    const got = have.has(a.id);
+    const row = el("div", "friend-row" + (got ? "" : " locked"));
+    row.style.opacity = got ? "1" : "0.45";
+    const icon = el("div", "avatar", got ? a.emoji : "🔒");
+    icon.style.background = got ? "var(--blurple)" : "var(--bg-rail)";
+    row.appendChild(icon);
+    const col = el("div", "m-col");
+    col.appendChild(el("div", "m-name", a.name));
+    col.appendChild(el("div", "m-status", a.desc));
+    row.appendChild(col);
+    list.appendChild(row);
+  }
+}
+$("set-achievements").onclick = openAchievements;
+
+/* ================================= polls ================================= */
+// A poll is an ordinary message with a recognisable shape, and voting is just
+// the reactions that already exist. No new storage, no new server code, and
+// the votes survive exactly as long as the message does.
+
+const POLL_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"];
+const POLL_MARK = "📊 **Poll:** ";
+
+function buildPollMessage(raw) {
+  const parts = raw.split("|").map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 3) {
+    toast("Polls look like: /poll Pizza tonight? | Yes | Absolutely", true);
+    return null;
+  }
+  const [question, ...options] = parts;
+  const picks = options.slice(0, POLL_EMOJI.length);
+  const lines = picks.map((o, i) => `${POLL_EMOJI[i]} ${o}`);
+  return `${POLL_MARK}${question}\n${lines.join("\n")}`;
+}
+
+function parsePoll(content) {
+  if (!content.startsWith(POLL_MARK)) return null;
+  const [head, ...rest] = content.split("\n");
+  const question = head.slice(POLL_MARK.length).trim();
+  const options = [];
+  for (const line of rest) {
+    const i = POLL_EMOJI.findIndex((e) => line.startsWith(e));
+    if (i >= 0) options.push({ emoji: POLL_EMOJI[i], text: line.slice(POLL_EMOJI[i].length).trim() });
+  }
+  return options.length >= 2 ? { question, options } : null;
+}
+
+function buildPollNode(msg, poll) {
+  const wrap = el("div", "poll");
+  wrap.appendChild(el("div", "poll-q", poll.question));
+  const reactions = msg.reactions || {};
+  const total = poll.options.reduce((n, o) => n + (reactions[o.emoji]?.length || 0), 0);
+  const me = myUserId();
+  for (const opt of poll.options) {
+    const voters = reactions[opt.emoji] || [];
+    const mine = voters.includes(me);
+    const btn = el("button", "poll-opt" + (mine ? " mine" : ""));
+    const fill = el("div", "poll-fill");
+    fill.style.width = total ? `${(voters.length / total) * 100}%` : "0%";
+    btn.appendChild(fill);
+    btn.appendChild(el("span", "poll-emoji", opt.emoji));
+    btn.appendChild(el("span", "poll-text", opt.text));
+    btn.appendChild(el("span", "poll-count", String(voters.length)));
+    btn.onclick = () => {
+      // One vote each: clear whatever else you'd picked first.
+      for (const other of poll.options) {
+        if (other.emoji === opt.emoji) continue;
+        if ((reactions[other.emoji] || []).includes(me)) {
+          wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji: other.emoji });
+        }
+      }
+      wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji: opt.emoji });
+    };
+    wrap.appendChild(btn);
+  }
+  wrap.appendChild(el("div", "poll-foot", total === 1 ? "1 vote" : `${total} votes`));
+  return wrap;
+}
+
 /* ============================ focus / unload ============================= */
 
 window.addEventListener("focus", () => {
@@ -3566,6 +3847,9 @@ renderServerRail();
 updateTitle();
 
 installPrankStyles();
+applyTheme(state.settings.theme || "midnight");
+applyTurbo(state.settings.turbo);
+renderLevel();
 applyVoiceFx(state.settings.fx, state.settings.fxPitch); // restore the saved voice
 
 if ("serviceWorker" in navigator) {
