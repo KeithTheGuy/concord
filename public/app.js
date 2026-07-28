@@ -2,6 +2,8 @@
 import { VoiceEngine } from "./voice.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
+import { HubConnection } from "./hub.js";
+import { SOUNDBOARD, playSound } from "./sounds.js";
 
 /* ============================== constants =============================== */
 
@@ -18,6 +20,73 @@ const EMOJIS = (
   "🚀 🛸 🌙 ☀️ 🌊 🍀 🌵 ⛺ 🗿 💎 🔑 🛠️ 📌 ✅ ❌ ❓ ‼️ 💤"
 ).split(" ").filter(Boolean);
 const QUICK_REACTS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+
+const PRESENCE_META = {
+  online: { dot: "online", label: "Online", emoji: "🟢" },
+  idle: { dot: "idle", label: "Idle", emoji: "🌙" },
+  dnd: { dot: "dnd", label: "Do Not Disturb", emoji: "⛔" },
+  invisible: { dot: "offline", label: "Invisible", emoji: "⚫" },
+};
+
+// Slash commands. Each returns the text to actually send, or null to swallow
+// the command entirely (it did something else instead).
+const SLASH = [
+  { name: "shrug", args: "[message]", help: "Appends ¯\\_(ツ)_/¯", run: (rest) => `${rest} ¯\\_(ツ)_/¯`.trim() },
+  { name: "tableflip", args: "[message]", help: "(╯°□°)╯︵ ┻━┻", run: (rest) => `${rest} (╯°□°)╯︵ ┻━┻`.trim() },
+  { name: "unflip", args: "[message]", help: "┬─┬ ノ( ゜-゜ノ)", run: (rest) => `${rest} ┬─┬ ノ( ゜-゜ノ)`.trim() },
+  { name: "me", args: "<action>", help: "Italicised action", run: (rest) => (rest ? `*${rest}*` : null) },
+  { name: "spoiler", args: "<text>", help: "Hide it behind a click", run: (rest) => (rest ? `||${rest}||` : null) },
+  { name: "big", args: "<text>", help: "MAKES IT LOUD", run: (rest) => (rest ? `**${rest.toUpperCase()}**` : null) },
+  {
+    name: "mock",
+    args: "<text>",
+    help: "sPoNgEbOb CaSe",
+    run: (rest) => (rest ? rest.split("").map((c, i) => (i % 2 ? c.toUpperCase() : c.toLowerCase())).join("") : null),
+  },
+  { name: "clap", args: "<text>", help: "Puts 👏 between 👏 every 👏 word", run: (rest) => (rest ? rest.split(/\s+/).join(" 👏 ") : null) },
+  { name: "roll", args: "[sides]", help: "Roll a die", run: (rest) => {
+      const sides = Math.max(2, Math.min(1000, parseInt(rest, 10) || 6));
+      return `🎲 rolled a **${1 + Math.floor(Math.random() * sides)}** (d${sides})`;
+    } },
+  { name: "flip", args: "", help: "Coin flip", run: () => `🪙 **${Math.random() < 0.5 ? "Heads" : "Tails"}**` },
+  { name: "8ball", args: "<question>", help: "Ask the magic 8-ball", run: (rest) => {
+      const answers = ["It is certain.", "Absolutely not.", "Ask again later.", "Without a doubt.",
+        "My sources say no.", "Yes — definitely.", "Very doubtful.", "Signs point to yes.",
+        "Don't count on it.", "Obviously.", "lol no", "The 8-ball is tired. Try tomorrow."];
+      return rest ? `🎱 *${rest}* — ${answers[Math.floor(Math.random() * answers.length)]}` : null;
+    } },
+  { name: "nick", args: "<name>", help: "Change your display name", run: (rest) => {
+      if (!rest) return null;
+      state.profile.name = rest.slice(0, 32);
+      store.set("profile", state.profile);
+      renderMe();
+      pushProfile();
+      toast(`You are now ${state.profile.name}.`);
+      return null;
+    } },
+  { name: "status", args: "<text>", help: "Set your custom status", run: (rest) => {
+      state.profile.status = rest.slice(0, 60);
+      store.set("profile", state.profile);
+      renderMe();
+      pushProfile();
+      toast(rest ? `Status set: ${rest}` : "Status cleared.");
+      return null;
+    } },
+  { name: "sound", args: "<name>", help: "Fire a soundboard clip", run: (rest) => {
+      const clip = SOUNDBOARD.find((s) => s.id === rest.trim().toLowerCase());
+      if (!clip) { toast(`Sounds: ${SOUNDBOARD.map((s) => s.id).join(", ")}`, true); return null; }
+      fireSound(clip.id);
+      return null;
+    } },
+  { name: "shout", args: "<text>", help: "Sends it, then air-horns the call", run: (rest) => {
+      fireSound("airhorn");
+      return rest ? `📢 **${rest.toUpperCase()}**` : null;
+    } },
+  { name: "help", args: "", help: "List every command", run: () => {
+      toast("Commands: " + SLASH.map((c) => "/" + c.name).join(", "));
+      return null;
+    } },
+];
 
 // Voice changer presets, in semitones of pitch shift.
 const VOICE_FX = [
@@ -49,14 +118,20 @@ const store = {
 
 const state = {
   profile: store.get("profile", null), // {userId, name, color, avatar, status}
+  account: store.get("account", null), // {uid, token, tag} — the global identity
   settings: Object.assign(
     {
       micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100,
-      notifs: false, gremlin: true, mascot: true, fx: "off", fxPitch: 0, gorbHits: 0,
+      notifs: false, gremlin: true, mascot: true, board: true, fx: "off",
+      fxPitch: 0, gorbHits: 0, presence: "online",
     },
     store.get("settings", {})
   ),
   servers: store.get("servers", []), // [{code, name, icon}]
+  view: "server", // server | home | dm
+  realmKind: "guild", // what the main socket is currently pointed at
+  dmPeer: null, // {uid, name, avatar, color, ...} when realmKind === "dm"
+  fvTab: "online",
   currentCode: null,
   ws: null,
   wsState: "idle", // idle | connecting | open
@@ -83,6 +158,9 @@ const state = {
   editingId: null,
   voiceChan: null,
   pendingByNonce: new Map(),
+  autocomplete: null, // {kind:'mention'|'slash'|'emoji', items, index, from}
+  switchIndex: 0,
+  switchItems: [],
 };
 
 /* ============================== dom helpers ============================= */
@@ -147,6 +225,85 @@ const voice = new VoiceEngine({
   inMyChannel: (sid) => !!state.voiceChan && state.members.get(sid)?.voice?.chanId === state.voiceChan,
 });
 
+/* ================================= hub ================================== */
+
+const hub = new HubConnection({
+  savedAccount: () => state.account,
+  profile: () => state.profile || { name: "Wumpus", avatar: "🙂", color: COLORS[0], status: "" },
+  presence: () => state.settings.presence || "online",
+  rememberAccount(uid, token, tag) {
+    state.account = { uid, token, tag };
+    store.set("account", state.account);
+  },
+  rememberTag(tag) {
+    if (state.account) {
+      state.account.tag = tag;
+      store.set("account", state.account);
+    }
+  },
+  toast,
+  onWelcome() {
+    renderHomeBadge();
+    if (state.view === "home") renderFriendsView();
+  },
+  onChange() {
+    renderHomeBadge();
+    renderDmList();
+    if (state.view === "home") renderFriendsView();
+  },
+  onRequest(user) {
+    toast(`👋 ${user.name} (@${user.tag}) wants to be your friend.`);
+    if (state.settings.sounds) voice.playCue("ping");
+  },
+  onFriendRemoved(uid, known) {
+    if (known) toast(`${known.name} is no longer on your friends list.`);
+    // If you were reading their DM, there's nothing to read any more.
+    if (state.view === "dm" && state.dmPeer?.uid === uid) goHome();
+  },
+  onDmReady(uid, code, user) {
+    openDmRealm(uid, code, user);
+  },
+  onDmNudge(uid, name, preview) {
+    if (state.view === "dm" && state.dmPeer?.uid === uid) {
+      hub.markDmRead(uid); // we're literally looking at it
+      return;
+    }
+    if (state.settings.sounds) voice.playCue("ping");
+    updateTitle();
+    if (state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted") {
+      try {
+        const n = new Notification(`${name} — direct message`, {
+          body: preview || "(no preview)",
+          icon: "/icon-192.png",
+          tag: "concord-dm-" + uid,
+        });
+        n.onclick = () => {
+          window.focus();
+          openDm(uid);
+          n.close();
+        };
+      } catch {}
+    }
+  },
+  onPoked(name) {
+    toast(`👉 ${name} poked you.`);
+    if (state.settings.sounds) playSound("bonk", 0.6);
+    document.body.classList.add("poked");
+    setTimeout(() => document.body.classList.remove("poked"), 700);
+  },
+});
+
+function pushProfile() {
+  hub.pushProfile();
+  wsSend({
+    type: "set-profile",
+    name: state.profile.name,
+    color: state.profile.color,
+    avatar: state.profile.avatar,
+    status: state.profile.status,
+  });
+}
+
 /* ============================== websocket =============================== */
 
 function wsSend(obj) {
@@ -166,6 +323,10 @@ function connect(code, intent) {
   let url = `${location.origin.replace(/^http/, "ws")}/ws?server=${encodeURIComponent(code)}`;
   if (intent?.kind === "create") {
     url += `&create=1&name=${encodeURIComponent(intent.name)}&icon=${encodeURIComponent(intent.icon)}`;
+  } else if (state.realmKind === "dm") {
+    // The DM's Durable Object is created lazily the first time either friend
+    // opens it; create=1 is a no-op once it exists.
+    url += `&create=1&kind=dm&name=${encodeURIComponent("DM")}&icon=${encodeURIComponent("💬")}`;
   }
   const ws = new WebSocket(url);
   state.ws = ws;
@@ -176,6 +337,7 @@ function connect(code, intent) {
       type: "hello",
       userId: identityFor(code)?.userId || state.profile.userId,
       token: identityFor(code)?.token || "", // proves this userId is ours
+      tag: hub.me?.tag || state.account?.tag || "",
       name: state.profile.name,
       color: state.profile.color,
       avatar: state.profile.avatar,
@@ -287,6 +449,20 @@ function handleServerMessage(m) {
       state.channels = m.channels;
       state.members = new Map(m.members.map((mm) => [mm.sid, mm]));
       startPing();
+
+      // A DM is a ConcordServer too, but it never belongs in the server rail.
+      if (state.realmKind === "dm") {
+        state.intent = null;
+        const resumeDm = state.resume && state.resume.code === state.currentCode ? state.resume : null;
+        state.resume = null;
+        renderAll();
+        const chan = state.channels.find((c) => c.type === "text");
+        if (chan) activateChannel(chan.id);
+        if (resumeDm?.voiceChan && state.channels.some((c) => c.id === resumeDm.voiceChan && c.type === "voice")) {
+          joinVoice(resumeDm.voiceChan);
+        }
+        break;
+      }
 
       // Persist / refresh this server in the rail.
       const existing = state.servers.find((s) => s.code === state.currentCode);
@@ -479,6 +655,39 @@ function handleServerMessage(m) {
       break;
     }
 
+    case "msg-pin": {
+      const list = state.messages.get(m.chanId) || [];
+      const msg = list.find((x) => x.id === m.msgId);
+      if (msg) {
+        if (m.pinned) msg.pinned = true;
+        else delete msg.pinned;
+        if (m.chanId === state.activeChan) renderMessages();
+      }
+      if (m.chanId === state.activeChan) {
+        toast(m.pinned ? `📌 ${m.by} pinned a message.` : `${m.by} unpinned a message.`);
+      }
+      break;
+    }
+
+    case "pins": {
+      renderPins(m.messages);
+      break;
+    }
+
+    case "search-results": {
+      renderSearchResults(m);
+      break;
+    }
+
+    case "sound": {
+      if (!state.settings.board) break;
+      if (m.sid === state.me?.sid) break; // we already played it locally
+      playSound(m.sound, (state.settings.volume || 100) / 100);
+      const clip = SOUNDBOARD.find((s) => s.id === m.sound);
+      if (clip) toast(`${clip.emoji} ${m.name} played ${clip.label}`);
+      break;
+    }
+
     case "voice-peers": {
       voice.connectToPeers(m.peers);
       break;
@@ -548,21 +757,47 @@ function pushMessage(msg) {
   }
 }
 
+// A message mentions you if it says @everyone, @here, your display name, or
+// your friend tag. Names can contain spaces, so we test against the known
+// names rather than trying to parse a token out of the text.
+function mentionNames() {
+  const names = [];
+  if (state.profile?.name) names.push(state.profile.name);
+  if (state.account?.tag) names.push(state.account.tag);
+  return names;
+}
+
+function mentionsMe(msg) {
+  if (msg.author.userId === myUserId()) return false;
+  const text = msg.content.toLowerCase();
+  if (text.includes("@everyone") || text.includes("@here")) return true;
+  return mentionNames().some((n) => n && text.includes("@" + n.toLowerCase()));
+}
+
 function notifyIfNeeded(msg) {
   const mine = msg.author.userId === myUserId();
   if (mine) return;
+  const pinged = mentionsMe(msg);
   // "Inactive" = other channel, tab hidden, OR window visible but not
   // focused (second monitor while gaming — the whole point of notifications).
   const inactive = msg.chanId !== state.activeChan || document.hidden || !document.hasFocus();
-  if (inactive) {
+  // A direct mention always pings, even in the channel you're staring at —
+  // that's the entire point of being @'d.
+  if (inactive || pinged) {
     if (msg.chanId !== state.activeChan) {
       state.unread.set(msg.chanId, (state.unread.get(msg.chanId) || 0) + 1);
       renderChannels();
     }
     if (state.settings.sounds) voice.playCue("ping");
     updateTitle();
-    desktopNotify(msg);
+    if (inactive) desktopNotify(msg);
+    if (pinged && !document.hidden) flashMention();
   }
+}
+
+function flashMention() {
+  document.body.classList.add("mentioned");
+  setTimeout(() => document.body.classList.remove("mentioned"), 900);
 }
 
 function desktopNotify(msg) {
@@ -591,14 +826,32 @@ function totalUnread() {
   return n;
 }
 function updateTitle() {
-  const n = totalUnread();
+  const n = totalUnread() + hub.totalUnread() + hub.pendingCount();
   document.title = (n ? `(${n}) ` : "") + "Concord";
 }
 
 function sendCurrentMessage() {
   const input = $("input");
-  const content = input.value.trim();
+  let content = input.value.trim();
   if (!content || !state.activeChan) return;
+
+  // Slash commands rewrite (or swallow) the message before it goes anywhere.
+  if (content.startsWith("/") && !content.startsWith("//")) {
+    const [, name, rest = ""] = content.match(/^\/(\S+)\s*([\s\S]*)$/) || [];
+    const cmd = SLASH.find((c) => c.name === (name || "").toLowerCase());
+    if (cmd) {
+      const out = cmd.run(rest.trim());
+      input.value = "";
+      autoGrow(input);
+      hideAutocomplete();
+      if (out === null || out === undefined || !String(out).trim()) return;
+      content = String(out).slice(0, 4000);
+    } else {
+      toast(`No command called /${name}. Try /help.`, true);
+      return;
+    }
+  }
+
   const nonce = "n" + Math.random().toString(36).slice(2);
   const optimistic = {
     id: "pending-" + nonce,
@@ -615,9 +868,15 @@ function sendCurrentMessage() {
   state.messages.set(state.activeChan, list);
 
   wsSend({ type: "msg", chanId: state.activeChan, content, nonce, replyTo: state.replyTo?.id });
+  // The other half of a DM isn't connected to its Durable Object unless they
+  // have it open, so the hub is what lights up their sidebar.
+  if (state.realmKind === "dm" && state.dmPeer) {
+    hub.nudgeDm(state.dmPeer.uid, content.slice(0, 120));
+  }
   state.lastTypingSent = 0; // sending ends "typing"; next keystroke signals fresh
   input.value = "";
   autoGrow(input);
+  hideAutocomplete();
   clearReply();
   renderMessages();
 }
@@ -648,18 +907,362 @@ function renderMarkdown(text) {
   t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  t = t.replace(/\|\|([\s\S]+?)\|\|/g, '<span class="spoiler" title="Click to reveal">$1</span>');
+  t = highlightMentions(t);
   t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => codeBlocks[+i]);
   return t;
+}
+
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Runs on already-escaped text, so names are matched in their escaped form
+// too. Only names we actually know light up — a stray @ is left alone.
+function highlightMentions(t) {
+  const names = new Set(["everyone", "here"]);
+  for (const member of state.members.values()) names.add(member.name);
+  for (const f of hub.friends.values()) {
+    names.add(f.name);
+    if (f.tag) names.add(f.tag);
+  }
+  if (state.profile?.name) names.add(state.profile.name);
+  if (state.account?.tag) names.add(state.account.tag);
+  const mine = new Set(mentionNames().map((n) => n.toLowerCase()).concat(["everyone", "here"]));
+  // Longest first so "@Keith the Guy" wins over "@Keith".
+  const alts = [...names]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+    .map((n) => reEsc(esc(n)));
+  if (!alts.length) return t;
+  let re;
+  try {
+    re = new RegExp(`@(${alts.join("|")})`, "gi");
+  } catch {
+    return t; // a pathological name broke the pattern; render it plain
+  }
+  return t.replace(re, (whole, name) => {
+    const isMe = mine.has(name.toLowerCase());
+    return `<span class="mention${isMe ? " me" : ""}">@${name}</span>`;
+  });
 }
 
 /* =============================== rendering ============================== */
 
 function renderAll() {
   renderServerRail();
-  $("server-name").textContent = state.meta?.name || "Concord";
   renderChannels();
   renderMembers();
   renderMe();
+  renderDmList();
+  renderHomeBadge();
+  applyView();
+}
+
+/* ------------------------------ view switch ------------------------------ */
+// Three views share one shell: "server" (channels + chat), "home" (DM list +
+// friends), and "dm" (DM list + chat with one friend).
+
+function applyView() {
+  const app = $("app");
+  app.classList.toggle("home-view", state.view === "home");
+  app.classList.toggle("dm-view", state.view === "dm");
+  $("channels").classList.toggle("hidden", state.view !== "server");
+  $("dm-panel").classList.toggle("hidden", state.view === "server");
+  $("friends-view").classList.toggle("hidden", state.view !== "home");
+  $("chat-view").classList.toggle("hidden", state.view === "home");
+  $("home-btn").classList.toggle("active", state.view !== "server");
+
+  const isDm = state.view === "dm";
+  $("btn-invite").classList.toggle("hidden", state.view !== "server");
+  $("btn-gremlin").classList.toggle("hidden", state.view !== "server");
+  $("btn-members").classList.toggle("hidden", state.view !== "server");
+  $("btn-call").classList.toggle("hidden", !isDm);
+  $("btn-pins").classList.toggle("hidden", state.view === "home");
+  $("btn-search").classList.toggle("hidden", state.view === "home");
+  $("server-caret").classList.toggle("hidden", state.view !== "server");
+  $("server-header").style.cursor = state.view === "server" ? "pointer" : "default";
+
+  if (state.view === "server") {
+    $("server-name").textContent = state.meta?.name || "Concord";
+  } else {
+    $("server-name").textContent = "Direct Messages";
+  }
+  renderChatHeader();
+}
+
+function goHome() {
+  state.view = "home";
+  state.fvTab = hub.pendingCount() ? "pending" : "online";
+  applyView();
+  renderFriendsView();
+  renderDmList();
+}
+
+function goServer(code) {
+  state.view = "server";
+  if (code && (state.currentCode !== code || state.realmKind !== "guild")) {
+    state.realmKind = "guild";
+    state.dmPeer = null;
+    connect(code, { kind: "reopen", code });
+  }
+  applyView();
+}
+
+// Opening a DM points the main socket at the DM's Durable Object. That's what
+// makes DM voice calls work with zero extra machinery — but it does mean
+// stepping away from whichever server you were in.
+function openDm(uid) {
+  const friend = hub.friends.get(uid);
+  if (!friend) return;
+  state.view = "dm";
+  applyView();
+  const code = hub.dmCodes.get(uid);
+  if (code) openDmRealm(uid, code, friend);
+  else hub.openDm(uid); // hub replies with dm-ready, which lands here again
+}
+
+function openDmRealm(uid, code, user) {
+  const friend = { ...(hub.friends.get(uid) || {}), ...(user || {}), uid };
+  state.view = "dm";
+  hub.markDmRead(uid);
+  if (state.currentCode === code && state.realmKind === "dm") {
+    state.dmPeer = friend;
+    applyView();
+    renderDmList();
+    return;
+  }
+  state.realmKind = "dm";
+  state.dmPeer = friend;
+  connect(code, { kind: "dm", code, uid });
+  applyView();
+  renderDmList();
+}
+
+/* -------------------------------- DM list -------------------------------- */
+
+function renderHomeBadge() {
+  const n = hub.totalUnread() + hub.pendingCount();
+  const badge = $("home-badge");
+  badge.textContent = n > 99 ? "99+" : String(n);
+  badge.classList.toggle("hidden", !n);
+  const pend = hub.pendingCount();
+  for (const id of ["dm-pending-badge", "fv-pending-badge"]) {
+    const b = $(id);
+    if (!b) continue;
+    b.textContent = String(pend);
+    b.classList.toggle("hidden", !pend);
+  }
+  updateTitle();
+}
+
+function presenceClass(f) {
+  if (!f.online || f.presence === "invisible") return "offline";
+  return PRESENCE_META[f.presence]?.dot || "online";
+}
+
+function renderDmList() {
+  const wrap = $("dm-list");
+  if (!wrap) return;
+  wrap.textContent = "";
+  const friends = [...hub.friends.values()].sort((a, b) => {
+    const ua = hub.unread.get(a.uid) || 0;
+    const ub = hub.unread.get(b.uid) || 0;
+    if (ua !== ub) return ub - ua;
+    const oa = a.online && a.presence !== "invisible" ? 0 : 1;
+    const ob = b.online && b.presence !== "invisible" ? 0 : 1;
+    if (oa !== ob) return oa - ob;
+    return a.name.localeCompare(b.name);
+  });
+  if (!friends.length) {
+    const empty = el("div", "dm-empty", "No friends yet. Hit + to add someone by their tag.");
+    wrap.appendChild(empty);
+    return;
+  }
+  for (const f of friends) {
+    const row = el("div", "dm-row" + (state.view === "dm" && state.dmPeer?.uid === f.uid ? " active" : ""));
+    const wrapAv = el("div", "avatar-wrap small");
+    const av = el("div", "avatar", f.avatar);
+    av.style.background = f.color;
+    wrapAv.appendChild(av);
+    wrapAv.appendChild(el("span", "presence-dot " + presenceClass(f)));
+    row.appendChild(wrapAv);
+    row.appendChild(el("span", "dm-name", f.name));
+    const unread = hub.unread.get(f.uid);
+    if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
+    row.onclick = () => openDm(f.uid);
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      friendMenu(e.clientX, e.clientY, f);
+    };
+    wrap.appendChild(row);
+  }
+}
+
+function friendMenu(x, y, f) {
+  ctxMenu(x, y, [
+    { label: "Message", onClick: () => openDm(f.uid) },
+    { label: "Poke 👉", onClick: () => hub.poke(f.uid) },
+    { label: "Copy Tag", onClick: () => copyText("@" + f.tag, "Tag copied") },
+    {
+      label: "Remove Friend",
+      danger: true,
+      onClick: () =>
+        confirmModal(`Remove ${f.name}?`, "Your DM history stays put, but you'll have to add each other again.", () =>
+          hub.remove(f.uid)
+        ),
+    },
+  ]);
+}
+
+/* ------------------------------ friends view ----------------------------- */
+
+function renderFriendsView() {
+  const body = $("fv-body");
+  if (!body) return;
+  document.querySelectorAll("#fv-tabs button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === state.fvTab);
+  });
+  body.textContent = "";
+
+  if (state.fvTab === "add") {
+    body.appendChild(renderAddFriend());
+    return;
+  }
+
+  if (state.fvTab === "pending") {
+    const incoming = [...hub.incoming.values()];
+    const outgoing = [...hub.outgoing.values()];
+    if (!incoming.length && !outgoing.length) {
+      body.appendChild(emptyState("🕊️", "No pending requests", "Nobody wants anything from you. Peaceful."));
+      return;
+    }
+    if (incoming.length) {
+      body.appendChild(el("div", "fv-head", `Incoming — ${incoming.length}`));
+      for (const u of incoming) body.appendChild(friendRow(u, "incoming"));
+    }
+    if (outgoing.length) {
+      body.appendChild(el("div", "fv-head", `Sent — ${outgoing.length}`));
+      for (const u of outgoing) body.appendChild(friendRow(u, "outgoing"));
+    }
+    return;
+  }
+
+  let friends = [...hub.friends.values()];
+  if (state.fvTab === "online") friends = friends.filter((f) => f.online && f.presence !== "invisible");
+  friends.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (!friends.length) {
+    body.appendChild(
+      state.fvTab === "online"
+        ? emptyState("🌙", "Nobody's around", "Your friends are all offline. Or hiding.")
+        : emptyState("👋", "No friends yet", "Click Add Friend and give someone your tag.")
+    );
+    return;
+  }
+  body.appendChild(el("div", "fv-head", `${state.fvTab === "online" ? "Online" : "All Friends"} — ${friends.length}`));
+  for (const f of friends) body.appendChild(friendRow(f, "friend"));
+}
+
+function emptyState(emoji, title, sub) {
+  const wrap = el("div", "fv-empty");
+  wrap.appendChild(el("div", "fv-empty-emoji", emoji));
+  wrap.appendChild(el("div", "fv-empty-title", title));
+  wrap.appendChild(el("div", "fv-empty-sub", sub));
+  return wrap;
+}
+
+function friendRow(f, mode) {
+  const row = el("div", "friend-row");
+  const wrapAv = el("div", "avatar-wrap");
+  const av = el("div", "avatar", f.avatar);
+  av.style.background = f.color;
+  wrapAv.appendChild(av);
+  wrapAv.appendChild(el("span", "presence-dot " + presenceClass(f)));
+  row.appendChild(wrapAv);
+
+  const col = el("div", "m-col");
+  const name = el("div", "m-name", f.name);
+  name.style.color = f.color;
+  col.appendChild(name);
+  const sub =
+    mode === "incoming"
+      ? "Wants to be your friend"
+      : mode === "outgoing"
+      ? "Request sent"
+      : f.status || (f.online && f.presence !== "invisible" ? PRESENCE_META[f.presence]?.label || "Online" : "Offline");
+  col.appendChild(el("div", "m-status", `@${f.tag} · ${sub}`));
+  row.appendChild(col);
+
+  const actions = el("div", "friend-actions");
+  if (mode === "incoming") {
+    const yes = el("button", "primary-btn tiny", "Accept");
+    yes.onclick = () => hub.accept(f.uid);
+    const no = el("button", "pill-btn tiny", "Ignore");
+    no.onclick = () => hub.decline(f.uid);
+    actions.append(yes, no);
+  } else if (mode === "outgoing") {
+    const cancel = el("button", "pill-btn tiny", "Cancel");
+    cancel.onclick = () => hub.decline(f.uid);
+    actions.appendChild(cancel);
+  } else {
+    const msg = el("button", "icon-btn", "💬");
+    msg.title = "Message";
+    msg.onclick = () => openDm(f.uid);
+    const poke = el("button", "icon-btn", "👉");
+    poke.title = "Poke";
+    poke.onclick = () => hub.poke(f.uid);
+    const more = el("button", "icon-btn", "⋯");
+    more.title = "More";
+    more.onclick = (e) => {
+      e.stopPropagation(); // the document handler would close the menu otherwise
+      friendMenu(e.clientX - 160, e.clientY, f);
+    };
+    actions.append(msg, poke, more);
+  }
+  row.appendChild(actions);
+  return row;
+}
+
+function renderAddFriend() {
+  const wrap = el("div", "add-friend");
+  wrap.appendChild(el("h2", "", "Add a friend"));
+  wrap.appendChild(
+    el("p", "modal-sub", "Friend tags are how people find each other here. Ask for theirs, or send them yours.")
+  );
+
+  const row = el("div", "add-friend-row");
+  const at = el("span", "tag-at", "@");
+  const input = document.createElement("input");
+  input.placeholder = "their-tag";
+  input.maxLength = 25;
+  input.autocomplete = "off";
+  const btn = el("button", "primary-btn", "Send Request");
+  const submit = () => {
+    const tag = input.value.trim().replace(/^@/, "").toLowerCase();
+    if (!tag) return;
+    hub.addFriend(tag);
+    input.value = "";
+  };
+  btn.onclick = submit;
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") submit();
+  };
+  row.append(at, input, btn);
+  wrap.appendChild(row);
+
+  const mine = el("div", "your-tag");
+  mine.appendChild(el("span", "", "Your tag is "));
+  const code = el("b", "", "@" + (hub.me?.tag || state.account?.tag || "…"));
+  mine.appendChild(code);
+  const copy = el("button", "pill-btn tiny", "Copy");
+  copy.onclick = () => copyText("@" + (hub.me?.tag || ""), "Your tag is on the clipboard.");
+  mine.appendChild(copy);
+  const change = el("button", "pill-btn tiny", "Change");
+  change.onclick = () =>
+    promptModal("Pick a new tag", hub.me?.tag || "", (v) => hub.setTag(v.replace(/^@/, "").toLowerCase()));
+  mine.appendChild(change);
+  wrap.appendChild(mine);
+  setTimeout(() => input.focus(), 0);
+  return wrap;
 }
 
 function renderServerRail() {
@@ -668,9 +1271,7 @@ function renderServerRail() {
   for (const s of state.servers) {
     const b = el("div", "server-bubble" + (s.code === state.currentCode ? " active" : ""), s.icon);
     b.title = s.name;
-    b.onclick = () => {
-      if (s.code !== state.currentCode) connect(s.code, { kind: "reopen", code: s.code });
-    };
+    b.onclick = () => goServer(s.code);
     b.oncontextmenu = (e) => {
       e.preventDefault();
       ctxMenu(e.clientX, e.clientY, [
@@ -820,6 +1421,10 @@ function renderMembers() {
     if (member.voice?.muted) icons.append("🔇");
     if (member.voice?.deafened) icons.append("🎧");
     row.appendChild(icons);
+    row.onclick = (e) => {
+      e.stopPropagation(); // otherwise the document handler closes it instantly
+      openProfile(e.clientX - 300, e.clientY - 40, member);
+    };
     if (member.sid !== state.me?.sid && member.voice && member.voice.chanId === state.voiceChan) {
       row.oncontextmenu = (e) => {
         e.preventDefault();
@@ -837,10 +1442,24 @@ function renderMe() {
   if (state.me) av.dataset.vsid = state.me.sid;
   av.classList.toggle("speaking", voice.isSpeaking("me"));
   $("me-name").textContent = state.profile.name;
-  $("me-sub").textContent = state.profile.status || "online";
+  const pres = PRESENCE_META[state.settings.presence] || PRESENCE_META.online;
+  $("me-sub").textContent = state.profile.status || (hub.me?.tag ? "@" + hub.me.tag : pres.label);
+  $("me-presence").className = "presence-dot " + pres.dot;
+  $("me-presence").title = pres.label;
 }
 
 function renderChatHeader() {
+  if (state.view === "dm" && state.dmPeer) {
+    const f = hub.friends.get(state.dmPeer.uid) || state.dmPeer;
+    $("chan-hash").textContent = f.avatar || "💬";
+    $("chan-name").textContent = f.name;
+    $("chan-topic").textContent = f.online && f.presence !== "invisible"
+      ? f.status || PRESENCE_META[f.presence]?.label || "Online"
+      : "Offline";
+    $("input").placeholder = `Message ${f.name}`;
+    return;
+  }
+  $("chan-hash").textContent = "#";
   const c = state.channels.find((x) => x.id === state.activeChan);
   $("chan-name").textContent = c ? c.name : "";
   $("chan-topic").textContent = c?.topic || "";
@@ -881,6 +1500,12 @@ function renderMessages(scrollToBottom = false) {
       group = el("div", "msg-group");
       const av = el("div", "mg-avatar", msg.author.avatar);
       av.style.background = msg.author.color;
+      av.title = "View profile";
+      av.onclick = (e) => {
+        e.stopPropagation();
+        const known = [...state.members.values()].find((mm) => mm.userId === msg.author.userId);
+        openProfile(e.clientX + 12, e.clientY - 40, known || msg.author);
+      };
       group.appendChild(av);
       const body = el("div", "mg-body");
       const head = el("div", "mg-head");
@@ -907,8 +1532,9 @@ function renderMessages(scrollToBottom = false) {
 }
 
 function buildMsgNode(msg) {
-  const node = el("div", "msg" + (msg.pending ? " pending" : ""));
+  const node = el("div", "msg" + (msg.pending ? " pending" : "") + (mentionsMe(msg) ? " pinged" : ""));
   node.dataset.id = msg.id;
+  if (msg.pinned) node.classList.add("is-pinned");
 
   if (msg.replyTo) {
     const r = el("div", "msg-reply", `↩ ${msg.replyTo.name}: ${msg.replyTo.content}`);
@@ -947,6 +1573,9 @@ function buildMsgNode(msg) {
 
   const content = el("div", "msg-content");
   content.innerHTML = renderMarkdown(msg.content);
+  content.querySelectorAll(".spoiler").forEach((s) => {
+    s.onclick = () => s.classList.add("revealed");
+  });
   if (msg.edited) {
     const tag = el("span", "msg-edited", " (edited)");
     content.appendChild(tag);
@@ -984,6 +1613,10 @@ function buildMsgNode(msg) {
     reply.title = "Reply";
     reply.onclick = () => setReply(msg);
     actions.appendChild(reply);
+    const pin = el("button", "", "📌");
+    pin.title = msg.pinned ? "Unpin" : "Pin to channel";
+    pin.onclick = () => wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id });
+    actions.appendChild(pin);
     if (msg.author.userId === myUserId()) {
       const edit = el("button", "", "✏");
       edit.title = "Edit";
@@ -1042,6 +1675,7 @@ function requestHistory(chanId, before) {
 function activateChannel(chanId) {
   state.activeChan = chanId;
   state.unread.delete(chanId);
+  if (state.realmKind === "dm" && state.dmPeer) hub.markDmRead(state.dmPeer.uid);
   updateTitle();
   clearReply();
   state.editingId = null;
@@ -1079,8 +1713,12 @@ async function joinVoice(chanId) {
   state.voiceChan = chanId;
   wsSend({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
   const chan = state.channels.find((c) => c.id === chanId);
-  $("vs-channel").textContent = `${chan?.name || "voice"} / ${state.meta?.name || ""}`;
+  $("vs-channel").textContent =
+    state.realmKind === "dm"
+      ? `Call with ${state.dmPeer?.name || "a friend"}`
+      : `${chan?.name || "voice"} / ${state.meta?.name || ""}`;
   $("voice-status").classList.remove("hidden");
+  $("btn-call").classList.toggle("on", true);
   renderChannels();
 }
 
@@ -1091,6 +1729,7 @@ function leaveVoice({ silent } = {}) {
   wsSend({ type: "voice-leave" });
   $("voice-status").classList.add("hidden");
   $("btn-share").classList.remove("on");
+  $("btn-call").classList.remove("on");
   clearShareStage();
   renderChannels();
   renderMembers();
@@ -1279,6 +1918,11 @@ $("jm-create").onclick = async () => {
     const res = await fetch("/api/new-code");
     const { code } = await res.json();
     closeModals();
+    // Creating a server means going to it, even if we were on the Friends view.
+    state.view = "server";
+    state.realmKind = "guild";
+    state.dmPeer = null;
+    applyView();
     connect(code, { kind: "create", code, name, icon: jmIcon });
   } catch {
     toast("Couldn't reach the server. Are you online?", true);
@@ -1292,6 +1936,10 @@ $("jm-join").onclick = () => {
     return;
   }
   closeModals();
+  state.view = "server";
+  state.realmKind = "guild";
+  state.dmPeer = null;
+  applyView();
   connect(code, { kind: "join", code });
 };
 $("jm-code").addEventListener("keydown", (e) => {
@@ -1337,7 +1985,7 @@ $("btn-invite").onclick = openInviteModal;
 
 /* ----------------------------- gremlin mode ------------------------------ */
 
-function openGremlinModal() {
+function openGremlinModal(preselectSid) {
   const others = [...state.members.values()].filter((m) => m.sid !== state.me?.sid);
   if (!others.length) {
     toast("Nobody here to troll yet. Invite some victims first.", true);
@@ -1355,6 +2003,7 @@ function openGremlinModal() {
     o.value = m.sid;
     select.appendChild(o);
   }
+  if (preselectSid && others.some((m) => m.sid === preselectSid)) select.value = preselectSid;
 
   const grid = $("gm-pranks");
   grid.textContent = "";
@@ -1371,7 +2020,7 @@ function openGremlinModal() {
     grid.appendChild(card);
   }
 }
-$("btn-gremlin").onclick = openGremlinModal;
+$("btn-gremlin").onclick = () => openGremlinModal();
 
 /* ------------------------------- settings ------------------------------- */
 
@@ -1388,6 +2037,9 @@ function openSettings() {
   $("set-notifs").checked = state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted";
   $("set-gremlin").checked = state.settings.gremlin;
   $("set-mascot").checked = state.settings.mascot;
+  $("set-board").checked = state.settings.board;
+  $("set-tag").value = hub.me?.tag || state.account?.tag || "";
+  $("set-presence").value = state.settings.presence || "online";
 
   const fxSelect = $("set-fx");
   fxSelect.textContent = "";
@@ -1433,15 +2085,23 @@ $("set-done").onclick = () => {
   state.settings.micId = $("set-mic").value;
   store.set("settings", state.settings);
   renderMe();
-  wsSend({
-    type: "set-profile",
-    name: state.profile.name,
-    color: state.profile.color,
-    avatar: state.profile.avatar,
-    status: state.profile.status,
-  });
+  pushProfile();
   if (micChanged) voice.setMicDevice();
   closeModals();
+};
+$("set-tag-save").onclick = () => {
+  const tag = $("set-tag").value.trim().replace(/^@/, "").toLowerCase();
+  if (tag) hub.setTag(tag);
+};
+$("set-presence").onchange = (e) => {
+  state.settings.presence = e.target.value;
+  store.set("settings", state.settings);
+  renderMe();
+  hub.pushProfile();
+};
+$("set-board").onchange = (e) => {
+  state.settings.board = e.target.checked;
+  store.set("settings", state.settings);
 };
 $("set-ptt").onchange = (e) => {
   state.settings.ptt = e.target.checked;
@@ -1600,13 +2260,37 @@ function autoGrow(node) {
 }
 input.addEventListener("input", () => {
   autoGrow(input);
+  updateAutocomplete();
   const now = Date.now();
   if (input.value && now - state.lastTypingSent > 4000 && state.activeChan) {
     state.lastTypingSent = now;
     wsSend({ type: "typing", chanId: state.activeChan });
   }
 });
+input.addEventListener("blur", () => setTimeout(hideAutocomplete, 120));
 input.addEventListener("keydown", (e) => {
+  // The autocomplete popup owns the arrows, Tab, Enter and Escape while open.
+  const ac = state.autocomplete;
+  if (ac) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      ac.index = (ac.index + 1) % ac.items.length;
+      return renderAutocomplete();
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      ac.index = (ac.index - 1 + ac.items.length) % ac.items.length;
+      return renderAutocomplete();
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      return applyAutocomplete();
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      return hideAutocomplete();
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     sendCurrentMessage();
@@ -1702,6 +2386,498 @@ $("btn-share").onclick = async () => {
 };
 $("btn-members").onclick = () => $("app").classList.toggle("members-hidden");
 
+// A DM's "call" is just joining the DM's voice channel.
+$("btn-call").onclick = () => {
+  const chan = state.channels.find((c) => c.type === "voice");
+  if (!chan) return;
+  if (state.voiceChan === chan.id) leaveVoice();
+  else joinVoice(chan.id);
+};
+
+/* ========================== home / friends wiring ========================= */
+
+$("home-btn").onclick = goHome;
+$("dm-friends-btn").onclick = goHome;
+$("dm-add-btn").onclick = () => {
+  goHome();
+  state.fvTab = "add";
+  renderFriendsView();
+};
+document.querySelectorAll("#fv-tabs button").forEach((b) => {
+  b.onclick = () => {
+    state.fvTab = b.dataset.tab;
+    renderFriendsView();
+  };
+});
+
+/* =========================== keyboard shortcuts ========================== */
+
+window.addEventListener("keydown", (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openSwitcher();
+  } else if (mod && e.key.toLowerCase() === "f" && state.view !== "home") {
+    e.preventDefault();
+    openSearch();
+  } else if (e.key === "Escape") {
+    hideProfile();
+    $("soundboard").classList.add("hidden");
+    if (!$("modal-backdrop").classList.contains("hidden")) {
+      const blocking =
+        !$("onboard-modal").classList.contains("hidden") ||
+        (!$("join-modal").classList.contains("hidden") && !state.servers.length);
+      if (!blocking) closeModals();
+    }
+  }
+});
+
+// Clicking away closes the floating bits.
+document.addEventListener("click", (e) => {
+  const pop = $("profile-pop");
+  if (!pop.classList.contains("hidden") && !pop.contains(e.target)) hideProfile();
+  const board = $("soundboard");
+  if (!board.classList.contains("hidden") && !board.contains(e.target) && e.target.id !== "btn-soundboard") {
+    board.classList.add("hidden");
+  }
+});
+
+/* ================================ pins =================================== */
+
+$("btn-pins").onclick = () => {
+  if (!state.activeChan) return;
+  $("pins-list").textContent = "Loading…";
+  $("pins-sub").textContent =
+    state.view === "dm" ? "The greatest hits of this conversation." : "The greatest hits of this channel.";
+  showModal("pins-modal");
+  wsSend({ type: "pins", chanId: state.activeChan });
+};
+
+function renderPins(messages) {
+  const list = $("pins-list");
+  list.textContent = "";
+  if (!messages.length) {
+    list.appendChild(emptyState("📌", "Nothing pinned yet", "Hover any message and hit 📌 to immortalise it."));
+    return;
+  }
+  for (const msg of messages) {
+    const row = el("div", "pin-row");
+    const av = el("div", "avatar small", msg.author.avatar);
+    av.style.background = msg.author.color;
+    row.appendChild(av);
+    const col = el("div", "m-col");
+    const head = el("div", "pin-head");
+    const name = el("span", "mg-name", msg.author.name);
+    name.style.color = msg.author.color;
+    head.append(name, el("span", "mg-time", fmtTime(msg.ts)));
+    col.appendChild(head);
+    const body = el("div", "msg-content");
+    body.innerHTML = renderMarkdown(msg.content);
+    body.querySelectorAll(".spoiler").forEach((s) => (s.onclick = () => s.classList.add("revealed")));
+    col.appendChild(body);
+    row.appendChild(col);
+    const jump = el("button", "pill-btn tiny", "Jump");
+    jump.onclick = () => {
+      closeModals();
+      jumpToMessage(msg.id);
+    };
+    const unpin = el("button", "icon-btn", "✕");
+    unpin.title = "Unpin";
+    unpin.onclick = () => {
+      wsSend({ type: "unpin", chanId: msg.chanId, msgId: msg.id });
+      row.remove();
+    };
+    const acts = el("div", "friend-actions");
+    acts.append(jump, unpin);
+    row.appendChild(acts);
+    list.appendChild(row);
+  }
+}
+
+function jumpToMessage(id) {
+  const target = document.querySelector(`.msg[data-id="${id}"]`);
+  if (!target) {
+    toast("That message is further up than we've loaded — scroll up a bit.", true);
+    return;
+  }
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.add("flash");
+  setTimeout(() => target.classList.remove("flash"), 1600);
+}
+
+/* =============================== search ================================== */
+
+$("btn-search").onclick = () => openSearch();
+function openSearch() {
+  if (!state.activeChan) return;
+  showModal("search-modal");
+  $("search-results").textContent = "";
+  const input = $("search-input");
+  input.value = "";
+  setTimeout(() => input.focus(), 0);
+}
+
+let searchTimer = null;
+function runSearch() {
+  const q = $("search-input").value.trim();
+  if (q.length < 2) {
+    $("search-results").textContent = "";
+    return;
+  }
+  const everywhere = $("search-all").checked;
+  wsSend({ type: "search", q, chanId: everywhere ? "" : state.activeChan });
+}
+$("search-input").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 220);
+});
+$("search-all").addEventListener("change", runSearch);
+
+function renderSearchResults(m) {
+  const out = $("search-results");
+  out.textContent = "";
+  if (!m.hits.length) {
+    out.appendChild(emptyState("🔍", "No matches", `Nothing here says "${m.q}".`));
+    return;
+  }
+  out.appendChild(
+    el("div", "fv-head", `${m.hits.length}${m.truncated ? "+" : ""} result${m.hits.length === 1 ? "" : "s"}`)
+  );
+  for (const msg of m.hits) {
+    const row = el("div", "pin-row");
+    const av = el("div", "avatar small", msg.author.avatar);
+    av.style.background = msg.author.color;
+    row.appendChild(av);
+    const col = el("div", "m-col");
+    const head = el("div", "pin-head");
+    const name = el("span", "mg-name", msg.author.name);
+    name.style.color = msg.author.color;
+    head.append(name, el("span", "mg-time", `#${msg.chanName} · ${fmtTime(msg.ts)}`));
+    col.appendChild(head);
+    const body = el("div", "msg-content");
+    body.innerHTML = renderMarkdown(msg.content);
+    col.appendChild(body);
+    row.appendChild(col);
+    const jump = el("button", "pill-btn tiny", "Jump");
+    jump.onclick = () => {
+      closeModals();
+      if (msg.chanId !== state.activeChan) activateChannel(msg.chanId);
+      setTimeout(() => jumpToMessage(msg.id), 300);
+    };
+    row.appendChild(jump);
+    out.appendChild(row);
+  }
+}
+
+/* =========================== quick switcher =============================== */
+
+function openSwitcher() {
+  showModal("switch-modal");
+  const input = $("switch-input");
+  input.value = "";
+  state.switchIndex = 0;
+  renderSwitcher();
+  setTimeout(() => input.focus(), 0);
+}
+
+function switcherCandidates(q) {
+  const items = [];
+  for (const s of state.servers) {
+    items.push({ icon: s.icon, label: s.name, sub: "Server", act: () => goServer(s.code) });
+  }
+  if (state.view === "server") {
+    for (const c of state.channels) {
+      items.push({
+        icon: c.type === "text" ? "#" : "🔊",
+        label: c.name,
+        sub: state.meta?.name || "Channel",
+        act: () => (c.type === "text" ? activateChannel(c.id) : joinVoice(c.id)),
+      });
+    }
+  }
+  for (const f of hub.friends.values()) {
+    items.push({ icon: f.avatar, label: f.name, sub: `@${f.tag} · Direct Message`, act: () => openDm(f.uid) });
+  }
+  items.push({ icon: "👥", label: "Friends", sub: "Home", act: goHome });
+  const needle = q.trim().toLowerCase();
+  if (!needle) return items.slice(0, 12);
+  return items
+    .filter((i) => (i.label + " " + i.sub).toLowerCase().includes(needle))
+    .slice(0, 12);
+}
+
+function renderSwitcher() {
+  const out = $("switch-results");
+  out.textContent = "";
+  state.switchItems = switcherCandidates($("switch-input").value);
+  if (!state.switchItems.length) {
+    out.appendChild(el("div", "switch-empty", "Nothing matches that."));
+    return;
+  }
+  state.switchIndex = Math.max(0, Math.min(state.switchIndex, state.switchItems.length - 1));
+  state.switchItems.forEach((item, i) => {
+    const row = el("div", "switch-row" + (i === state.switchIndex ? " active" : ""));
+    row.appendChild(el("span", "switch-icon", item.icon));
+    row.appendChild(el("span", "switch-label", item.label));
+    row.appendChild(el("span", "switch-sub", item.sub));
+    row.onclick = () => {
+      closeModals();
+      item.act();
+    };
+    out.appendChild(row);
+  });
+}
+
+$("switch-input").addEventListener("input", () => {
+  state.switchIndex = 0;
+  renderSwitcher();
+});
+$("switch-input").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    state.switchIndex++;
+    renderSwitcher();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    state.switchIndex--;
+    renderSwitcher();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    const item = state.switchItems[state.switchIndex];
+    if (item) {
+      closeModals();
+      item.act();
+    }
+  }
+});
+
+/* ============================ profile popout ============================== */
+
+function openProfile(x, y, person) {
+  const pop = $("profile-pop");
+  pop.textContent = "";
+  const uid = person.uid || null;
+  const friend = uid ? hub.friends.get(uid) : null;
+
+  const banner = el("div", "pp-banner");
+  banner.style.background = person.color;
+  pop.appendChild(banner);
+  const av = el("div", "pp-avatar", person.avatar);
+  av.style.background = person.color;
+  pop.appendChild(av);
+
+  const body = el("div", "pp-body");
+  const name = el("div", "pp-name", person.name);
+  name.style.color = person.color;
+  body.appendChild(name);
+  if (person.tag) body.appendChild(el("div", "pp-tag", "@" + person.tag));
+  if (person.status) body.appendChild(el("div", "pp-status", person.status));
+  if (person.voice) {
+    const chan = state.channels.find((c) => c.id === person.voice.chanId);
+    body.appendChild(el("div", "pp-status", `🔊 In ${chan?.name || "voice"}`));
+  }
+
+  const acts = el("div", "pp-actions");
+  const isMe = person.sid ? person.sid === state.me?.sid : uid && uid === hub.me?.uid;
+  if (!isMe) {
+    if (friend) {
+      const msg = el("button", "primary-btn tiny", "Message");
+      msg.onclick = () => {
+        hideProfile();
+        openDm(friend.uid);
+      };
+      const poke = el("button", "pill-btn tiny", "Poke 👉");
+      poke.onclick = () => hub.poke(friend.uid);
+      acts.append(msg, poke);
+    } else if (person.tag) {
+      const add = el("button", "primary-btn tiny", "Add Friend");
+      add.onclick = () => {
+        hub.addFriend(person.tag);
+        hideProfile();
+      };
+      acts.appendChild(add);
+    } else {
+      const hint = el("div", "pp-hint", "Ask them for their friend tag to add them.");
+      body.appendChild(hint);
+    }
+    if (person.sid && person.sid !== state.me?.sid) {
+      const prank = el("button", "pill-btn tiny", "Prank 🃏");
+      prank.onclick = () => {
+        hideProfile();
+        openGremlinModal(person.sid);
+      };
+      acts.appendChild(prank);
+    }
+  } else {
+    const edit = el("button", "pill-btn tiny", "Edit Profile");
+    edit.onclick = () => {
+      hideProfile();
+      openSettings();
+    };
+    acts.appendChild(edit);
+  }
+  body.appendChild(acts);
+  pop.appendChild(body);
+
+  pop.classList.remove("hidden");
+  const w = pop.offsetWidth || 260;
+  const h = pop.offsetHeight || 240;
+  pop.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + "px";
+  pop.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+}
+function hideProfile() {
+  $("profile-pop").classList.add("hidden");
+}
+
+/* ============================== soundboard ================================ */
+
+function fireSound(id) {
+  if (!SOUNDBOARD.some((s) => s.id === id)) return;
+  playSound(id, (state.settings.volume || 100) / 100);
+  if (state.voiceChan) wsSend({ type: "sound", sound: id });
+  else toast("Nobody heard that — join a voice channel first.", true);
+}
+
+function renderSoundboard() {
+  const board = $("soundboard");
+  if (board.childNodes.length) return;
+  const head = el("div", "sb-head", "🎵 Soundboard");
+  board.appendChild(head);
+  const grid = el("div", "sb-grid");
+  for (const s of SOUNDBOARD) {
+    const b = el("button", "sb-btn");
+    b.appendChild(el("span", "sb-emoji", s.emoji));
+    b.appendChild(el("span", "sb-label", s.label));
+    b.onclick = () => fireSound(s.id);
+    grid.appendChild(b);
+  }
+  board.appendChild(grid);
+  board.appendChild(el("div", "sb-foot", "Everyone in your voice channel hears it. Use responsibly. Or don't."));
+}
+
+$("btn-soundboard").onclick = (e) => {
+  e.stopPropagation();
+  renderSoundboard();
+  $("soundboard").classList.toggle("hidden");
+};
+
+/* ============================= autocomplete =============================== */
+// One popup, three modes: @mentions, /commands, and :emoji:.
+
+function hideAutocomplete() {
+  state.autocomplete = null;
+  $("autocomplete").classList.add("hidden");
+}
+
+function autocompleteCandidates() {
+  const node = $("input");
+  const upto = node.value.slice(0, node.selectionStart ?? node.value.length);
+
+  const slash = upto.match(/^\/(\w*)$/);
+  if (slash) {
+    const q = slash[1].toLowerCase();
+    const items = SLASH.filter((c) => c.name.startsWith(q)).map((c) => ({
+      icon: "/",
+      label: c.name,
+      sub: c.help,
+      insert: `/${c.name} `,
+      from: 0,
+    }));
+    return items.length ? { kind: "slash", items } : null;
+  }
+
+  const at = upto.match(/(^|\s)@([\w.\- ]{0,24})$/);
+  if (at) {
+    const q = at[2].toLowerCase();
+    const from = upto.length - at[2].length - 1;
+    const seen = new Set();
+    const items = [];
+    const push = (name, icon, sub) => {
+      const key = name.toLowerCase();
+      if (seen.has(key) || !key.includes(q)) return;
+      seen.add(key);
+      items.push({ icon, label: name, sub, insert: `@${name} `, from });
+    };
+    for (const member of state.members.values()) {
+      if (member.sid !== state.me?.sid) push(member.name, member.avatar, "in this server");
+    }
+    for (const f of hub.friends.values()) push(f.name, f.avatar, "@" + f.tag);
+    if (state.view === "server") {
+      push("everyone", "📣", "notify the whole channel");
+      push("here", "👋", "notify whoever's around");
+    }
+    return items.length ? { kind: "mention", items: items.slice(0, 8) } : null;
+  }
+
+  const colon = upto.match(/(^|\s):([a-z0-9_+-]{2,})$/i);
+  if (colon) {
+    const q = colon[2].toLowerCase();
+    const from = upto.length - colon[2].length - 1;
+    const items = EMOJI_NAMES.filter(([name]) => name.includes(q))
+      .slice(0, 8)
+      .map(([name, emoji]) => ({ icon: emoji, label: `:${name}:`, sub: "", insert: emoji + " ", from }));
+    return items.length ? { kind: "emoji", items } : null;
+  }
+  return null;
+}
+
+function updateAutocomplete() {
+  const found = autocompleteCandidates();
+  if (!found) return hideAutocomplete();
+  const prevIndex = state.autocomplete?.index || 0;
+  state.autocomplete = { ...found, index: Math.min(prevIndex, found.items.length - 1) };
+  renderAutocomplete();
+}
+
+function renderAutocomplete() {
+  const pop = $("autocomplete");
+  const ac = state.autocomplete;
+  if (!ac) return hideAutocomplete();
+  pop.textContent = "";
+  const title = { mention: "MEMBERS", slash: "COMMANDS", emoji: "EMOJI" }[ac.kind];
+  pop.appendChild(el("div", "ac-head", title));
+  ac.items.forEach((item, i) => {
+    const row = el("div", "ac-row" + (i === ac.index ? " active" : ""));
+    row.appendChild(el("span", "ac-icon", item.icon));
+    row.appendChild(el("span", "ac-label", item.label));
+    if (item.sub) row.appendChild(el("span", "ac-sub", item.sub));
+    row.onmousedown = (e) => {
+      e.preventDefault();
+      applyAutocomplete(i);
+    };
+    pop.appendChild(row);
+  });
+  pop.classList.remove("hidden");
+}
+
+function applyAutocomplete(index) {
+  const ac = state.autocomplete;
+  if (!ac) return;
+  const item = ac.items[index ?? ac.index];
+  if (!item) return;
+  const node = $("input");
+  const caret = node.selectionStart ?? node.value.length;
+  node.value = node.value.slice(0, item.from) + item.insert + node.value.slice(caret);
+  const pos = item.from + item.insert.length;
+  node.selectionStart = node.selectionEnd = pos;
+  hideAutocomplete();
+  autoGrow(node);
+  node.focus();
+}
+
+// A small name->emoji table for :shortcode: completion.
+const EMOJI_NAMES = [
+  ["joy", "😂"], ["sob", "😭"], ["skull", "💀"], ["fire", "🔥"], ["heart", "❤️"],
+  ["thumbsup", "👍"], ["thumbsdown", "👎"], ["clap", "👏"], ["pray", "🙏"], ["eyes", "👀"],
+  ["thinking", "🤔"], ["sunglasses", "😎"], ["party", "🥳"], ["tada", "🎉"], ["rocket", "🚀"],
+  ["ghost", "👻"], ["robot", "🤖"], ["alien", "👽"], ["clown", "🤡"], ["poop", "💩"],
+  ["pizza", "🍕"], ["beer", "🍺"], ["coffee", "☕"], ["cat", "🐱"], ["dog", "🐶"],
+  ["fox", "🦊"], ["frog", "🐸"], ["duck", "🦆"], ["shark", "🦈"], ["unicorn", "🦄"],
+  ["moon", "🌙"], ["star", "⭐"], ["zap", "⚡"], ["boom", "💥"], ["sparkles", "✨"],
+  ["check", "✅"], ["x", "❌"], ["warning", "⚠️"], ["question", "❓"], ["100", "💯"],
+  ["sleeping", "💤"], ["wave", "👋"], ["muscle", "💪"], ["brain", "🧠"], ["trophy", "🏆"],
+];
+
 /* ============================ focus / unload ============================= */
 
 window.addEventListener("focus", () => {
@@ -1723,20 +2899,25 @@ window.addEventListener("beforeunload", () => {
 function afterProfileReady() {
   $("app").classList.remove("hidden");
   renderMe();
+  hub.connect(); // friends + DMs stay live regardless of which server we're in
   if (state.settings.mascot) launchMascot();
   const params = new URLSearchParams(location.search);
   const joinCode = (params.get("join") || "").toUpperCase();
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
     history.replaceState(null, "", location.pathname);
+    state.view = "server";
     connect(joinCode, { kind: "join", code: joinCode });
     return;
   }
   const last = store.get("lastServer", null);
   const target = state.servers.find((s) => s.code === last) || state.servers[0];
   if (target) {
+    state.view = "server";
     connect(target.code, { kind: "reopen", code: target.code });
   } else {
+    state.view = "home";
     renderAll();
+    renderFriendsView();
     openJoinModal();
   }
 }

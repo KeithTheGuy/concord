@@ -18,6 +18,10 @@
 
   <!-- far-left server rail -->
   <nav id="server-rail">
+    <button id="home-btn" class="rail-btn home" title="Friends &amp; Direct Messages">
+      <span>💬</span><span id="home-badge" class="rail-badge hidden"></span>
+    </button>
+    <div class="rail-divider"></div>
     <div id="server-list"></div>
     <div class="rail-divider"></div>
     <button id="add-server-btn" class="rail-btn" title="Add a server">+</button>
@@ -35,6 +39,7 @@
       <button data-act="leave" class="danger">Leave Server</button>
     </div>
 
+    <!-- server view: channels -->
     <div id="channels">
       <div class="chan-section">
         <div class="chan-section-head">
@@ -52,6 +57,19 @@
       </div>
     </div>
 
+    <!-- home view: friends + DM list -->
+    <div id="dm-panel" class="hidden">
+      <button id="dm-friends-btn" class="dm-nav">
+        <span class="dm-nav-icon">👥</span><span>Friends</span>
+        <span id="dm-pending-badge" class="chan-badge hidden"></span>
+      </button>
+      <div class="chan-section-head">
+        <span>Direct Messages</span>
+        <button class="chan-add" id="dm-add-btn" title="Add a friend">+</button>
+      </div>
+      <div id="dm-list"></div>
+    </div>
+
     <!-- voice connected panel -->
     <div id="voice-status" class="hidden">
       <div class="vs-row">
@@ -67,7 +85,10 @@
 
     <!-- bottom user panel -->
     <footer id="user-panel">
-      <div class="avatar" id="me-avatar"></div>
+      <div class="avatar-wrap">
+        <div class="avatar" id="me-avatar"></div>
+        <span id="me-presence" class="presence-dot online"></span>
+      </div>
       <div class="me-info">
         <span id="me-name"></span>
         <span id="me-sub">online</span>
@@ -78,13 +99,16 @@
     </footer>
   </aside>
 
-  <!-- main chat column -->
+  <!-- main column -->
   <main id="main">
     <header id="chat-header">
       <span id="chan-hash">#</span>
       <span id="chan-name">general</span>
       <span id="chan-topic"></span>
       <div class="header-actions">
+        <button id="btn-call" class="pill-btn hidden" title="Start a voice call">📞</button>
+        <button id="btn-pins" title="Pinned messages">📌</button>
+        <button id="btn-search" title="Search messages (Ctrl+F)">🔍</button>
         <button id="btn-squirt" class="pill-btn" title="Squirt gun — spray Gorb (Esc to put it away)">💦</button>
         <button id="btn-gremlin" class="pill-btn" title="Gremlin Mode — troll your friends">🃏</button>
         <button id="btn-invite" class="pill-btn">Invite</button>
@@ -92,23 +116,42 @@
       </div>
     </header>
 
-    <!-- screen-share stage -->
-    <div id="share-stage" class="hidden"></div>
-
-    <div id="messages"></div>
-
-    <div id="reply-bar" class="hidden">
-      <span id="reply-label"></span>
-      <button id="reply-cancel">✕</button>
+    <!-- friends home -->
+    <div id="friends-view" class="hidden">
+      <nav id="fv-tabs">
+        <span class="fv-title">👥 Friends</span>
+        <button data-tab="online" class="active">Online</button>
+        <button data-tab="all">All</button>
+        <button data-tab="pending">Pending<span id="fv-pending-badge" class="chan-badge hidden"></span></button>
+        <button data-tab="add" class="fv-add">Add Friend</button>
+      </nav>
+      <div id="fv-body"></div>
     </div>
 
-    <div id="composer">
-      <button id="btn-emoji" title="Emoji">😄</button>
-      <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
-    </div>
-    <div id="typing-bar">&nbsp;</div>
+    <!-- chat -->
+    <div id="chat-view">
+      <div id="share-stage" class="hidden"></div>
 
-    <div id="emoji-picker" class="hidden"></div>
+      <div id="messages"></div>
+
+      <div id="reply-bar" class="hidden">
+        <span id="reply-label"></span>
+        <button id="reply-cancel">✕</button>
+      </div>
+
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
+        <!-- Buttons live to the RIGHT of the box. dapmon was very clear. -->
+        <div id="composer-actions">
+          <button id="btn-soundboard" title="Soundboard (join voice first)">🎵</button>
+          <button id="btn-emoji" title="Emoji">😄</button>
+        </div>
+      </div>
+      <div id="typing-bar">&nbsp;</div>
+
+      <div id="emoji-picker" class="hidden"></div>
+      <div id="autocomplete" class="hidden"></div>
+    </div>
   </main>
 
   <!-- member list -->
@@ -171,12 +214,25 @@
         <h2>Profile</h2>
         <label>Display name</label>
         <input id="set-name" maxlength="32">
+        <label>Friend tag <span class="hint">— this is how people add you</span></label>
+        <div class="tag-row">
+          <span class="tag-at">@</span>
+          <input id="set-tag" maxlength="20" placeholder="keith" autocomplete="off">
+          <button id="set-tag-save" class="pill-btn">Save</button>
+        </div>
         <label>Avatar</label>
         <div id="set-avatars" class="emoji-row"></div>
         <label>Color</label>
         <div id="set-colors" class="color-row"></div>
         <label>Custom status</label>
         <input id="set-status" maxlength="60" placeholder="playing Sea of Thieves">
+        <label>Presence</label>
+        <select id="set-presence">
+          <option value="online">🟢 Online</option>
+          <option value="idle">🌙 Idle</option>
+          <option value="dnd">⛔ Do Not Disturb</option>
+          <option value="invisible">⚫ Invisible</option>
+        </select>
       </section>
       <section>
         <h2>Voice</h2>
@@ -191,9 +247,10 @@
           <label>Push-to-talk key</label>
           <button id="set-ptt-key" class="pill-btn">ControlLeft</button>
         </div>
-        <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification & voice sounds</label>
+        <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification &amp; voice sounds</label>
         <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
         <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
+        <label class="check-row"><input type="checkbox" id="set-board" checked> Allow soundboard clips</label>
         <label class="check-row"><input type="checkbox" id="set-mascot" checked> Let Gorb wander the app</label>
         <button id="set-revive" class="pill-btn">Revive Gorb</button>
         <label>Output volume <span id="set-vol-label">100%</span></label>
@@ -214,6 +271,30 @@
     <div id="gm-pranks"></div>
     <p class="gm-warn">15 second cooldown. They will be told it was you. Godspeed.</p>
     <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- pinned messages -->
+  <div class="modal hidden" id="pins-modal">
+    <h1>📌 Pinned Messages</h1>
+    <p class="modal-sub" id="pins-sub">The greatest hits of this channel.</p>
+    <div id="pins-list"></div>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- search -->
+  <div class="modal hidden" id="search-modal">
+    <h1>🔍 Search</h1>
+    <input id="search-input" maxlength="100" placeholder="Search messages…" autocomplete="off">
+    <label class="check-row"><input type="checkbox" id="search-all"> Search every channel in this server</label>
+    <div id="search-results"></div>
+    <button class="modal-close" data-close>✕</button>
+  </div>
+
+  <!-- quick switcher -->
+  <div class="modal hidden" id="switch-modal">
+    <h1>⚡ Quick Switcher</h1>
+    <input id="switch-input" placeholder="Jump to a channel, server, or friend…" autocomplete="off">
+    <div id="switch-results"></div>
   </div>
 
   <!-- generic confirm -->
@@ -237,6 +318,8 @@
   </div>
 </div>
 
+<div id="soundboard" class="hidden"></div>
+<div id="profile-pop" class="hidden"></div>
 <div id="toasts"></div>
 <div id="ctx-menu" class="menu hidden"></div>
 

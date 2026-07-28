@@ -2,11 +2,23 @@
 // One ConcordServer Durable Object per "server" (guild). It owns channels,
 // message history, live presence, voice-channel state, and relays WebRTC
 // signaling between peers. Static client comes from the [assets] binding.
+//
+// A single ConcordHub Durable Object (see bottom) owns the *global* layer that
+// can't live inside one server: accounts, friend tags, the friend graph, and
+// the secret code for each DM. A DM is just a ConcordServer whose code only
+// the two friends know, which is what makes DM voice calls free.
 
 const CODE_RE = /^[A-Z0-9]{4,12}$/;
 const MSG_CAP = 300; // messages kept per channel
 const HISTORY_PAGE = 60;
 const MAX_REACTION_KEYS = 20; // distinct emoji per message
+const MAX_PINS = 50;
+const SEARCH_SCAN = 1200; // messages examined per search
+const SEARCH_HITS = 40;
+const SOUNDS = new Set([
+  "airhorn", "bruh", "vine", "sad", "yeet", "rimshot", "bonk", "quack",
+  "wow", "fart", "applause", "windows",
+]);
 const PRANK_COOLDOWN_MS = 15_000; // per pranker, keeps Gremlin Mode funny not fatal
 // Per-VICTIM floor. The sender's cooldown can always be dodged by minting a
 // new identity (nothing stops a client opening sockets), so the only bound an
@@ -27,6 +39,7 @@ const RATE_LIMITED = new Set([
   "msg", "react", "edit", "delete", "typing", "history", "set-profile",
   "create-channel", "update-channel", "delete-channel", "update-server",
   "voice-join", "voice-leave", "voice-state", "prank", "hello",
+  "pin", "unpin", "pins", "search", "sound",
 ]);
 
 export default {
@@ -34,6 +47,10 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/ws") {
+      // The hub is a singleton; everything else is one DO per server code.
+      if (url.searchParams.get("hub") === "1") {
+        return env.HUB.get(env.HUB.idFromName("hub")).fetch(request);
+      }
       const code = (url.searchParams.get("server") || "").toUpperCase();
       if (!CODE_RE.test(code)) {
         return new Response("bad server code", { status: 400 });
@@ -69,6 +86,7 @@ export class ConcordServer {
     this.rate = new Map(); // sid -> {count, windowStart}
     this.prankAt = new Map(); // userId -> last prank sent (survives reconnects)
     this.prankedAt = new Map(); // userId -> last prank received
+    this.soundAt = new Map(); // userId -> last soundboard clip
     this.authWrites = 0;
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
@@ -91,18 +109,27 @@ export class ConcordServer {
       if (url.searchParams.get("create") !== "1") {
         return new Response("no such server", { status: 404 });
       }
+      const isDm = url.searchParams.get("kind") === "dm";
       meta = {
         name: cleanText(url.searchParams.get("name"), 40) || "New Server",
         icon: cleanText(url.searchParams.get("icon"), 8) || "🎮",
+        kind: isDm ? "dm" : "guild",
         createdAt: Date.now(),
       };
-      const channels = [
-        { id: "c1", type: "text", name: "general", topic: "Talk about whatever" },
-        { id: "c2", type: "text", name: "random", topic: "Off topic" },
-        { id: "c3", type: "voice", name: "General" },
-        { id: "c4", type: "voice", name: "Gaming" },
-      ];
-      await this.state.storage.put({ meta, channels, nextChanId: 5 });
+      // A DM is a one-room server: one text channel and one voice channel so
+      // "call" is the same code path as joining voice anywhere else.
+      const channels = isDm
+        ? [
+            { id: "c1", type: "text", name: "direct", topic: "" },
+            { id: "c2", type: "voice", name: "Call" },
+          ]
+        : [
+            { id: "c1", type: "text", name: "general", topic: "Talk about whatever" },
+            { id: "c2", type: "text", name: "random", topic: "Off topic" },
+            { id: "c3", type: "voice", name: "General" },
+            { id: "c4", type: "voice", name: "Gaming" },
+          ];
+      await this.state.storage.put({ meta, channels, nextChanId: channels.length + 1 });
     }
 
     const pair = new WebSocketPair();
@@ -168,6 +195,9 @@ export class ConcordServer {
     }
     for (const [key, at] of this.prankedAt) {
       if (now - at > PRANK_VICTIM_FLOOR_MS) this.prankedAt.delete(key);
+    }
+    for (const [key, at] of this.soundAt) {
+      if (now - at > 10_000) this.soundAt.delete(key);
     }
   }
 
@@ -270,6 +300,10 @@ export class ConcordServer {
         s.color = cleanColor(m.color);
         s.avatar = cleanText(m.avatar, 8) || "🙂";
         s.status = cleanText(m.status, 60);
+        // Self-reported hub tag, shown in the member list so you can add
+        // someone as a friend without asking them to type it out. The hub
+        // still validates the real owner when the request is actually sent.
+        s.tag = cleanText(m.tag, 20).toLowerCase();
         s.voice = null;
         s.joined = true;
         this.saveSession(ws, s);
@@ -376,6 +410,11 @@ export class ConcordServer {
         const msg = await storage.get(key);
         if (!msg || msg.author.userId !== s.userId) return;
         await storage.delete(key);
+        if (msg.pinned) {
+          const idxKey = `pins:${chanId}`;
+          const ids = ((await storage.get(idxKey)) || []).filter((id) => id !== msg.id);
+          await storage.put(idxKey, ids);
+        }
         this.broadcast({ type: "msg-delete", chanId, msgId: msg.id });
         break;
       }
@@ -407,6 +446,96 @@ export class ConcordServer {
           { type: "typing", chanId: String(m.chanId || ""), sid: s.sid, name: s.name },
           ws
         );
+        break;
+      }
+
+      // Pins live on the message itself (so history carries the flag) and in a
+      // per-channel index (so the pin list doesn't have to scan the channel).
+      case "pin":
+      case "unpin": {
+        if (!s.joined) return;
+        const chanId = String(m.chanId || "");
+        const key = msgKey(chanId, Number(m.msgId));
+        const msg = await storage.get(key);
+        if (!msg) return;
+        const idxKey = `pins:${chanId}`;
+        const ids = (await storage.get(idxKey)) || [];
+        const at = ids.indexOf(msg.id);
+        if (m.type === "pin") {
+          if (at >= 0) return;
+          if (ids.length >= MAX_PINS) {
+            ws.send(JSON.stringify({ type: "error", error: `Only ${MAX_PINS} pins per channel. Unpin something.` }));
+            return;
+          }
+          ids.push(msg.id);
+          msg.pinned = true;
+        } else {
+          if (at < 0) return;
+          ids.splice(at, 1);
+          delete msg.pinned;
+        }
+        await storage.put({ [key]: msg, [idxKey]: ids });
+        this.broadcast({ type: "msg-pin", chanId, msgId: msg.id, pinned: m.type === "pin", by: s.name });
+        break;
+      }
+
+      case "pins": {
+        if (!s.joined) return;
+        const chanId = String(m.chanId || "");
+        const ids = (await storage.get(`pins:${chanId}`)) || [];
+        const rows = await Promise.all(ids.map((id) => storage.get(msgKey(chanId, id))));
+        const messages = rows.filter(Boolean);
+        // Pinned messages age out of the 300-message window; drop the stragglers.
+        if (messages.length !== ids.length) {
+          await storage.put(`pins:${chanId}`, messages.map((x) => x.id));
+        }
+        ws.send(JSON.stringify({ type: "pins", chanId, messages }));
+        break;
+      }
+
+      case "search": {
+        if (!s.joined) return;
+        const q = cleanText(m.q, 100).toLowerCase();
+        if (q.length < 2) return;
+        const scope = String(m.chanId || "");
+        const channels = (await storage.get("channels")) || [];
+        const targets = scope
+          ? channels.filter((c) => c.id === scope && c.type === "text")
+          : channels.filter((c) => c.type === "text");
+        const hits = [];
+        let scanned = 0;
+        for (const c of targets) {
+          if (hits.length >= SEARCH_HITS || scanned >= SEARCH_SCAN) break;
+          const rows = await storage.list({ prefix: `msg:${c.id}:`, reverse: true, limit: SEARCH_SCAN - scanned });
+          for (const msg of rows.values()) {
+            scanned++;
+            if (msg.content.toLowerCase().includes(q)) {
+              hits.push({ ...msg, chanName: c.name });
+              if (hits.length >= SEARCH_HITS) break;
+            }
+          }
+        }
+        ws.send(JSON.stringify({ type: "search-results", q: m.q, chanId: scope, hits, truncated: hits.length >= SEARCH_HITS }));
+        break;
+      }
+
+      // Soundboard: everyone in the sender's voice channel hears it. Voice is
+      // peer-to-peer, so the clip itself is synthesized locally — this only
+      // relays *which* sound to play, and only to people in the same room.
+      case "sound": {
+        if (!s.joined || !s.voice) return;
+        const sound = cleanText(m.sound, 20);
+        if (!SOUNDS.has(sound)) return;
+        const now = Date.now();
+        const last = this.soundAt.get(s.userId) || 0;
+        if (now - last < 2000) return; // one clip per 2s per person
+        this.soundAt.set(s.userId, now);
+        for (const [sock, other] of this.sessions) {
+          if (!other.joined || other.voice?.chanId !== s.voice.chanId) continue;
+          try {
+            sock.send(JSON.stringify({ type: "sound", sound, name: s.name, sid: s.sid }));
+          } catch {}
+        }
         break;
       }
 
@@ -448,7 +577,7 @@ export class ConcordServer {
         await storage.put("channels", channels);
         // Purge that channel's stored messages.
         const keys = await storage.list({ prefix: `msg:${m.chanId}:` });
-        await storage.delete([...keys.keys(), `chanseq:${m.chanId}`]);
+        await storage.delete([...keys.keys(), `chanseq:${m.chanId}`, `pins:${m.chanId}`]);
         this.broadcast({ type: "channel-delete", chanId: m.chanId });
         break;
       }
@@ -618,6 +747,486 @@ export class ConcordServer {
   }
 }
 
+/* ================================== hub ==================================== */
+// One singleton Durable Object for the whole app. It holds the things that
+// can't belong to any single server: your account, your friend tag, the friend
+// graph, and the secret code for each DM conversation.
+//
+// It deliberately does NOT hold messages. When two people become friends the
+// hub mints a random 12-character code and hands it to exactly those two; the
+// DM itself is an ordinary ConcordServer at that code. That keeps DM history,
+// reactions, typing, and voice calls on the code path that already works,
+// and means the hub never sees a word anyone says.
+
+const TAG_RE = /^[a-z0-9_.]{2,20}$/;
+const FRIEND_CAP = 250;
+const HUB_RATE_LIMITED = new Set([
+  "hello", "friend-add", "friend-accept", "friend-decline", "friend-remove",
+  "presence", "set-tag", "dm-open", "dm-nudge", "dm-read", "poke",
+]);
+
+const frKey = (a, b) => `fr:${a}:${b}`;
+const unreadKey = (owner, other) => `unread:${owner}:${other}`;
+
+export class ConcordHub {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.sessions = new Map(); // ws -> session
+    this.online = new Map(); // uid -> Set<ws>
+    this.rate = new Map();
+    this.state.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
+    );
+    for (const ws of this.state.getWebSockets()) {
+      const s = ws.deserializeAttachment();
+      if (!s) continue;
+      this.sessions.set(ws, s);
+      if (s.uid) this.track(ws, s.uid);
+    }
+  }
+
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    const session = { sid: crypto.randomUUID().slice(0, 8), uid: null };
+    server.serializeAttachment(session);
+    this.sessions.set(server, session);
+    this.state.acceptWebSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  track(ws, uid) {
+    let set = this.online.get(uid);
+    if (!set) {
+      set = new Set();
+      this.online.set(uid, set);
+    }
+    set.add(ws);
+    return set.size === 1; // true when this uid just came online
+  }
+
+  untrack(ws, uid) {
+    const set = this.online.get(uid);
+    if (!set) return false;
+    set.delete(ws);
+    if (set.size) return false;
+    this.online.delete(uid);
+    return true; // that uid's last socket just went away
+  }
+
+  isOnline(uid) {
+    return this.online.has(uid);
+  }
+
+  sendToUser(uid, payload) {
+    const set = this.online.get(uid);
+    if (!set) return false;
+    const raw = JSON.stringify(payload);
+    let sent = false;
+    for (const ws of set) {
+      try {
+        ws.send(raw);
+        sent = true;
+      } catch {}
+    }
+    return sent;
+  }
+
+  overRate(sid) {
+    const now = Date.now();
+    let r = this.rate.get(sid);
+    if (!r || now - r.windowStart > 5000) {
+      r = { count: 0, windowStart: now };
+      this.rate.set(sid, r);
+    }
+    r.count++;
+    return r.count > 30;
+  }
+
+  async account(uid) {
+    return uid ? await this.state.storage.get(`user:${uid}`) : null;
+  }
+
+  publicUser(uid, acct) {
+    return {
+      uid,
+      tag: acct?.tag || "",
+      name: acct?.name || "Wumpus",
+      avatar: acct?.avatar || "🙂",
+      color: acct?.color || "#5865f2",
+      status: acct?.status || "",
+      presence: acct?.presence || "online",
+      online: this.isOnline(uid),
+    };
+  }
+
+  // Tags are the "add me" handle: a slug, plus digits when the slug is taken.
+  async mintTag(name) {
+    const base =
+      (typeof name === "string" ? name : "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_.]/g, "")
+        .slice(0, 14) || "wumpus";
+    if (base.length >= 2 && !(await this.state.storage.get(`tag:${base}`))) return base;
+    for (let i = 0; i < 12; i++) {
+      const n = 1000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 9000);
+      const candidate = `${base.padEnd(2, "0")}${n}`;
+      if (!(await this.state.storage.get(`tag:${candidate}`))) return candidate;
+    }
+    return `user${crypto.randomUUID().slice(0, 8)}`;
+  }
+
+  async friendRows(uid) {
+    const rows = await this.state.storage.list({ prefix: `fr:${uid}:` });
+    const out = [];
+    for (const [key, row] of rows) out.push([key.slice(`fr:${uid}:`.length), row]);
+    return out;
+  }
+
+  // Everyone who has accepted you — the people who get told when you come
+  // online, change your name, or start playing something.
+  async notifyFriends(uid, payload, skipWs = null) {
+    const rows = await this.friendRows(uid);
+    const raw = JSON.stringify(payload);
+    for (const [other, row] of rows) {
+      if (row.state !== "friend") continue;
+      const set = this.online.get(other);
+      if (!set) continue;
+      for (const ws of set) {
+        if (ws === skipWs) continue;
+        try {
+          ws.send(raw);
+        } catch {}
+      }
+    }
+  }
+
+  async webSocketMessage(ws, raw) {
+    if (typeof raw !== "string" || raw.length > 8000) return;
+    let m;
+    try {
+      m = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const s = this.sessions.get(ws) || ws.deserializeAttachment();
+    if (!s) return;
+    this.sessions.set(ws, s);
+    try {
+      await this.hubDispatch(ws, s, m);
+    } catch (err) {
+      try {
+        ws.send(JSON.stringify({ type: "hub-error", error: String(err?.message || err) }));
+      } catch {}
+    }
+  }
+
+  async hubDispatch(ws, s, m) {
+    const storage = this.state.storage;
+    if (HUB_RATE_LIMITED.has(m.type) && this.overRate(s.sid)) return;
+
+    switch (m.type) {
+      case "hello": {
+        if (s.uid) return; // identity is claimed once per socket, as in ConcordServer
+
+        const claimed = cleanText(m.uid, 40);
+        const presented = cleanText(m.token, 64);
+        let uid = claimed;
+        let acct = uid ? await storage.get(`user:${uid}`) : null;
+        if (acct && acct.token !== presented) {
+          acct = null; // wrong token — you get a new account, not theirs
+          uid = "";
+        }
+        if (!acct) {
+          uid = crypto.randomUUID();
+          const tag = await this.mintTag(m.name);
+          acct = {
+            token: crypto.randomUUID(),
+            tag,
+            name: cleanText(m.name, 32) || "Wumpus",
+            avatar: cleanText(m.avatar, 8) || "🙂",
+            color: cleanColor(m.color),
+            status: cleanText(m.status, 60),
+            presence: cleanPresence(m.presence),
+            at: Date.now(),
+          };
+          await storage.put({ [`user:${uid}`]: acct, [`tag:${tag}`]: uid });
+        } else {
+          // Profile travels with the account so friends can see it while
+          // you're offline.
+          if (m.name !== undefined) acct.name = cleanText(m.name, 32) || acct.name;
+          if (m.avatar !== undefined) acct.avatar = cleanText(m.avatar, 8) || acct.avatar;
+          if (m.color !== undefined) acct.color = cleanColor(m.color);
+          if (m.status !== undefined) acct.status = cleanText(m.status, 60);
+          if (m.presence !== undefined) acct.presence = cleanPresence(m.presence);
+          acct.at = Date.now();
+          await storage.put(`user:${uid}`, acct);
+        }
+
+        s.uid = uid;
+        ws.serializeAttachment(s);
+        this.sessions.set(ws, s);
+        const cameOnline = this.track(ws, uid);
+
+        const rows = await this.friendRows(uid);
+        const friends = [];
+        const incoming = [];
+        const outgoing = [];
+        const dmUnread = {};
+        for (const [other, row] of rows) {
+          const otherAcct = await storage.get(`user:${other}`);
+          const user = this.publicUser(other, otherAcct);
+          if (row.state === "friend") {
+            const unread = (await storage.get(unreadKey(uid, other))) || 0;
+            if (unread) dmUnread[other] = unread;
+            friends.push({ ...user, dm: row.dm });
+          } else if (row.state === "in") incoming.push(user);
+          else if (row.state === "out") outgoing.push(user);
+        }
+
+        ws.send(
+          JSON.stringify({
+            type: "hub-welcome",
+            you: this.publicUser(uid, acct),
+            token: acct.token,
+            friends,
+            incoming,
+            outgoing,
+            dmUnread,
+          })
+        );
+        if (cameOnline) {
+          await this.notifyFriends(uid, { type: "friend-presence", uid, online: true, presence: acct.presence });
+        }
+        break;
+      }
+
+      case "set-tag": {
+        if (!s.uid) return;
+        const tag = cleanText(m.tag, 20).toLowerCase().replace(/^@/, "");
+        if (!TAG_RE.test(tag)) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "Tags are 2–20 characters: letters, numbers, dot, underscore." }));
+          return;
+        }
+        const acct = await this.account(s.uid);
+        if (!acct || acct.tag === tag) return;
+        const taken = await storage.get(`tag:${tag}`);
+        if (taken && taken !== s.uid) {
+          ws.send(JSON.stringify({ type: "hub-error", error: `@${tag} is taken. Try another.` }));
+          return;
+        }
+        const old = acct.tag;
+        acct.tag = tag;
+        await storage.put({ [`user:${s.uid}`]: acct, [`tag:${tag}`]: s.uid });
+        if (old && old !== tag) await storage.delete(`tag:${old}`);
+        ws.send(JSON.stringify({ type: "tag-changed", tag }));
+        await this.notifyFriends(s.uid, { type: "friend-update", user: this.publicUser(s.uid, acct) });
+        break;
+      }
+
+      case "presence": {
+        if (!s.uid) return;
+        const acct = await this.account(s.uid);
+        if (!acct) return;
+        if (m.name !== undefined) acct.name = cleanText(m.name, 32) || acct.name;
+        if (m.avatar !== undefined) acct.avatar = cleanText(m.avatar, 8) || acct.avatar;
+        if (m.color !== undefined) acct.color = cleanColor(m.color);
+        if (m.status !== undefined) acct.status = cleanText(m.status, 60);
+        if (m.presence !== undefined) acct.presence = cleanPresence(m.presence);
+        acct.at = Date.now();
+        await storage.put(`user:${s.uid}`, acct);
+        await this.notifyFriends(s.uid, { type: "friend-update", user: this.publicUser(s.uid, acct) });
+        break;
+      }
+
+      case "friend-add": {
+        if (!s.uid) return;
+        const tag = cleanText(m.tag, 25).toLowerCase().replace(/^@/, "");
+        if (!TAG_RE.test(tag)) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "That doesn't look like a tag. They look like @keith or @keith4821." }));
+          return;
+        }
+        const targetUid = await storage.get(`tag:${tag}`);
+        if (!targetUid) {
+          ws.send(JSON.stringify({ type: "hub-error", error: `Nobody here goes by @${tag}.` }));
+          return;
+        }
+        if (targetUid === s.uid) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "You cannot add yourself. Touch grass." }));
+          return;
+        }
+        const mine = await storage.get(frKey(s.uid, targetUid));
+        if (mine?.state === "friend") {
+          ws.send(JSON.stringify({ type: "hub-error", error: "You're already friends." }));
+          return;
+        }
+        if (mine?.state === "out") {
+          ws.send(JSON.stringify({ type: "hub-error", error: "Already asked. Give them a minute." }));
+          return;
+        }
+        const targetAcct = await storage.get(`user:${targetUid}`);
+        // They already asked you — adding them back just accepts.
+        if (mine?.state === "in") {
+          await this.becomeFriends(s.uid, targetUid);
+          return;
+        }
+        const rows = await this.friendRows(s.uid);
+        if (rows.length >= FRIEND_CAP) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "That's a lot of friends. Prune some first." }));
+          return;
+        }
+        const now = Date.now();
+        await storage.put({
+          [frKey(s.uid, targetUid)]: { state: "out", at: now },
+          [frKey(targetUid, s.uid)]: { state: "in", at: now },
+        });
+        const myAcct = await this.account(s.uid);
+        ws.send(JSON.stringify({ type: "friend-outgoing", user: this.publicUser(targetUid, targetAcct) }));
+        this.sendToUser(targetUid, { type: "friend-request", user: this.publicUser(s.uid, myAcct) });
+        break;
+      }
+
+      case "friend-accept": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (row?.state !== "in") return;
+        await this.becomeFriends(s.uid, other);
+        break;
+      }
+
+      case "friend-decline":
+      case "friend-remove": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (!row) return;
+        await storage.delete([
+          frKey(s.uid, other),
+          frKey(other, s.uid),
+          unreadKey(s.uid, other),
+          unreadKey(other, s.uid),
+        ]);
+        ws.send(JSON.stringify({ type: "friend-removed", uid: other }));
+        this.sendToUser(other, { type: "friend-removed", uid: s.uid });
+        break;
+      }
+
+      case "dm-open": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (row?.state !== "friend") {
+          ws.send(JSON.stringify({ type: "hub-error", error: "You can only DM friends." }));
+          return;
+        }
+        // Older friendships predate DM codes; mint one on demand for both.
+        let code = row.dm;
+        if (!code) {
+          code = newServerCode() + newServerCode().slice(0, 4);
+          const mirror = (await storage.get(frKey(other, s.uid))) || { state: "friend", at: Date.now() };
+          row.dm = code;
+          mirror.dm = code;
+          await storage.put({ [frKey(s.uid, other)]: row, [frKey(other, s.uid)]: mirror });
+        }
+        await storage.delete(unreadKey(s.uid, other));
+        const otherAcct = await storage.get(`user:${other}`);
+        ws.send(JSON.stringify({ type: "dm-ready", uid: other, code, user: this.publicUser(other, otherAcct) }));
+        break;
+      }
+
+      // Sent alongside a DM message. The recipient isn't connected to the DM's
+      // Durable Object unless they have it open, so this is what lights up
+      // their sidebar — and what survives until they're back online.
+      case "dm-nudge": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (row?.state !== "friend") return;
+        const key = unreadKey(other, s.uid);
+        const count = ((await storage.get(key)) || 0) + 1;
+        await storage.put(key, Math.min(count, 999));
+        const acct = await this.account(s.uid);
+        this.sendToUser(other, {
+          type: "dm-nudge",
+          uid: s.uid,
+          name: acct?.name || "Someone",
+          preview: cleanText(m.preview, 120),
+          count: Math.min(count, 999),
+        });
+        break;
+      }
+
+      case "dm-read": {
+        if (!s.uid) return;
+        await storage.delete(unreadKey(s.uid, cleanText(m.uid, 40)));
+        break;
+      }
+
+      // Purely for fun: a friend-to-friend nudge that rattles their window.
+      case "poke": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (row?.state !== "friend") return;
+        const acct = await this.account(s.uid);
+        const landed = this.sendToUser(other, { type: "poked", uid: s.uid, name: acct?.name || "Someone" });
+        ws.send(JSON.stringify({ type: "poke-sent", landed }));
+        break;
+      }
+    }
+  }
+
+  async becomeFriends(a, b) {
+    const storage = this.state.storage;
+    const now = Date.now();
+    const existing = await storage.get(frKey(a, b));
+    // 12 chars from the unambiguous alphabet: unguessable, and only these two
+    // are ever told it. That secrecy is what keeps the DM private.
+    const code = existing?.dm || newServerCode() + newServerCode().slice(0, 4);
+    await storage.put({
+      [frKey(a, b)]: { state: "friend", at: now, dm: code },
+      [frKey(b, a)]: { state: "friend", at: now, dm: code },
+    });
+    const [acctA, acctB] = await Promise.all([this.account(a), this.account(b)]);
+    this.sendToUser(a, { type: "friend-added", user: { ...this.publicUser(b, acctB), dm: code } });
+    this.sendToUser(b, { type: "friend-added", user: { ...this.publicUser(a, acctA), dm: code } });
+  }
+
+  async webSocketClose(ws) {
+    await this.dropHubSession(ws);
+  }
+
+  async webSocketError(ws) {
+    await this.dropHubSession(ws);
+  }
+
+  async dropHubSession(ws) {
+    const s = this.sessions.get(ws);
+    this.sessions.delete(ws);
+    if (s) {
+      this.rate.delete(s.sid);
+      if (s.uid && this.untrack(ws, s.uid)) {
+        await this.notifyFriends(s.uid, { type: "friend-presence", uid: s.uid, online: false });
+      }
+    }
+    try {
+      ws.close(1011, "session dropped");
+    } catch {}
+  }
+}
+
+const PRESENCES = new Set(["online", "idle", "dnd", "invisible"]);
+function cleanPresence(v) {
+  return typeof v === "string" && PRESENCES.has(v) ? v : "online";
+}
+
+/* ================================ helpers ================================= */
+
 function publicMember(s) {
   return {
     sid: s.sid,
@@ -626,6 +1235,7 @@ function publicMember(s) {
     color: s.color,
     avatar: s.avatar,
     status: s.status || "",
+    tag: s.tag || "",
     voice: s.voice || null,
   };
 }

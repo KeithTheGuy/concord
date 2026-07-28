@@ -31,10 +31,22 @@ to the server, so only share it with people you want in.
 
 ## Features
 
+- **Friends** — every account gets a tag like `@keith`. Add people by tag, accept or
+  ignore requests, see who's online (online / idle / DND / invisible), poke them
+- **Direct messages** — full 1:1 chat with history, reactions, edits, replies, pins,
+  and **DM voice calls** (the 📞 button). Unread counts survive being offline
 - **Servers** with invite codes; join as many as you want (left rail)
 - **Text channels** — history, edit/delete, replies, emoji reactions, typing indicators,
-  markdown (`**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, ``` ```blocks``` ```), links,
-  unread badges + notification pings, emoji picker
+  markdown (`**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, ``` ```blocks``` ```,
+  `||spoilers||`), links, unread badges + notification pings, emoji picker
+- **@mentions** — autocomplete as you type, highlighted in chat, and they ping you even
+  in the channel you're already looking at. `@everyone` and `@here` too
+- **Pinned messages** (📌 on any message), **message search** (Ctrl+F, one channel or the
+  whole server), and a **quick switcher** (Ctrl+K) for jumping to any channel, server or friend
+- **Slash commands** — `/shrug` `/tableflip` `/me` `/spoiler` `/mock` `/clap` `/roll` `/flip`
+  `/8ball` `/big` `/nick` `/status` `/sound` `/shout` `/help`
+- **Soundboard** — 🎵 next to the message box. Twelve clips, all synthesized in the browser
+  (no audio files to download), played to everyone in your voice channel
 - **Voice channels** — real-time group voice (WebRTC mesh), speaking indicators,
   mute / deafen, push-to-talk with a bindable key, per-user volume (right-click someone
   in voice), input-device picker, join/leave sounds
@@ -54,15 +66,24 @@ to the server, so only share it with people you want in.
 
 ```
 public/    static client (vanilla JS, no build step) — also an installable PWA
-worker/    Cloudflare Worker + ConcordServer Durable Object
+worker/    Cloudflare Worker + ConcordServer and ConcordHub Durable Objects
 electron/  Windows desktop shell (loads the live site, like real Discord)
 test/      smoke.mjs (protocol) · e2e.mjs (two-browser incl. live WebRTC audio)
-           desktop.mjs (Electron) · shot.mjs (screenshots) · icons.mjs (app icons)
+           social.mjs (friends + DMs across two browsers) · desktop.mjs (Electron)
+           shot.mjs (screenshots) · icons.mjs (app icons)
 ```
 
-One Durable Object per server holds channels, the last 300 messages per channel,
-live presence and voice state, and relays WebRTC signaling. Voice audio itself is
-peer-to-peer (mesh) — the server never hears you.
+One **ConcordServer** Durable Object per server holds channels, the last 300 messages
+per channel, pins, live presence and voice state, and relays WebRTC signaling. Voice
+audio itself is peer-to-peer (mesh) — the server never hears you.
+
+One **ConcordHub** Durable Object for the whole app holds the things that can't belong
+to any single server: accounts, friend tags, the friend graph, and DM unread counts.
+
+A **DM is just a ConcordServer** at a random 12-character code that the hub mints when
+two people become friends and tells only those two. That's what makes DM voice calls
+work with no extra machinery — a DM call is literally joining a voice channel. The hub
+never sees message content.
 
 ## Dev
 
@@ -71,6 +92,7 @@ npm install
 npm run dev       # wrangler dev on http://localhost:4189
 npm run smoke     # protocol test against the dev server
 npm run e2e       # two-browser Playwright test (chat + voice + notifications)
+npm run social    # two-browser test of friends, requests, DMs and DM unreads
 npm run app       # run the desktop app from source
 npm run dist      # build Windows installer + portable exe into dist/
 npm run deploy    # ship the web app
@@ -86,3 +108,8 @@ Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wr
 - Voice is a full mesh: great for friend groups (~2–8 people), not for a 50-person raid.
 - Anyone with the invite code is a full member — there are no roles/permissions. It's
   a clubhouse, not a moderation platform.
+- **Opening a DM steps out of the server you were in.** There's one live server socket,
+  and a DM borrows it (which is exactly why DM calls work). You keep getting DM pings
+  and friend presence from the hub the whole time, but not that server's channel pings
+  until you click back. Two sockets would fix it; it hasn't been worth the complexity.
+- Friend tags are global and first-come-first-served across everyone using the app.

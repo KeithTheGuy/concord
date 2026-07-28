@@ -16,6 +16,16 @@ run_worker_first = true
 name = "SERVERS"
 class_name = "ConcordServer"
 
+# One ConcordHub for the whole app: accounts, friend tags, the friend graph,
+# and the secret code behind each DM. Never sees message content.
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "ConcordHub"
+
 [[migrations]]
 tag = "v1-concord"
 new_sqlite_classes = ["ConcordServer"]
+
+[[migrations]]
+tag = "v2-hub"
+new_sqlite_classes = ["ConcordHub"]

@@ -10,6 +10,7 @@
     "deploy": "wrangler deploy",
     "smoke": "node test/smoke.mjs",
     "e2e": "node test/e2e.mjs",
+    "social": "node test/social.mjs",
     "identity": "node test/identity.mjs",
     "voicefx": "node test/voicefx.mjs",
     "app": "electron .",
