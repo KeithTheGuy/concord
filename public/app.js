@@ -124,44 +124,116 @@ const state = {
       micId: "", ptt: false, pttKey: "ControlLeft", sounds: true, volume: 100,
       notifs: false, gremlin: true, mascot: true, board: true, fx: "off",
       fxPitch: 0, gorbHits: 0, presence: "online",
+      userVolumes: {}, // userId -> 0..200, remembered forever
+      muted: {}, // server code -> true, silences pings from that server
+      embeds: true, tts: false, autoIdle: true,
     },
     store.get("settings", {})
   ),
   servers: store.get("servers", []), // [{code, name, icon}]
   view: "server", // server | home | dm
-  realmKind: "guild", // what the main socket is currently pointed at
-  dmPeer: null, // {uid, name, avatar, color, ...} when realmKind === "dm"
+
+  // Every server you're in — and every DM you've opened — keeps its own live
+  // socket and its own copy of channels/messages/members. `activeCode` is
+  // merely which one the UI is currently *showing*, and `voiceCode` is which
+  // one owns the call. They are deliberately independent: browsing another
+  // server, or reading a DM, must never touch a call in progress.
+  realms: new Map(), // code -> realm
+  activeCode: null,
+  voiceCode: null, // realm holding the live call, if any
+  voiceChan: null, // channel id within that realm
+
   fvTab: "online",
-  currentCode: null,
-  ws: null,
-  wsState: "idle", // idle | connecting | open
-  gotWelcome: false,
-  reconnectDelay: 1000,
-  reconnectTimer: null,
-  pingTimer: null,
-  intent: null, // {kind:'create'|'join', code, name?, icon?} while connecting
-  me: null,
-  meta: null,
-  channels: [],
-  members: new Map(), // sid -> member
-  messages: new Map(), // chanId -> msg[]
-  historyLoaded: new Set(), // chanIds whose initial history arrived
-  historyPending: new Set(), // chanIds with an in-flight history request
-  noMoreHistory: new Set(),
-  resume: null, // {code, voiceChan, activeChan} across an unplanned reconnect
-  failCount: 0,
-  activeChan: null,
-  unread: new Map(), // chanId -> count
-  typing: new Map(), // sid -> {name, chanId, until}
   lastTypingSent: 0,
-  replyTo: null, // {id, name}
-  editingId: null,
-  voiceChan: null,
-  pendingByNonce: new Map(),
   autocomplete: null, // {kind:'mention'|'slash'|'emoji', items, index, from}
   switchIndex: 0,
   switchItems: [],
 };
+
+const NO_ARR = [];
+const NO_MAP = new Map();
+const NO_SET = new Set();
+
+function makeRealm(code, kind) {
+  return {
+    code,
+    kind, // "guild" | "dm"
+    peer: null, // the friend, when kind === "dm"
+    ws: null,
+    wsState: "idle", // idle | connecting | open
+    gotWelcome: false,
+    reconnectDelay: 1000,
+    reconnectTimer: null,
+    pingTimer: null,
+    intent: null, // {kind:'create'|'join'|...} while connecting
+    resume: null, // {voiceChan, activeChan} across an unplanned reconnect
+    failCount: 0,
+    closing: false,
+    me: null,
+    meta: null,
+    channels: [],
+    members: new Map(), // sid -> member
+    messages: new Map(), // chanId -> msg[]
+    historyLoaded: new Set(),
+    historyPending: new Set(),
+    noMoreHistory: new Set(),
+    activeChan: null,
+    unread: new Map(), // chanId -> count
+    firstUnread: new Map(), // chanId -> id of the first message you missed
+    mentions: 0, // how many of those unreads were aimed at you
+    typing: new Map(), // sid -> {name, chanId, until}
+    replyTo: null,
+    editingId: null,
+    pendingByNonce: new Map(),
+    touched: Date.now(), // for evicting stale DM sockets
+    send(obj) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(obj));
+        return true;
+      }
+      return false;
+    },
+  };
+}
+
+const R = () => (state.activeCode ? state.realms.get(state.activeCode) : null) || null;
+const voiceRealm = () => (state.voiceCode ? state.realms.get(state.voiceCode) : null) || null;
+
+// The UI reads the *active* realm through plain `state.channels`-style names,
+// so every render and click handler stays realm-agnostic. Anything driven by
+// the network instead takes an explicit realm argument, because a message can
+// arrive for a server you aren't currently looking at.
+const REALM_FIELDS = {
+  channels: NO_ARR,
+  members: NO_MAP,
+  messages: NO_MAP,
+  historyLoaded: NO_SET,
+  historyPending: NO_SET,
+  noMoreHistory: NO_SET,
+  unread: NO_MAP,
+  typing: NO_MAP,
+  pendingByNonce: NO_MAP,
+  me: null,
+  meta: null,
+  activeChan: null,
+  replyTo: null,
+  editingId: null,
+};
+for (const [key, fallback] of Object.entries(REALM_FIELDS)) {
+  Object.defineProperty(state, key, {
+    get() {
+      const r = R();
+      return r ? r[key] : fallback;
+    },
+    set(v) {
+      const r = R();
+      if (r) r[key] = v;
+    },
+  });
+}
+Object.defineProperty(state, "currentCode", { get: () => R()?.code || null });
+Object.defineProperty(state, "realmKind", { get: () => R()?.kind || "guild" });
+Object.defineProperty(state, "dmPeer", { get: () => R()?.peer || null });
 
 /* ============================== dom helpers ============================= */
 
@@ -203,15 +275,19 @@ const esc = (s) =>
 
 /* ============================ voice engine ============================== */
 
+// Every hook resolves against the realm holding the CALL, never the one on
+// screen — that separation is what lets you wander between servers and DMs
+// mid-conversation without dropping anybody.
 const voice = new VoiceEngine({
-  mySid: () => state.me?.sid || "",
-  send: wsSend,
+  mySid: () => voiceRealm()?.me?.sid || "",
+  send: (obj) => voiceRealm()?.send(obj),
   onSpeaking(sid, speaking) {
-    const key = sid === "me" ? state.me?.sid : sid;
+    const key = sid === "me" ? voiceRealm()?.me?.sid : sid;
+    if (!key) return;
     document.querySelectorAll(`[data-vsid="${key}"]`).forEach((n) => n.classList.toggle("speaking", speaking));
   },
   onShareStart(sid, stream) {
-    addShareTile(sid, stream, state.members.get(sid)?.name || "Someone");
+    addShareTile(sid, stream, voiceRealm()?.members.get(sid)?.name || "Someone");
   },
   onShareEnd(sid) {
     removeShareTile(sid);
@@ -222,7 +298,20 @@ const voice = new VoiceEngine({
   },
   onError: (t) => toast(t, true),
   settings: () => state.settings,
-  inMyChannel: (sid) => !!state.voiceChan && state.members.get(sid)?.voice?.chanId === state.voiceChan,
+  inMyChannel: (sid) => !!state.voiceChan && voiceRealm()?.members.get(sid)?.voice?.chanId === state.voiceChan,
+  // Per-person volume keyed on the stable userId, so it survives reconnects,
+  // reloads, and the sid churning on every join.
+  volumeFor: (sid) => {
+    const uid = voiceRealm()?.members.get(sid)?.userId;
+    const saved = uid ? state.settings.userVolumes?.[uid] : undefined;
+    return typeof saved === "number" ? saved : undefined;
+  },
+  saveVolume: (sid, percent) => {
+    const uid = voiceRealm()?.members.get(sid)?.userId;
+    if (!uid) return;
+    state.settings.userVolumes = { ...(state.settings.userVolumes || {}), [uid]: percent };
+    store.set("settings", state.settings);
+  },
 });
 
 /* ================================= hub ================================== */
@@ -230,7 +319,7 @@ const voice = new VoiceEngine({
 const hub = new HubConnection({
   savedAccount: () => state.account,
   profile: () => state.profile || { name: "Wumpus", avatar: "🙂", color: COLORS[0], status: "" },
-  presence: () => state.settings.presence || "online",
+  presence: () => effectivePresence(),
   rememberAccount(uid, token, tag) {
     state.account = { uid, token, tag };
     store.set("account", state.account);
@@ -258,24 +347,41 @@ const hub = new HubConnection({
   onFriendRemoved(uid, known) {
     if (known) toast(`${known.name} is no longer on your friends list.`);
     // If you were reading their DM, there's nothing to read any more.
-    if (state.view === "dm" && state.dmPeer?.uid === uid) goHome();
+    const code = hub.dmCodes.get(uid);
+    if (code) {
+      const wasActive = state.activeCode === code;
+      closeRealm(code);
+      if (wasActive) {
+        state.activeCode = state.servers[0]?.code || null;
+        goHome();
+      }
+    }
   },
   onDmReady(uid, code, user) {
     openDmRealm(uid, code, user);
   },
   onDmNudge(uid, name, preview) {
-    if (state.view === "dm" && state.dmPeer?.uid === uid) {
+    const code = hub.dmCodes.get(uid);
+    const realm = code ? state.realms.get(code) : null;
+    if (realm && realm.code === state.activeCode && state.view === "dm" && !document.hidden && document.hasFocus()) {
       hub.markDmRead(uid); // we're literally looking at it
       return;
     }
-    if (state.settings.sounds) voice.playCue("ping");
+    // If that DM has a live socket, its own `msg` already made the noise —
+    // don't announce the same message twice.
+    if (realm && realm.wsState === "open") {
+      updateTitle();
+      return;
+    }
+    if (state.settings.sounds) voice.playCue("mention");
     updateTitle();
-    if (state.settings.notifs && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    if (notificationsReady()) {
       try {
-        const n = new Notification(`${name} — direct message`, {
+        const n = new Notification(`🔔 ${name} — direct message`, {
           body: preview || "(no preview)",
           icon: "/icon-192.png",
           tag: "concord-dm-" + uid,
+          renotify: true,
         });
         n.onclick = () => {
           window.focus();
@@ -293,47 +399,89 @@ const hub = new HubConnection({
   },
 });
 
+// Your name/avatar/colour should change everywhere at once, not just in the
+// server you happen to be looking at.
+// What everyone else sees. Auto-idle only ever downgrades "online" — an
+// explicit DND or Invisible is left exactly as you set it.
+function effectivePresence() {
+  const chosen = state.settings.presence || "online";
+  return autoIdle && chosen === "online" ? "idle" : chosen;
+}
+
 function pushProfile() {
   hub.pushProfile();
-  wsSend({
+  const payload = {
     type: "set-profile",
     name: state.profile.name,
     color: state.profile.color,
     avatar: state.profile.avatar,
     status: state.profile.status,
-  });
+  };
+  for (const realm of state.realms.values()) realm.send(payload);
 }
 
 /* ============================== websocket =============================== */
 
+// Sends on the realm the UI is showing. Network-driven code should use
+// `realm.send(...)` directly instead — this one follows the user's eyes.
 function wsSend(obj) {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify(obj));
-  }
+  R()?.send(obj);
 }
 
-function connect(code, intent) {
-  disconnect();
-  if (intent?.kind !== "reconnect") state.resume = null;
-  state.currentCode = code;
-  state.intent = intent || { kind: "reopen", code };
-  state.wsState = "connecting";
-  state.gotWelcome = false;
+// Idle DM sockets are cheap but not free. Servers stay connected forever (you
+// want their pings); DMs beyond this many get closed, oldest-touched first.
+const MAX_DM_REALMS = 6;
+
+function openRealm(code, kind, intent) {
+  let realm = state.realms.get(code);
+  if (!realm) {
+    realm = makeRealm(code, kind);
+    state.realms.set(code, realm);
+  }
+  realm.kind = kind;
+  realm.touched = Date.now();
+  if (realm.wsState === "idle") connectRealm(realm, intent);
+  evictStaleDms();
+  return realm;
+}
+
+function evictStaleDms() {
+  const dms = [...state.realms.values()].filter(
+    (r) => r.kind === "dm" && r.code !== state.activeCode && r.code !== state.voiceCode
+  );
+  if (dms.length <= MAX_DM_REALMS) return;
+  dms.sort((a, b) => a.touched - b.touched);
+  for (const r of dms.slice(0, dms.length - MAX_DM_REALMS)) closeRealm(r.code);
+}
+
+function connectRealm(realm, intent) {
+  const code = realm.code;
+  if (intent?.kind !== "reconnect") realm.resume = null;
+  realm.intent = intent || { kind: "reopen", code };
+  realm.wsState = "connecting";
+  realm.gotWelcome = false;
 
   let url = `${location.origin.replace(/^http/, "ws")}/ws?server=${encodeURIComponent(code)}`;
   if (intent?.kind === "create") {
     url += `&create=1&name=${encodeURIComponent(intent.name)}&icon=${encodeURIComponent(intent.icon)}`;
-  } else if (state.realmKind === "dm") {
+  } else if (realm.kind === "dm") {
     // The DM's Durable Object is created lazily the first time either friend
     // opens it; create=1 is a no-op once it exists.
     url += `&create=1&kind=dm&name=${encodeURIComponent("DM")}&icon=${encodeURIComponent("💬")}`;
   }
-  const ws = new WebSocket(url);
-  state.ws = ws;
+
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch {
+    realm.wsState = "idle";
+    return;
+  }
+  realm.ws = ws;
 
   ws.onopen = () => {
-    state.wsState = "open";
-    wsSend({
+    realm.wsState = "open";
+    realm.send({
       type: "hello",
       userId: identityFor(code)?.userId || state.profile.userId,
       token: identityFor(code)?.token || "", // proves this userId is ours
@@ -351,178 +499,199 @@ function connect(code, intent) {
     } catch {
       return;
     }
-    handleServerMessage(m);
+    handleServerMessage(realm, m);
   };
   ws.onclose = () => {
-    if (ws !== state.ws) return;
-    const hadWelcome = state.gotWelcome;
-    state.wsState = "idle";
-    stopPing();
+    if (ws !== realm.ws) return;
+    const hadWelcome = realm.gotWelcome;
+    realm.wsState = "idle";
+    stopRealmPing(realm);
+
     if (!hadWelcome) {
-      // Join/create failed (bad code, or server rejected us).
-      if (state.intent?.kind === "join") {
+      if (realm.intent?.kind === "join") {
         toast("Couldn't join — double-check the invite code.", true);
         state.servers = state.servers.filter((s) => s.code !== code);
         store.set("servers", state.servers);
-        state.currentCode = null;
+        state.realms.delete(code);
+        if (state.activeCode === code) state.activeCode = state.servers[0]?.code || null;
         renderServerRail();
+        applyView();
         if (!state.servers.length) openJoinModal();
         return;
       }
-      // Repeated failures on a saved server: stop hammering, let the user retry.
-      state.failCount++;
-      if (state.failCount >= 5) {
-        state.failCount = 0;
-        state.currentCode = null;
-        toast(`Can't reach server ${code} right now — click it in the rail to retry.`, true);
+      realm.failCount++;
+      if (realm.failCount >= 5) {
+        realm.failCount = 0;
+        toast(`Can't reach ${realm.meta?.name || code} right now — click it in the rail to retry.`, true);
         return;
       }
     } else {
-      state.failCount = 0;
-      // Remember where we were so the reconnect puts us right back.
-      state.resume = { code, voiceChan: state.voiceChan, activeChan: state.activeChan };
+      realm.failCount = 0;
+      realm.resume = {
+        voiceChan: state.voiceCode === code ? state.voiceChan : null,
+        activeChan: realm.activeChan,
+      };
     }
-    if (state.voiceChan) leaveVoice({ silent: true });
-    if (state.currentCode === code) scheduleReconnect(code);
+    // Only the realm that actually owns the call loses it.
+    if (state.voiceCode === code) leaveVoice({ silent: true });
+    if (!realm.closing) scheduleRealmReconnect(realm);
   };
 }
 
-function disconnect() {
-  if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-  state.reconnectTimer = null;
-  stopPing();
-  if (state.ws) {
-    const old = state.ws;
-    state.ws = null;
+function scheduleRealmReconnect(realm) {
+  if (realm.reconnectTimer) clearTimeout(realm.reconnectTimer);
+  if (realm.code === state.activeCode) toast("Connection lost — reconnecting…", true);
+  realm.reconnectTimer = setTimeout(() => {
+    realm.reconnectDelay = Math.min(realm.reconnectDelay * 1.6, 10000);
+    if (state.realms.has(realm.code) && !realm.closing) {
+      connectRealm(realm, { kind: "reconnect", code: realm.code });
+    }
+  }, realm.reconnectDelay);
+}
+
+function closeRealm(code) {
+  const realm = state.realms.get(code);
+  if (!realm) return;
+  realm.closing = true;
+  if (realm.reconnectTimer) clearTimeout(realm.reconnectTimer);
+  stopRealmPing(realm);
+  if (state.voiceCode === code) leaveVoice({ silent: true });
+  if (realm.ws) {
+    const old = realm.ws;
+    realm.ws = null;
     try {
       old.onclose = null;
       old.close();
     } catch {}
   }
-  if (state.voiceChan) leaveVoice({ silent: true });
-  state.members.clear();
-  state.messages.clear();
-  state.historyLoaded.clear();
-  state.historyPending.clear();
-  state.noMoreHistory.clear();
-  state.unread.clear();
-  state.typing.clear();
-  state.me = null;
-  state.meta = null;
-  state.channels = [];
-  state.activeChan = null;
-  state.gotWelcome = false;
+  state.realms.delete(code);
 }
 
-function scheduleReconnect(code) {
-  toast("Connection lost — reconnecting…", true);
-  state.reconnectTimer = setTimeout(() => {
-    state.reconnectDelay = Math.min(state.reconnectDelay * 1.6, 10000);
-    if (state.currentCode === code) connect(code, { kind: "reconnect", code });
-  }, state.reconnectDelay);
-}
-
-function startPing() {
-  stopPing();
-  state.pingTimer = setInterval(() => {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send('{"type":"ping"}');
+function startRealmPing(realm) {
+  stopRealmPing(realm);
+  realm.pingTimer = setInterval(() => {
+    if (realm.ws?.readyState === WebSocket.OPEN) realm.ws.send('{"type":"ping"}');
   }, 30000);
 }
-function stopPing() {
-  if (state.pingTimer) clearInterval(state.pingTimer);
-  state.pingTimer = null;
+function stopRealmPing(realm) {
+  if (realm.pingTimer) clearInterval(realm.pingTimer);
+  realm.pingTimer = null;
 }
 
 /* ========================== server msg handling ========================= */
 
-function handleServerMessage(m) {
+// `realm` is which connection this arrived on — NOT necessarily the one on
+// screen. Anything visual is gated on `live` so a busy server you aren't
+// looking at can't repaint the one you are.
+function handleServerMessage(realm, m) {
+  const live = realm.code === state.activeCode;
+  const inCall = state.voiceCode === realm.code;
+
   switch (m.type) {
     case "pong":
       break;
 
     case "welcome": {
-      state.gotWelcome = true;
-      state.reconnectDelay = 1000;
-      state.me = m.you;
-      rememberIdentity(state.currentCode, m.you.userId, m.token);
-      state.meta = m.meta;
-      state.channels = m.channels;
-      state.members = new Map(m.members.map((mm) => [mm.sid, mm]));
-      startPing();
+      realm.gotWelcome = true;
+      realm.reconnectDelay = 1000;
+      realm.me = m.you;
+      rememberIdentity(realm.code, m.you.userId, m.token);
+      realm.meta = m.meta;
+      realm.channels = m.channels;
+      realm.members = new Map(m.members.map((mm) => [mm.sid, mm]));
+      startRealmPing(realm);
+
+      const resume = realm.resume;
+      realm.resume = null;
+      const wasIntent = realm.intent;
+      realm.intent = null;
 
       // A DM is a ConcordServer too, but it never belongs in the server rail.
-      if (state.realmKind === "dm") {
-        state.intent = null;
-        const resumeDm = state.resume && state.resume.code === state.currentCode ? state.resume : null;
-        state.resume = null;
-        renderAll();
-        const chan = state.channels.find((c) => c.type === "text");
-        if (chan) activateChannel(chan.id);
-        if (resumeDm?.voiceChan && state.channels.some((c) => c.id === resumeDm.voiceChan && c.type === "voice")) {
-          joinVoice(resumeDm.voiceChan);
+      if (realm.kind === "dm") {
+        const chan = realm.channels.find((c) => c.type === "text");
+        if (chan && !realm.activeChan) realm.activeChan = chan.id;
+        if (live) {
+          renderAll();
+          if (realm.activeChan) activateChannel(realm.activeChan);
+        } else if (realm.activeChan && !realm.historyLoaded.has(realm.activeChan)) {
+          requestHistoryIn(realm, realm.activeChan);
+        }
+        if (resume?.voiceChan && realm.channels.some((c) => c.id === resume.voiceChan && c.type === "voice")) {
+          joinVoiceIn(realm, resume.voiceChan);
         }
         break;
       }
 
       // Persist / refresh this server in the rail.
-      const existing = state.servers.find((s) => s.code === state.currentCode);
+      const existing = state.servers.find((s) => s.code === realm.code);
       if (existing) {
         existing.name = m.meta.name;
         existing.icon = m.meta.icon;
       } else {
-        state.servers.push({ code: state.currentCode, name: m.meta.name, icon: m.meta.icon });
+        state.servers.push({ code: realm.code, name: m.meta.name, icon: m.meta.icon });
       }
       store.set("servers", state.servers);
-      store.set("lastServer", state.currentCode);
 
-      if (state.intent?.kind === "create") {
+      if (wasIntent?.kind === "create") {
         toast(`Server "${m.meta.name}" created! Hit Invite to get your friends in.`);
         openInviteModal();
-      } else if (state.intent?.kind === "join") {
+      } else if (wasIntent?.kind === "join") {
         toast(`Joined ${m.meta.name}!`);
       }
-      state.intent = null;
 
-      const resume = state.resume && state.resume.code === state.currentCode ? state.resume : null;
-      state.resume = null;
-      renderAll();
-      const firstText = state.channels.find((c) => c.type === "text");
+      const firstText = realm.channels.find((c) => c.type === "text");
       const target =
-        resume && state.channels.some((c) => c.id === resume.activeChan && c.type === "text")
+        (resume && realm.channels.some((c) => c.id === resume.activeChan && c.type === "text")
           ? resume.activeChan
-          : firstText?.id;
-      if (target) activateChannel(target);
-      if (resume?.voiceChan && state.channels.some((c) => c.id === resume.voiceChan && c.type === "voice")) {
-        joinVoice(resume.voiceChan); // rejoin the call we were dropped from
+          : null) ||
+        (realm.channels.some((c) => c.id === realm.activeChan && c.type === "text") ? realm.activeChan : null) ||
+        firstText?.id;
+      realm.activeChan = target || null;
+
+      if (live) {
+        store.set("lastServer", realm.code);
+        renderAll();
+        if (target) activateChannel(target);
+      } else {
+        renderServerRail();
+        // Load enough to know whether anything in here needs your attention.
+        if (target && !realm.historyLoaded.has(target)) requestHistoryIn(realm, target);
+      }
+      if (resume?.voiceChan && realm.channels.some((c) => c.id === resume.voiceChan && c.type === "voice")) {
+        joinVoiceIn(realm, resume.voiceChan); // rejoin the call we were dropped from
       }
       break;
     }
 
     case "member-join": {
-      state.members.set(m.member.sid, m.member);
-      renderMembers();
-      renderChannels();
+      realm.members.set(m.member.sid, m.member);
+      if (live) {
+        renderMembers();
+        renderChannels();
+      }
       break;
     }
 
     case "member-leave": {
-      const member = state.members.get(m.sid);
-      state.members.delete(m.sid);
-      state.typing.delete(m.sid);
-      if (member?.voice?.chanId && member.voice.chanId === state.voiceChan) {
+      const member = realm.members.get(m.sid);
+      realm.members.delete(m.sid);
+      realm.typing.delete(m.sid);
+      if (inCall && member?.voice?.chanId && member.voice.chanId === state.voiceChan) {
         voice.peerLeft(m.sid);
         voice.playCue("leave");
       }
-      renderMembers();
-      renderChannels();
-      renderTyping();
+      if (live) {
+        renderMembers();
+        renderChannels();
+        renderTyping();
+      }
       break;
     }
 
     case "member-update": {
-      const prev = state.members.get(m.member.sid);
-      state.members.set(m.member.sid, m.member);
-      if (m.member.sid !== state.me?.sid && state.voiceChan) {
+      const prev = realm.members.get(m.member.sid);
+      realm.members.set(m.member.sid, m.member);
+      if (inCall && m.member.sid !== realm.me?.sid && state.voiceChan) {
         const was = prev?.voice?.chanId === state.voiceChan;
         const is = m.member.voice?.chanId === state.voiceChan;
         if (was && !is) {
@@ -532,21 +701,23 @@ function handleServerMessage(m) {
           voice.playCue("join"); // they'll initiate the WebRTC offer to us
         }
       }
-      renderMembers();
-      renderChannels();
+      if (live) {
+        renderMembers();
+        renderChannels();
+      }
       break;
     }
 
     case "msg": {
-      pushMessage(m.msg);
-      notifyIfNeeded(m.msg);
+      pushMessage(realm, m.msg);
+      notifyIfNeeded(realm, m.msg);
       break;
     }
 
     case "msg-ack": {
-      const pending = state.pendingByNonce.get(m.nonce);
-      state.pendingByNonce.delete(m.nonce);
-      const list = state.messages.get(m.msg.chanId) || [];
+      const pending = realm.pendingByNonce.get(m.nonce);
+      realm.pendingByNonce.delete(m.nonce);
+      const list = realm.messages.get(m.msg.chanId) || [];
       if (pending) {
         const i = list.indexOf(pending);
         if (i >= 0) list[i] = m.msg;
@@ -554,152 +725,163 @@ function handleServerMessage(m) {
       } else {
         list.push(m.msg);
       }
-      state.messages.set(m.msg.chanId, list);
-      if (m.msg.chanId === state.activeChan) renderMessages();
+      realm.messages.set(m.msg.chanId, list);
+      if (live && m.msg.chanId === realm.activeChan) renderMessages();
       break;
     }
 
     case "history": {
-      state.historyPending.delete(m.chanId);
-      const existing = state.messages.get(m.chanId) || [];
+      realm.historyPending.delete(m.chanId);
+      const existing = realm.messages.get(m.chanId) || [];
       if (m.before) {
-        if (!m.messages.length) state.noMoreHistory.add(m.chanId);
+        if (!m.messages.length) realm.noMoreHistory.add(m.chanId);
         const known = new Set(existing.map((x) => x.id));
-        state.messages.set(m.chanId, [...m.messages.filter((x) => !known.has(x.id)), ...existing]);
+        realm.messages.set(m.chanId, [...m.messages.filter((x) => !known.has(x.id)), ...existing]);
       } else {
         // Initial load — keep optimistic pendings and any live messages that
         // raced in before this response (deduped by id).
         const known = new Set(m.messages.map((x) => x.id));
         const extras = existing.filter((x) => x.pending || !known.has(x.id));
-        state.messages.set(m.chanId, [...m.messages, ...extras]);
-        state.historyLoaded.add(m.chanId);
-        if (m.messages.length < 60) state.noMoreHistory.add(m.chanId);
+        realm.messages.set(m.chanId, [...m.messages, ...extras]);
+        realm.historyLoaded.add(m.chanId);
+        if (m.messages.length < 60) realm.noMoreHistory.add(m.chanId);
       }
-      if (m.chanId === state.activeChan) renderMessages(!m.before);
+      if (live && m.chanId === realm.activeChan) renderMessages(!m.before);
       break;
     }
 
     case "msg-edit": {
-      const list = state.messages.get(m.msg.chanId) || [];
+      const list = realm.messages.get(m.msg.chanId) || [];
       const i = list.findIndex((x) => x.id === m.msg.id);
       if (i >= 0) list[i] = m.msg;
-      if (m.msg.chanId === state.activeChan) renderMessages();
+      if (live && m.msg.chanId === realm.activeChan) renderMessages();
       break;
     }
 
     case "msg-delete": {
-      const list = state.messages.get(m.chanId) || [];
-      state.messages.set(m.chanId, list.filter((x) => x.id !== m.msgId));
-      if (m.chanId === state.activeChan) renderMessages();
+      const list = realm.messages.get(m.chanId) || [];
+      realm.messages.set(m.chanId, list.filter((x) => x.id !== m.msgId));
+      if (live && m.chanId === realm.activeChan) renderMessages();
       break;
     }
 
     case "msg-react": {
-      const list = state.messages.get(m.chanId) || [];
+      const list = realm.messages.get(m.chanId) || [];
       const msg = list.find((x) => x.id === m.msgId);
       if (msg) {
         if (Object.keys(m.reactions).length) msg.reactions = m.reactions;
         else delete msg.reactions;
-        if (m.chanId === state.activeChan) renderMessages();
+        if (live && m.chanId === realm.activeChan) renderMessages();
       }
       break;
     }
 
     case "typing": {
-      if (m.chanId !== state.activeChan) break;
-      state.typing.set(m.sid, { name: m.name, chanId: m.chanId, until: Date.now() + 6000 });
-      renderTyping();
+      if (m.chanId !== realm.activeChan) break;
+      realm.typing.set(m.sid, { name: m.name, chanId: m.chanId, until: Date.now() + 6000 });
+      if (live) renderTyping();
+      // A friend typing at you shows up in the DM list even when you're
+      // reading something else.
+      else if (realm.kind === "dm") renderDmList();
       break;
     }
 
     case "channel-create": {
-      state.channels.push(m.channel);
-      renderChannels();
-      toast(`Channel ${m.channel.type === "text" ? "#" : "🔊 "}${m.channel.name} created`);
+      realm.channels.push(m.channel);
+      if (live) {
+        renderChannels();
+        toast(`Channel ${m.channel.type === "text" ? "#" : "🔊 "}${m.channel.name} created`);
+      }
       break;
     }
 
     case "channel-update": {
-      const i = state.channels.findIndex((c) => c.id === m.channel.id);
-      if (i >= 0) state.channels[i] = m.channel;
-      renderChannels();
-      if (m.channel.id === state.activeChan) renderChatHeader();
+      const i = realm.channels.findIndex((c) => c.id === m.channel.id);
+      if (i >= 0) realm.channels[i] = m.channel;
+      if (live) {
+        renderChannels();
+        if (m.channel.id === realm.activeChan) renderChatHeader();
+      }
       break;
     }
 
     case "channel-delete": {
-      state.channels = state.channels.filter((c) => c.id !== m.chanId);
-      state.messages.delete(m.chanId);
-      state.historyLoaded.delete(m.chanId);
-      state.historyPending.delete(m.chanId);
-      state.noMoreHistory.delete(m.chanId);
-      if (state.voiceChan === m.chanId) leaveVoice();
-      if (state.activeChan === m.chanId) {
-        const first = state.channels.find((c) => c.type === "text");
-        if (first) activateChannel(first.id);
+      realm.channels = realm.channels.filter((c) => c.id !== m.chanId);
+      realm.messages.delete(m.chanId);
+      realm.historyLoaded.delete(m.chanId);
+      realm.historyPending.delete(m.chanId);
+      realm.noMoreHistory.delete(m.chanId);
+      realm.unread.delete(m.chanId);
+      if (inCall && state.voiceChan === m.chanId) leaveVoice();
+      if (realm.activeChan === m.chanId) {
+        const first = realm.channels.find((c) => c.type === "text");
+        realm.activeChan = first?.id || null;
+        if (live && first) activateChannel(first.id);
       }
-      renderChannels();
+      if (live) renderChannels();
       break;
     }
 
     case "server-meta": {
-      state.meta = m.meta;
-      const entry = state.servers.find((s) => s.code === state.currentCode);
+      realm.meta = m.meta;
+      const entry = state.servers.find((s) => s.code === realm.code);
       if (entry) {
         entry.name = m.meta.name;
         entry.icon = m.meta.icon;
         store.set("servers", state.servers);
       }
-      $("server-name").textContent = m.meta.name;
+      if (live) $("server-name").textContent = m.meta.name;
       renderServerRail();
       break;
     }
 
     case "msg-pin": {
-      const list = state.messages.get(m.chanId) || [];
+      const list = realm.messages.get(m.chanId) || [];
       const msg = list.find((x) => x.id === m.msgId);
       if (msg) {
         if (m.pinned) msg.pinned = true;
         else delete msg.pinned;
-        if (m.chanId === state.activeChan) renderMessages();
       }
-      if (m.chanId === state.activeChan) {
+      if (live && m.chanId === realm.activeChan) {
+        renderMessages();
         toast(m.pinned ? `📌 ${m.by} pinned a message.` : `${m.by} unpinned a message.`);
       }
       break;
     }
 
     case "pins": {
-      renderPins(m.messages);
+      if (live) renderPins(m.messages);
       break;
     }
 
     case "search-results": {
-      renderSearchResults(m);
+      if (live) renderSearchResults(m);
       break;
     }
 
     case "sound": {
-      if (!state.settings.board) break;
-      if (m.sid === state.me?.sid) break; // we already played it locally
+      // Soundboard is a voice-channel thing: only the call's realm plays it.
+      if (!inCall || !state.settings.board) break;
+      if (m.sid === realm.me?.sid) break; // we already played it locally
       playSound(m.sound, (state.settings.volume || 100) / 100);
       const clip = SOUNDBOARD.find((s) => s.id === m.sound);
       if (clip) toast(`${clip.emoji} ${m.name} played ${clip.label}`);
       break;
     }
 
+    // WebRTC signaling is only ever meaningful for the realm holding the call.
     case "voice-peers": {
-      voice.connectToPeers(m.peers);
+      if (inCall) voice.connectToPeers(m.peers);
       break;
     }
 
     case "rtc": {
-      voice.handleRtc(m.from, m.data);
+      if (inCall) voice.handleRtc(m.from, m.data);
       break;
     }
 
     case "rtc-gone": {
-      voice.peerLeft(m.sid);
+      if (inCall) voice.peerLeft(m.sid);
       break;
     }
 
@@ -735,7 +917,7 @@ function handleServerMessage(m) {
     }
 
     case "error": {
-      toast(m.error, true);
+      if (live) toast(m.error, true);
       break;
     }
   }
@@ -743,15 +925,15 @@ function handleServerMessage(m) {
 
 /* ============================== messaging =============================== */
 
-function pushMessage(msg) {
-  const list = state.messages.get(msg.chanId) || [];
+function pushMessage(realm, msg) {
+  const list = realm.messages.get(msg.chanId) || [];
   if (list.some((x) => x.id === msg.id)) return;
   list.push(msg);
-  state.messages.set(msg.chanId, list);
-  state.typing.forEach((t, sid) => {
-    if (state.members.get(sid)?.userId === msg.author.userId) state.typing.delete(sid);
+  realm.messages.set(msg.chanId, list);
+  realm.typing.forEach((t, sid) => {
+    if (realm.members.get(sid)?.userId === msg.author.userId) realm.typing.delete(sid);
   });
-  if (msg.chanId === state.activeChan) {
+  if (realm.code === state.activeCode && msg.chanId === realm.activeChan) {
     renderMessages();
     renderTyping();
   }
@@ -767,32 +949,73 @@ function mentionNames() {
   return names;
 }
 
-function mentionsMe(msg) {
-  if (msg.author.userId === myUserId()) return false;
+function mentionsMe(msg, realm) {
+  const meId = realm ? realmUserId(realm) : myUserId();
+  if (msg.author.userId === meId) return false;
   const text = msg.content.toLowerCase();
   if (text.includes("@everyone") || text.includes("@here")) return true;
   return mentionNames().some((n) => n && text.includes("@" + n.toLowerCase()));
 }
 
-function notifyIfNeeded(msg) {
-  const mine = msg.author.userId === myUserId();
-  if (mine) return;
-  const pinged = mentionsMe(msg);
-  // "Inactive" = other channel, tab hidden, OR window visible but not
-  // focused (second monitor while gaming — the whole point of notifications).
-  const inactive = msg.chanId !== state.activeChan || document.hidden || !document.hasFocus();
-  // A direct mention always pings, even in the channel you're staring at —
-  // that's the entire point of being @'d.
-  if (inactive || pinged) {
-    if (msg.chanId !== state.activeChan) {
-      state.unread.set(msg.chanId, (state.unread.get(msg.chanId) || 0) + 1);
-      renderChannels();
-    }
-    if (state.settings.sounds) voice.playCue("ping");
+const realmUserId = (realm) =>
+  realm?.me?.userId || identityFor(realm?.code)?.userId || state.profile?.userId;
+
+function notifyIfNeeded(realm, msg) {
+  if (msg.author.userId === realmUserId(realm)) return;
+  const isDm = realm.kind === "dm";
+  const pinged = isDm || mentionsMe(msg, realm);
+  const looking =
+    realm.code === state.activeCode &&
+    msg.chanId === realm.activeChan &&
+    state.view !== "home" &&
+    !document.hidden &&
+    document.hasFocus();
+
+  if (!looking) {
+    realm.unread.set(msg.chanId, (realm.unread.get(msg.chanId) || 0) + 1);
+    // Remember where you'd got to, so the "new messages" line lands in the
+    // right place when you come back.
+    if (!realm.firstUnread.has(msg.chanId)) realm.firstUnread.set(msg.chanId, msg.id);
+    if (pinged) realm.mentions = (realm.mentions || 0) + 1;
+    if (realm.code === state.activeCode) renderChannels();
+    renderServerRail();
+  }
+
+  // A muted server still counts unread — it just doesn't make a sound or
+  // throw a notification at you.
+  if (state.settings.muted?.[realm.code]) {
     updateTitle();
-    if (inactive) desktopNotify(msg);
+    return;
+  }
+
+  // A direct mention or a DM always announces itself, even in the channel
+  // you're staring at — that's the entire point.
+  if (!looking || pinged) {
+    if (state.settings.sounds) voice.playCue(pinged ? "mention" : "ping");
+    updateTitle();
+    if (!looking) desktopNotify(realm, msg, pinged);
     if (pinged && !document.hidden) flashMention();
   }
+  if (looking && state.settings.tts) speakMessage(msg);
+}
+
+/* --------------------------- read messages aloud ------------------------- */
+// Opt-in on the receiving side only — nobody can force speech onto anyone
+// else's machine, which is the flaw in the version Discord shipped.
+function speakMessage(msg) {
+  if (typeof speechSynthesis === "undefined") return;
+  const text = msg.content
+    .replace(/```[\s\S]*?```/g, " code block ")
+    .replace(/https?:\/\/\S+/g, " link ")
+    .replace(/[*_~`|]/g, "")
+    .slice(0, 240);
+  if (!text.trim()) return;
+  try {
+    const u = new SpeechSynthesisUtterance(`${msg.author.name} says ${text}`);
+    u.rate = 1.05;
+    u.volume = Math.min(1, (state.settings.volume || 100) / 100);
+    speechSynthesis.speak(u);
+  } catch {}
 }
 
 function flashMention() {
@@ -800,18 +1023,28 @@ function flashMention() {
   setTimeout(() => document.body.classList.remove("mentioned"), 900);
 }
 
-function desktopNotify(msg) {
-  if (!state.settings.notifs) return;
-  if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  const chan = state.channels.find((c) => c.id === msg.chanId);
+// Fires a real OS notification (a Windows toast in the desktop app). `urgent`
+// marks mentions and DMs so they bypass the "only when unfocused" rule and
+// don't get coalesced away by a same-channel notification.
+function desktopNotify(realm, msg, urgent) {
+  if (!notificationsReady()) return;
+  const chan = realm.channels.find((c) => c.id === msg.chanId);
+  const where =
+    realm.kind === "dm"
+      ? `${realm.peer?.name || msg.author.name} — direct message`
+      : `${msg.author.name} • #${chan?.name || "?"} — ${realm.meta?.name || "Concord"}`;
   try {
-    const n = new Notification(`${msg.author.name} • #${chan?.name || "?"} — ${state.meta?.name || "Concord"}`, {
+    const n = new Notification(urgent ? `🔔 ${where}` : where, {
       body: msg.content.slice(0, 140),
       icon: "/icon-192.png",
-      tag: "concord-" + msg.chanId, // coalesce per channel
+      tag: "concord-" + realm.code + "-" + msg.chanId, // coalesce per channel
+      renotify: !!urgent,
+      requireInteraction: false,
+      silent: false,
     });
     n.onclick = () => {
       window.focus();
+      switchToRealm(realm.code);
       activateChannel(msg.chanId);
       n.close();
     };
@@ -820,9 +1053,43 @@ function desktopNotify(msg) {
   }
 }
 
+function notificationsReady() {
+  return (
+    state.settings.notifs &&
+    typeof Notification !== "undefined" &&
+    Notification.permission === "granted"
+  );
+}
+
+// Asked once, right after onboarding. If the browser has already granted it
+// (common in the desktop app), just switch notifications on.
+async function ensureNotificationPermission({ ask } = { ask: true }) {
+  if (typeof Notification === "undefined") return false;
+  if (Notification.permission === "granted") {
+    if (!state.settings.notifs) {
+      state.settings.notifs = true;
+      store.set("settings", state.settings);
+    }
+    return true;
+  }
+  if (!ask || Notification.permission === "denied" || store.get("notifAsked", false)) return false;
+  store.set("notifAsked", true);
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm === "granted") {
+      state.settings.notifs = true;
+      store.set("settings", state.settings);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
 function totalUnread() {
   let n = 0;
-  state.unread.forEach((v) => (n += v));
+  for (const realm of state.realms.values()) {
+    realm.unread.forEach((v) => (n += v));
+  }
   return n;
 }
 function updateTitle() {
@@ -954,6 +1221,7 @@ function renderAll() {
   renderMe();
   renderDmList();
   renderHomeBadge();
+  renderVoicePanel();
   applyView();
 }
 
@@ -986,6 +1254,7 @@ function applyView() {
   } else {
     $("server-name").textContent = "Direct Messages";
   }
+  renderVoicePanel();
   renderChatHeader();
 }
 
@@ -997,24 +1266,38 @@ function goHome() {
   renderDmList();
 }
 
-function goServer(code) {
-  state.view = "server";
-  if (code && (state.currentCode !== code || state.realmKind !== "guild")) {
-    state.realmKind = "guild";
-    state.dmPeer = null;
-    connect(code, { kind: "reopen", code });
-  }
+// Switching what you're LOOKING at. Nothing here disconnects anything: every
+// realm keeps its socket, so the server you just left keeps collecting
+// messages and a call in progress carries on untouched.
+function switchToRealm(code) {
+  if (!code) return null;
+  const realm = state.realms.get(code);
+  if (!realm) return null;
+  state.activeCode = code;
+  realm.touched = Date.now();
+  state.view = realm.kind === "dm" ? "dm" : "server";
+  if (realm.kind === "guild") store.set("lastServer", code);
+  realm.mentions = 0;
   applyView();
+  renderAll();
+  if (realm.activeChan) activateChannel(realm.activeChan);
+  else renderMessages(true);
+  return realm;
 }
 
-// Opening a DM points the main socket at the DM's Durable Object. That's what
-// makes DM voice calls work with zero extra machinery — but it does mean
-// stepping away from whichever server you were in.
+function goServer(code) {
+  if (!code) return;
+  const entry = state.servers.find((s) => s.code === code);
+  const realm = openRealm(code, "guild", { kind: "reopen", code });
+  if (entry && !realm.meta) realm.meta = { name: entry.name, icon: entry.icon };
+  switchToRealm(code);
+}
+
+// Opening a DM gives it its own connection. It does NOT disturb the server you
+// were in, and it does NOT touch a call in progress.
 function openDm(uid) {
   const friend = hub.friends.get(uid);
   if (!friend) return;
-  state.view = "dm";
-  applyView();
   const code = hub.dmCodes.get(uid);
   if (code) openDmRealm(uid, code, friend);
   else hub.openDm(uid); // hub replies with dm-ready, which lands here again
@@ -1022,18 +1305,10 @@ function openDm(uid) {
 
 function openDmRealm(uid, code, user) {
   const friend = { ...(hub.friends.get(uid) || {}), ...(user || {}), uid };
-  state.view = "dm";
   hub.markDmRead(uid);
-  if (state.currentCode === code && state.realmKind === "dm") {
-    state.dmPeer = friend;
-    applyView();
-    renderDmList();
-    return;
-  }
-  state.realmKind = "dm";
-  state.dmPeer = friend;
-  connect(code, { kind: "dm", code, uid });
-  applyView();
+  const realm = openRealm(code, "dm", { kind: "dm", code, uid });
+  realm.peer = friend;
+  switchToRealm(code);
   renderDmList();
 }
 
@@ -1086,6 +1361,13 @@ function renderDmList() {
     wrapAv.appendChild(el("span", "presence-dot " + presenceClass(f)));
     row.appendChild(wrapAv);
     row.appendChild(el("span", "dm-name", f.name));
+    const dmCode = hub.dmCodes.get(f.uid);
+    const dmRealm = dmCode ? state.realms.get(dmCode) : null;
+    let typing = false;
+    dmRealm?.typing.forEach((t) => {
+      if (t.until > Date.now()) typing = true;
+    });
+    if (typing) row.appendChild(el("span", "dm-typing", "typing…"));
     const unread = hub.unread.get(f.uid);
     if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
     row.onclick = () => openDm(f.uid);
@@ -1269,18 +1551,64 @@ function renderServerRail() {
   const list = $("server-list");
   list.textContent = "";
   for (const s of state.servers) {
-    const b = el("div", "server-bubble" + (s.code === state.currentCode ? " active" : ""), s.icon);
+    const active = s.code === state.activeCode && state.view === "server";
+    const b = el("div", "server-bubble" + (active ? " active" : ""), s.icon);
     b.title = s.name;
+
+    // Because every server stays connected, unread counts are real even for
+    // the ones you aren't looking at.
+    const realm = state.realms.get(s.code);
+    let unread = 0;
+    realm?.unread.forEach((v) => (unread += v));
+    if (unread) {
+      const badge = el("span", "badge", String(Math.min(unread, 99)));
+      if (realm?.mentions) badge.classList.add("mention-badge");
+      b.appendChild(badge);
+      b.classList.add("has-unread");
+    }
+    if (state.voiceCode === s.code) b.classList.add("in-call");
+
     b.onclick = () => goServer(s.code);
+    if (state.settings.muted?.[s.code]) b.classList.add("muted");
     b.oncontextmenu = (e) => {
       e.preventDefault();
+      const isMuted = !!state.settings.muted?.[s.code];
       ctxMenu(e.clientX, e.clientY, [
+        { label: "Mark As Read", onClick: () => markRealmRead(s.code) },
+        {
+          label: isMuted ? "🔔 Unmute Server" : "🔕 Mute Server",
+          onClick: () => setServerMuted(s.code, !isMuted),
+        },
         { label: "Copy Invite Code", onClick: () => copyText(s.code, "Invite code copied") },
         { label: "Leave Server", danger: true, onClick: () => confirmLeaveServer(s) },
       ]);
     };
     list.appendChild(b);
   }
+}
+
+// Muting is per server and purely local — it silences pings without telling
+// anyone or leaving anything.
+function setServerMuted(code, muted) {
+  const all = { ...(state.settings.muted || {}) };
+  if (muted) all[code] = true;
+  else delete all[code];
+  state.settings.muted = all;
+  store.set("settings", state.settings);
+  renderServerRail();
+  const name = state.servers.find((s) => s.code === code)?.name || "Server";
+  toast(muted ? `🔕 ${name} muted — still unread, just quiet.` : `🔔 ${name} unmuted.`);
+}
+
+function markRealmRead(code) {
+  const realm = state.realms.get(code);
+  if (!realm) return;
+  realm.unread.clear();
+  realm.firstUnread.clear();
+  realm.mentions = 0;
+  renderServerRail();
+  if (code === state.activeCode) renderChannels();
+  updateTitle();
 }
 
 function renderChannels() {
@@ -1330,7 +1658,13 @@ function renderChannels() {
         if (member.voice.deafened) icons.append("🎧");
         if (member.voice.sharing) icons.append("🖥");
         u.appendChild(icons);
-        if (member.sid !== state.me?.sid && member.voice.chanId === state.voiceChan) {
+        // Volume controls only make sense for people you can actually hear,
+        // i.e. when the call is in the realm you're looking at.
+        if (
+          member.sid !== state.me?.sid &&
+          state.voiceCode === state.activeCode &&
+          member.voice.chanId === state.voiceChan
+        ) {
           u.oncontextmenu = (e) => {
             e.preventDefault();
             volumeMenu(e, member);
@@ -1374,6 +1708,37 @@ function channelMenu(e, c) {
         wsSend({ type: "delete-channel", chanId: c.id })
       ),
   });
+  ctxMenu(e.clientX, e.clientY, items);
+}
+
+// Right-clicking anyone in a server: message them, add them, prank them, or
+// set their volume if you're currently in a call with them.
+function memberMenu(e, member) {
+  if (member.sid === state.me?.sid) {
+    ctxMenu(e.clientX, e.clientY, [{ label: "Edit Profile", onClick: openSettings }]);
+    return;
+  }
+  const friend = friendFor(member);
+  const items = [
+    {
+      label: "View Profile",
+      onClick: () => openProfile(e.clientX - 300, e.clientY - 40, member),
+    },
+  ];
+  if (friend) {
+    items.push({ label: "💬 Message", onClick: () => openDm(friend.uid) });
+    items.push({ label: "👉 Poke", onClick: () => hub.poke(friend.uid) });
+  } else if (member.tag) {
+    items.push({ label: `Add Friend (@${member.tag})`, onClick: () => hub.addFriend(member.tag) });
+  } else {
+    items.push({ label: "No friend tag — ask them for it", onClick: () => {} });
+  }
+  items.push({ label: "🃏 Prank", onClick: () => openGremlinModal(member.sid) });
+  const inCallTogether =
+    state.voiceCode === state.activeCode && member.voice && member.voice.chanId === state.voiceChan;
+  if (inCallTogether) {
+    items.push({ label: "🔊 Volume…", onClick: () => volumeMenu(e, member) });
+  }
   ctxMenu(e.clientX, e.clientY, items);
 }
 
@@ -1425,12 +1790,10 @@ function renderMembers() {
       e.stopPropagation(); // otherwise the document handler closes it instantly
       openProfile(e.clientX - 300, e.clientY - 40, member);
     };
-    if (member.sid !== state.me?.sid && member.voice && member.voice.chanId === state.voiceChan) {
-      row.oncontextmenu = (e) => {
-        e.preventDefault();
-        volumeMenu(e, member);
-      };
-    }
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      memberMenu(e, member);
+    };
     wrap.appendChild(row);
   }
 }
@@ -1442,7 +1805,7 @@ function renderMe() {
   if (state.me) av.dataset.vsid = state.me.sid;
   av.classList.toggle("speaking", voice.isSpeaking("me"));
   $("me-name").textContent = state.profile.name;
-  const pres = PRESENCE_META[state.settings.presence] || PRESENCE_META.online;
+  const pres = PRESENCE_META[effectivePresence()] || PRESENCE_META.online;
   $("me-sub").textContent = state.profile.status || (hub.me?.tag ? "@" + hub.me.tag : pres.label);
   $("me-presence").className = "presence-dot " + pres.dot;
   $("me-presence").title = pres.label;
@@ -1488,11 +1851,20 @@ function renderMessages(scrollToBottom = false) {
   let lastDay = "";
   let group = null;
 
+  const firstUnread = R()?.firstUnread.get(state.activeChan);
+  let markedUnread = false;
+
   for (const msg of list) {
     const day = new Date(msg.ts).toDateString();
     if (day !== lastDay) {
       pane.appendChild(el("div", "day-divider", fmtDay(msg.ts)));
       lastDay = day;
+      lastAuthor = null;
+    }
+    // The red "new messages" line, exactly where you stopped reading.
+    if (!markedUnread && firstUnread !== undefined && msg.id === firstUnread) {
+      pane.appendChild(el("div", "unread-divider", "NEW MESSAGES"));
+      markedUnread = true;
       lastAuthor = null;
     }
     const sameGroup = lastAuthor === msg.author.userId && msg.ts - lastTs < 5 * 60 * 1000 && !msg.replyTo;
@@ -1511,6 +1883,13 @@ function renderMessages(scrollToBottom = false) {
       const head = el("div", "mg-head");
       const name = el("span", "mg-name", msg.author.name);
       name.style.color = msg.author.color;
+      name.title = "View profile";
+      name.style.cursor = "pointer";
+      name.onclick = (e) => {
+        e.stopPropagation();
+        const known = [...state.members.values()].find((mm) => mm.userId === msg.author.userId);
+        openProfile(e.clientX + 12, e.clientY - 40, known || msg.author);
+      };
       head.appendChild(name);
       head.appendChild(el("span", "mg-time", fmtTime(msg.ts)));
       body.appendChild(head);
@@ -1576,6 +1955,7 @@ function buildMsgNode(msg) {
   content.querySelectorAll(".spoiler").forEach((s) => {
     s.onclick = () => s.classList.add("revealed");
   });
+  if (state.settings.embeds) attachEmbeds(content);
   if (msg.edited) {
     const tag = el("span", "msg-edited", " (edited)");
     content.appendChild(tag);
@@ -1638,6 +2018,59 @@ function buildMsgNode(msg) {
   return node;
 }
 
+/* -------------------------------- embeds --------------------------------- */
+// Turns bare links into something worth looking at. Only the URL the person
+// actually posted is loaded — nothing is fetched or resolved behind the
+// scenes, so no link ever gets pinged just because it was mentioned.
+
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif|bmp)(\?[^\s]*)?$/i;
+const YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{6,20})/i;
+
+function attachEmbeds(content) {
+  const links = [...content.querySelectorAll("a[href]")].slice(0, 4);
+  const seen = new Set();
+  for (const a of links) {
+    const href = a.getAttribute("href") || "";
+    if (seen.has(href)) continue;
+    seen.add(href);
+
+    if (IMAGE_RE.test(href)) {
+      const wrap = el("div", "embed");
+      const img = document.createElement("img");
+      img.className = "embed-img";
+      img.loading = "lazy";
+      img.referrerPolicy = "no-referrer";
+      img.alt = "";
+      img.src = href;
+      img.onerror = () => wrap.remove(); // dead or hotlink-blocked: say nothing
+      img.onclick = () => window.open(href, "_blank", "noopener");
+      wrap.appendChild(img);
+      content.appendChild(wrap);
+      continue;
+    }
+
+    const yt = href.match(YT_RE);
+    if (yt) {
+      const card = el("a", "embed embed-yt");
+      card.href = href;
+      card.target = "_blank";
+      card.rel = "noreferrer noopener";
+      const thumb = document.createElement("img");
+      thumb.className = "embed-thumb";
+      thumb.loading = "lazy";
+      thumb.referrerPolicy = "no-referrer";
+      thumb.alt = "";
+      thumb.src = `https://i.ytimg.com/vi/${yt[1]}/mqdefault.jpg`;
+      thumb.onerror = () => card.remove();
+      card.appendChild(thumb);
+      const play = el("span", "embed-play", "▶");
+      card.appendChild(play);
+      card.appendChild(el("span", "embed-label", "YouTube"));
+      content.appendChild(card);
+    }
+  }
+}
+
 function renderTyping() {
   const now = Date.now();
   const names = [];
@@ -1664,18 +2097,32 @@ setInterval(renderTyping, 1500);
 // frame). The timeout releases the lock if the server ever drops the request,
 // so a channel can't get permanently stuck without history.
 function requestHistory(chanId, before) {
-  if (state.historyPending.has(chanId)) return;
-  state.historyPending.add(chanId);
-  setTimeout(() => state.historyPending.delete(chanId), 8000);
+  const realm = R();
+  if (realm) requestHistoryIn(realm, chanId, before);
+}
+
+function requestHistoryIn(realm, chanId, before) {
+  if (realm.historyPending.has(chanId)) return;
+  realm.historyPending.add(chanId);
+  setTimeout(() => realm.historyPending.delete(chanId), 8000);
   const msg = { type: "history", chanId };
   if (before) msg.before = before;
-  wsSend(msg);
+  realm.send(msg);
 }
 
 function activateChannel(chanId) {
-  state.activeChan = chanId;
-  state.unread.delete(chanId);
-  if (state.realmKind === "dm" && state.dmPeer) hub.markDmRead(state.dmPeer.uid);
+  const realm = R();
+  if (!realm) return;
+  // The "new messages" line survives while you're reading the channel, and
+  // clears once you leave it — otherwise it vanishes before you can see it.
+  if (realm.activeChan && realm.activeChan !== chanId) {
+    realm.firstUnread.delete(realm.activeChan);
+  }
+  realm.activeChan = chanId;
+  realm.unread.delete(chanId);
+  if (!realm.unread.size) realm.mentions = 0;
+  renderServerRail();
+  if (realm.kind === "dm" && realm.peer) hub.markDmRead(realm.peer.uid);
   updateTitle();
   clearReply();
   state.editingId = null;
@@ -1702,37 +2149,65 @@ function clearReply() {
 
 /* =============================== voice ui =============================== */
 
-async function joinVoice(chanId) {
-  if (state.voiceChan === chanId) return;
-  if (state.voiceChan) leaveVoice({ silent: true });
+// Joins in whichever realm you're currently viewing.
+function joinVoice(chanId) {
+  const realm = R();
+  if (realm) joinVoiceIn(realm, chanId);
+}
+
+async function joinVoiceIn(realm, chanId) {
+  if (state.voiceCode === realm.code && state.voiceChan === chanId) return;
+  if (state.voiceCode) leaveVoice({ silent: true });
   try {
     await voice.join(chanId);
   } catch {
     return;
   }
+  state.voiceCode = realm.code;
   state.voiceChan = chanId;
-  wsSend({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
-  const chan = state.channels.find((c) => c.id === chanId);
-  $("vs-channel").textContent =
-    state.realmKind === "dm"
-      ? `Call with ${state.dmPeer?.name || "a friend"}`
-      : `${chan?.name || "voice"} / ${state.meta?.name || ""}`;
-  $("voice-status").classList.remove("hidden");
-  $("btn-call").classList.toggle("on", true);
+  realm.send({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
+  renderVoicePanel();
   renderChannels();
+  renderServerRail();
 }
 
 function leaveVoice({ silent } = {}) {
-  if (!state.voiceChan) return;
+  if (!state.voiceCode) return;
+  const realm = voiceRealm();
+  state.voiceCode = null;
   state.voiceChan = null;
   voice.leave({ silent });
-  wsSend({ type: "voice-leave" });
+  realm?.send({ type: "voice-leave" });
   $("voice-status").classList.add("hidden");
   $("btn-share").classList.remove("on");
   $("btn-call").classList.remove("on");
   clearShareStage();
   renderChannels();
   renderMembers();
+  renderServerRail();
+}
+
+// The call panel is global: it shows where the call is even when you've
+// wandered off to another server, and clicking it takes you back.
+function renderVoicePanel() {
+  const realm = voiceRealm();
+  if (!realm || !state.voiceChan) {
+    $("voice-status").classList.add("hidden");
+    return;
+  }
+  const chan = realm.channels.find((c) => c.id === state.voiceChan);
+  const where =
+    realm.kind === "dm"
+      ? `Call with ${realm.peer?.name || "a friend"}`
+      : `${chan?.name || "voice"} / ${realm.meta?.name || ""}`;
+  const label = $("vs-channel");
+  label.textContent = where;
+  label.title = "Jump to the call";
+  label.onclick = () => switchToRealm(realm.code);
+  const elsewhere = realm.code !== state.activeCode;
+  $("vs-quality").textContent = elsewhere ? "Voice Connected ↗" : "Voice Connected";
+  $("voice-status").classList.remove("hidden");
+  $("btn-call").classList.toggle("on", realm.code === state.activeCode);
 }
 
 function addShareTile(key, stream, label) {
@@ -1919,11 +2394,11 @@ $("jm-create").onclick = async () => {
     const { code } = await res.json();
     closeModals();
     // Creating a server means going to it, even if we were on the Friends view.
+    const realm = openRealm(code, "guild", { kind: "create", code, name, icon: jmIcon });
+    realm.meta = { name, icon: jmIcon };
+    state.activeCode = code;
     state.view = "server";
-    state.realmKind = "guild";
-    state.dmPeer = null;
-    applyView();
-    connect(code, { kind: "create", code, name, icon: jmIcon });
+    renderAll();
   } catch {
     toast("Couldn't reach the server. Are you online?", true);
   }
@@ -1936,11 +2411,10 @@ $("jm-join").onclick = () => {
     return;
   }
   closeModals();
+  openRealm(code, "guild", { kind: "join", code });
+  state.activeCode = code;
   state.view = "server";
-  state.realmKind = "guild";
-  state.dmPeer = null;
-  applyView();
-  connect(code, { kind: "join", code });
+  renderAll();
 };
 $("jm-code").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("jm-join").click();
@@ -1952,13 +2426,16 @@ function confirmLeaveServer(s) {
   confirmModal(`Leave ${s.name}?`, "You can rejoin any time with the invite code.", () => {
     state.servers = state.servers.filter((x) => x.code !== s.code);
     store.set("servers", state.servers);
-    if (state.currentCode === s.code) {
-      disconnect();
-      state.currentCode = null;
+    const wasActive = state.activeCode === s.code;
+    closeRealm(s.code);
+    if (wasActive) {
+      state.activeCode = null;
       if (state.servers.length) {
-        connect(state.servers[0].code, { kind: "reopen", code: state.servers[0].code });
+        goServer(state.servers[0].code);
       } else {
+        state.view = "home";
         renderAll();
+        renderFriendsView();
         openJoinModal();
       }
     }
@@ -2038,6 +2515,9 @@ function openSettings() {
   $("set-gremlin").checked = state.settings.gremlin;
   $("set-mascot").checked = state.settings.mascot;
   $("set-board").checked = state.settings.board;
+  $("set-embeds").checked = state.settings.embeds !== false;
+  $("set-tts").checked = !!state.settings.tts;
+  $("set-autoidle").checked = state.settings.autoIdle !== false;
   $("set-tag").value = hub.me?.tag || state.account?.tag || "";
   $("set-presence").value = state.settings.presence || "online";
 
@@ -2102,6 +2582,32 @@ $("set-presence").onchange = (e) => {
 $("set-board").onchange = (e) => {
   state.settings.board = e.target.checked;
   store.set("settings", state.settings);
+};
+$("set-embeds").onchange = (e) => {
+  state.settings.embeds = e.target.checked;
+  store.set("settings", state.settings);
+  renderMessages();
+};
+$("set-tts").onchange = (e) => {
+  state.settings.tts = e.target.checked;
+  store.set("settings", state.settings);
+  if (e.target.checked) {
+    if (typeof speechSynthesis === "undefined") {
+      toast("This browser can't do speech synthesis.", true);
+      e.target.checked = false;
+      state.settings.tts = false;
+      store.set("settings", state.settings);
+      return;
+    }
+    speakMessage({ author: { name: "Concord" }, content: "Reading messages aloud." });
+  } else if (typeof speechSynthesis !== "undefined") {
+    speechSynthesis.cancel();
+  }
+};
+$("set-autoidle").onchange = (e) => {
+  state.settings.autoIdle = e.target.checked;
+  store.set("settings", state.settings);
+  if (!e.target.checked) noteActivity();
 };
 $("set-ptt").onchange = (e) => {
   state.settings.ptt = e.target.checked;
@@ -2198,14 +2704,27 @@ $("set-notifs").onchange = async (e) => {
       e.target.checked = false;
       return;
     }
-    const perm = await Notification.requestPermission();
+    let perm = Notification.permission;
+    if (perm !== "granted") perm = await Notification.requestPermission();
     if (perm !== "granted") {
       toast("Notifications blocked — allow them in your browser settings.", true);
       e.target.checked = false;
       return;
     }
+    state.settings.notifs = true;
+    store.set("settings", state.settings);
+    // Prove it works, so nobody has to wonder whether it's on.
+    try {
+      new Notification("Concord notifications are on 🔔", {
+        body: "You'll get one of these for mentions and DMs.",
+        icon: "/icon-192.png",
+        tag: "concord-test",
+      });
+    } catch {}
+    voice.playCue("mention");
+    return;
   }
-  state.settings.notifs = e.target.checked;
+  state.settings.notifs = false;
   store.set("settings", state.settings);
 };
 $("set-volume").oninput = (e) => {
@@ -2258,9 +2777,19 @@ function autoGrow(node) {
   node.style.height = "auto";
   node.style.height = Math.min(node.scrollHeight, 200) + "px";
 }
+
+// Only appears when you're actually near the 4000-character wall.
+function updateCharCount() {
+  const left = 4000 - input.value.length;
+  const counter = $("char-count");
+  counter.classList.toggle("hidden", left > 400);
+  counter.classList.toggle("danger", left < 100);
+  counter.textContent = String(left);
+}
 input.addEventListener("input", () => {
   autoGrow(input);
   updateAutocomplete();
+  updateCharCount();
   const now = Date.now();
   if (input.value && now - state.lastTypingSent > 4000 && state.activeChan) {
     state.lastTypingSent = now;
@@ -2347,6 +2876,8 @@ $("btn-emoji").onclick = (e) => {
 
 $("messages").addEventListener("scroll", () => {
   const pane = $("messages");
+  const behind = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+  $("jump-present").classList.toggle("hidden", behind < 200);
   if (
     pane.scrollTop < 40 &&
     state.activeChan &&
@@ -2384,13 +2915,20 @@ $("btn-share").onclick = async () => {
     }
   }
 };
+$("jump-present").onclick = () => {
+  const realm = R();
+  if (realm) realm.firstUnread.delete(realm.activeChan);
+  renderMessages(true);
+  $("jump-present").classList.add("hidden");
+};
+
 $("btn-members").onclick = () => $("app").classList.toggle("members-hidden");
 
 // A DM's "call" is just joining the DM's voice channel.
 $("btn-call").onclick = () => {
   const chan = state.channels.find((c) => c.type === "voice");
   if (!chan) return;
-  if (state.voiceChan === chan.id) leaveVoice();
+  if (state.voiceCode === state.activeCode && state.voiceChan === chan.id) leaveVoice();
   else joinVoice(chan.id);
 };
 
@@ -2410,6 +2948,35 @@ document.querySelectorAll("#fv-tabs button").forEach((b) => {
   };
 });
 
+/* ============================== auto-idle ================================ */
+// Flip to Idle after a while with no input, and straight back on the first
+// sign of life. Your *chosen* presence is never overwritten — if you picked
+// DND or Invisible, that's what you stay.
+
+const IDLE_AFTER_MS = 6 * 60 * 1000;
+let lastActivity = Date.now();
+let autoIdle = false;
+
+function noteActivity() {
+  lastActivity = Date.now();
+  if (autoIdle) {
+    autoIdle = false;
+    hub.pushProfile();
+    renderMe();
+  }
+}
+for (const ev of ["mousedown", "keydown", "mousemove", "wheel", "touchstart", "focus"]) {
+  window.addEventListener(ev, noteActivity, { passive: true });
+}
+setInterval(() => {
+  if (!state.settings.autoIdle || autoIdle) return;
+  if (state.settings.presence !== "online") return; // respect DND / Invisible
+  if (Date.now() - lastActivity < IDLE_AFTER_MS) return;
+  autoIdle = true;
+  hub.pushProfile();
+  renderMe();
+}, 30000);
+
 /* =========================== keyboard shortcuts ========================== */
 
 window.addEventListener("keydown", (e) => {
@@ -2420,6 +2987,19 @@ window.addEventListener("keydown", (e) => {
   } else if (mod && e.key.toLowerCase() === "f" && state.view !== "home") {
     e.preventDefault();
     openSearch();
+  } else if (e.shiftKey && e.key === "Escape") {
+    // Shift+Esc: declare bankruptcy on this server's unread.
+    e.preventDefault();
+    if (state.activeCode) markRealmRead(state.activeCode);
+  } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+    // Alt+Up/Down walks the text channels, like the real thing.
+    const chans = state.channels.filter((c) => c.type === "text");
+    if (chans.length > 1 && state.view === "server") {
+      e.preventDefault();
+      const i = chans.findIndex((c) => c.id === state.activeChan);
+      const next = (i + (e.key === "ArrowDown" ? 1 : -1) + chans.length) % chans.length;
+      activateChannel(chans[next].id);
+    }
   } else if (e.key === "Escape") {
     hideProfile();
     $("soundboard").classList.add("hidden");
@@ -2583,7 +3163,16 @@ function openSwitcher() {
 function switcherCandidates(q) {
   const items = [];
   for (const s of state.servers) {
-    items.push({ icon: s.icon, label: s.name, sub: "Server", act: () => goServer(s.code) });
+    const realm = state.realms.get(s.code);
+    let unread = 0;
+    realm?.unread.forEach((v) => (unread += v));
+    items.push({
+      icon: s.icon,
+      label: s.name,
+      sub: unread ? `Server · ${unread} unread` : "Server",
+      unread,
+      act: () => goServer(s.code),
+    });
   }
   if (state.view === "server") {
     for (const c of state.channels) {
@@ -2596,13 +3185,23 @@ function switcherCandidates(q) {
     }
   }
   for (const f of hub.friends.values()) {
-    items.push({ icon: f.avatar, label: f.name, sub: `@${f.tag} · Direct Message`, act: () => openDm(f.uid) });
+    const unread = hub.unread.get(f.uid) || 0;
+    items.push({
+      icon: f.avatar,
+      label: f.name,
+      sub: unread ? `@${f.tag} · ${unread} unread` : `@${f.tag} · Direct Message`,
+      unread,
+      act: () => openDm(f.uid),
+    });
   }
   items.push({ icon: "👥", label: "Friends", sub: "Home", act: goHome });
   const needle = q.trim().toLowerCase();
-  if (!needle) return items.slice(0, 12);
+  // With nothing typed, put whatever needs your attention at the top.
+  const byUnread = (a, b) => (b.unread || 0) - (a.unread || 0);
+  if (!needle) return items.sort(byUnread).slice(0, 12);
   return items
     .filter((i) => (i.label + " " + i.sub).toLowerCase().includes(needle))
+    .sort(byUnread)
     .slice(0, 12);
 }
 
@@ -2653,11 +3252,24 @@ $("switch-input").addEventListener("keydown", (e) => {
 
 /* ============================ profile popout ============================== */
 
+// Given anyone we can see (a server member, a message author, a friend),
+// find the matching friend record if there is one.
+function friendFor(person) {
+  if (!person) return null;
+  if (person.uid && hub.friends.has(person.uid)) return hub.friends.get(person.uid);
+  if (person.tag) {
+    for (const f of hub.friends.values()) if (f.tag === person.tag) return f;
+  }
+  return null;
+}
+
 function openProfile(x, y, person) {
   const pop = $("profile-pop");
   pop.textContent = "";
-  const uid = person.uid || null;
-  const friend = uid ? hub.friends.get(uid) : null;
+  // Server members carry a friend tag, not a uid — so match on whichever we
+  // have. This is what makes "click someone in a server, then DM them" work.
+  const friend = friendFor(person);
+  const uid = person.uid || friend?.uid || null;
 
   const banner = el("div", "pp-banner");
   banner.style.background = person.color;
@@ -2734,7 +3346,8 @@ function hideProfile() {
 function fireSound(id) {
   if (!SOUNDBOARD.some((s) => s.id === id)) return;
   playSound(id, (state.settings.volume || 100) / 100);
-  if (state.voiceChan) wsSend({ type: "sound", sound: id });
+  // Goes to the call, wherever the call is — not to whatever you're reading.
+  if (state.voiceCode) voiceRealm()?.send({ type: "sound", sound: id });
   else toast("Nobody heard that — join a voice channel first.", true);
 }
 
@@ -2881,16 +3494,23 @@ const EMOJI_NAMES = [
 /* ============================ focus / unload ============================= */
 
 window.addEventListener("focus", () => {
-  if (state.activeChan) {
-    state.unread.delete(state.activeChan);
+  const realm = R();
+  if (realm?.activeChan && state.view !== "home") {
+    realm.unread.delete(realm.activeChan);
+    if (!realm.unread.size) realm.mentions = 0;
     updateTitle();
     renderChannels();
+    renderServerRail();
   }
 });
 window.addEventListener("beforeunload", () => {
-  if (state.ws) {
-    state.ws.onclose = null;
-    state.ws.close();
+  for (const realm of state.realms.values()) {
+    if (realm.ws) {
+      realm.ws.onclose = null;
+      try {
+        realm.ws.close();
+      } catch {}
+    }
   }
 });
 
@@ -2900,20 +3520,35 @@ function afterProfileReady() {
   $("app").classList.remove("hidden");
   renderMe();
   hub.connect(); // friends + DMs stay live regardless of which server we're in
+  ensureNotificationPermission();
   if (state.settings.mascot) launchMascot();
+
   const params = new URLSearchParams(location.search);
   const joinCode = (params.get("join") || "").toUpperCase();
+  const last = store.get("lastServer", null);
+
+  // Connect to every server up front, not just the one you're looking at.
+  // That is what makes cross-server unread badges real and what lets a call
+  // in one server survive you reading another.
+  for (const s of state.servers) {
+    const realm = openRealm(s.code, "guild", { kind: "reopen", code: s.code });
+    if (!realm.meta) realm.meta = { name: s.name, icon: s.icon };
+  }
+
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
     history.replaceState(null, "", location.pathname);
+    openRealm(joinCode, "guild", { kind: "join", code: joinCode });
+    state.activeCode = joinCode;
     state.view = "server";
-    connect(joinCode, { kind: "join", code: joinCode });
+    renderAll();
     return;
   }
-  const last = store.get("lastServer", null);
+
   const target = state.servers.find((s) => s.code === last) || state.servers[0];
   if (target) {
+    state.activeCode = target.code;
     state.view = "server";
-    connect(target.code, { kind: "reopen", code: target.code });
+    renderAll();
   } else {
     state.view = "home";
     renderAll();
@@ -2936,3 +3571,7 @@ applyVoiceFx(state.settings.fx, state.settings.fxPitch); // restore the saved vo
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
+
+// Handle for the browser tests (and for poking at things in the console).
+// Everything here is client-side state the user already owns.
+window.__concord = { state, hub, voice, R, voiceRealm, switchToRealm, openDm };

@@ -34,7 +34,12 @@ to the server, so only share it with people you want in.
 - **Friends** — every account gets a tag like `@keith`. Add people by tag, accept or
   ignore requests, see who's online (online / idle / DND / invisible), poke them
 - **Direct messages** — full 1:1 chat with history, reactions, edits, replies, pins,
-  and **DM voice calls** (the 📞 button). Unread counts survive being offline
+  and **DM voice calls** (the 📞 button). Unread counts survive being offline.
+  Click anyone in a server's member list to see their profile and DM them
+- **A call is independent of what you're looking at.** Every server keeps its own live
+  connection, so you can browse other servers, read DMs and chat anywhere while a voice
+  call carries on untouched. The rail shows a green ring on whichever server holds it,
+  unread badges on the rest, and the voice panel clicks through to jump back
 - **Servers** with invite codes; join as many as you want (left rail)
 - **Text channels** — history, edit/delete, replies, emoji reactions, typing indicators,
   markdown (`**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, ``` ```blocks``` ```,
@@ -47,6 +52,11 @@ to the server, so only share it with people you want in.
   `/8ball` `/big` `/nick` `/status` `/sound` `/shout` `/help`
 - **Soundboard** — 🎵 next to the message box. Twelve clips, all synthesized in the browser
   (no audio files to download), played to everyone in your voice channel
+- **Unread handling** — a red "new messages" line where you left off, jump-to-present,
+  per-server mute (🔕, still counts unread, just quiet), Mark As Read, and Shift+Esc
+- **Inline previews** for image links and YouTube, **auto-idle** after 6 minutes (never
+  overrides an explicit DND/Invisible), optional **read-aloud** for incoming messages,
+  and per-person volume that's remembered forever, keyed to the person not the session
 - **Voice channels** — real-time group voice (WebRTC mesh), speaking indicators,
   mute / deafen, push-to-talk with a bindable key, per-user volume (right-click someone
   in voice), input-device picker, join/leave sounds
@@ -108,8 +118,7 @@ Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wr
 - Voice is a full mesh: great for friend groups (~2–8 people), not for a 50-person raid.
 - Anyone with the invite code is a full member — there are no roles/permissions. It's
   a clubhouse, not a moderation platform.
-- **Opening a DM steps out of the server you were in.** There's one live server socket,
-  and a DM borrows it (which is exactly why DM calls work). You keep getting DM pings
-  and friend presence from the hub the whole time, but not that server's channel pings
-  until you click back. Two sockets would fix it; it hasn't been worth the complexity.
 - Friend tags are global and first-come-first-served across everyone using the app.
+- Every server you're in holds an open WebSocket for the whole session. That's what
+  makes cross-server unread badges and background pings work, and it's nothing for a
+  handful of servers — but it isn't a design that would scale to hundreds.

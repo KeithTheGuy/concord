@@ -127,7 +127,7 @@ export class VoiceEngine {
       audioEl: null,
       gainNode: null,
       analyser: null,
-      userVolume: 1,
+      userVolume: this._savedScalar(sid),
       videoSender: null,
       shareVisible: false,
     };
@@ -341,6 +341,9 @@ export class VoiceEngine {
     }
     const src = this.ctx.createMediaStreamSource(stream);
     peer.srcNode = src;
+    // The member list may only have arrived after the peer object was made,
+    // so re-read the saved volume now that we can map sid -> user.
+    peer.userVolume = this._savedScalar(peer.sid);
     peer.gainNode = this.ctx.createGain();
     peer.gainNode.gain.value = peer.userVolume;
     peer.analyser = this.ctx.createAnalyser();
@@ -454,16 +457,27 @@ export class VoiceEngine {
     this._applyTrackEnabled();
   }
 
+  // Per-person volume is remembered by the app against a stable user id, not
+  // the per-connection sid, so it survives reloads and rejoins.
   setUserVolume(sid, percent) {
+    const clamped = Math.max(0, Math.min(200, Math.round(percent)));
+    this.h.saveVolume?.(sid, clamped);
     const peer = this.peers.get(sid);
     if (!peer) return;
-    peer.userVolume = Math.max(0, Math.min(2, percent / 100));
+    peer.userVolume = clamped / 100;
     if (peer.gainNode) peer.gainNode.gain.value = peer.userVolume;
   }
 
   getUserVolume(sid) {
+    const saved = this.h.volumeFor?.(sid);
+    if (typeof saved === "number") return saved;
     const peer = this.peers.get(sid);
     return peer ? Math.round(peer.userVolume * 100) : 100;
+  }
+
+  _savedScalar(sid) {
+    const saved = this.h.volumeFor?.(sid);
+    return typeof saved === "number" ? Math.max(0, Math.min(2, saved / 100)) : 1;
   }
 
   // key is a peer sid, or "me" for the local mic.
@@ -603,8 +617,16 @@ export class VoiceEngine {
         [880, 0, 0.05],
         [1100, 0.06, 0.08],
       ],
+      // Mentions and DMs get their own, more insistent three-note figure so
+      // you can tell "someone said something" from "someone said YOUR NAME".
+      mention: [
+        [1046, 0, 0.09],
+        [1318, 0.1, 0.09],
+        [1568, 0.2, 0.22],
+      ],
     }[name];
     if (!notes) return;
+    const loud = name === "mention" ? 0.3 : 0.12;
     const t0 = this.ctx.currentTime;
     for (const [freq, start, dur] of notes) {
       const osc = this.ctx.createOscillator();
@@ -612,7 +634,7 @@ export class VoiceEngine {
       osc.type = "sine";
       osc.frequency.value = freq;
       g.gain.setValueAtTime(0.0001, t0 + start);
-      g.gain.exponentialRampToValueAtTime(0.12, t0 + start + 0.015);
+      g.gain.exponentialRampToValueAtTime(loud, t0 + start + 0.015);
       g.gain.exponentialRampToValueAtTime(0.0001, t0 + start + dur);
       osc.connect(g);
       g.connect(this.ctx.destination); // cues bypass deafen master gain

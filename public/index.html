@@ -134,6 +134,8 @@
 
       <div id="messages"></div>
 
+      <button id="jump-present" class="hidden">Jump to present ↓</button>
+
       <div id="reply-bar" class="hidden">
         <span id="reply-label"></span>
         <button id="reply-cancel">✕</button>
@@ -143,6 +145,7 @@
         <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
         <!-- Buttons live to the RIGHT of the box. dapmon was very clear. -->
         <div id="composer-actions">
+          <span id="char-count" class="hidden"></span>
           <button id="btn-soundboard" title="Soundboard (join voice first)">🎵</button>
           <button id="btn-emoji" title="Emoji">😄</button>
         </div>
@@ -251,6 +254,9 @@
         <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
         <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
         <label class="check-row"><input type="checkbox" id="set-board" checked> Allow soundboard clips</label>
+        <label class="check-row"><input type="checkbox" id="set-embeds" checked> Show image &amp; video previews</label>
+        <label class="check-row"><input type="checkbox" id="set-tts"> Read new messages aloud</label>
+        <label class="check-row"><input type="checkbox" id="set-autoidle" checked> Go idle after 6 minutes away</label>
         <label class="check-row"><input type="checkbox" id="set-mascot" checked> Let Gorb wander the app</label>
         <button id="set-revive" class="pill-btn">Revive Gorb</button>
         <label>Output volume <span id="set-vol-label">100%</span></label>

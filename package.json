@@ -14,7 +14,8 @@
     "identity": "node test/identity.mjs",
     "voicefx": "node test/voicefx.mjs",
     "app": "electron .",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win",
+    "multirealm": "node test/multirealm.mjs"
   },
   "devDependencies": {
     "electron": "^33.4.11",
@@ -26,13 +27,18 @@
   "build": {
     "appId": "com.keiththeguy.concord",
     "productName": "Concord",
-    "files": ["electron/**/*"],
+    "files": [
+      "electron/**/*"
+    ],
     "directories": {
       "buildResources": "build",
       "output": "dist"
     },
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "build/icon.png",
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}"
     },
