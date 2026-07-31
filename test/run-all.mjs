@@ -18,9 +18,14 @@ const BASE = `http://localhost:${PORT}`;
 // Order matters: the cheap protocol suites run first so an obvious breakage
 // fails in seconds instead of after the four-minute browser suites.
 const SUITES = [
+  // backup is pure logic and needs no server, so it goes first — it costs
+  // nothing and a failure here means the restore path is broken.
+  ["backup", "protocol"],
   ["smoke", "protocol"],
   ["identity", "protocol"],
   ["uploads", "protocol"],
+  ["security", "protocol"],
+  ["archive", "protocol"],
   ["roster", "protocol"],
   ["threads", "protocol"],
   ["voicefx", "audio"],

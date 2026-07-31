@@ -21,7 +21,10 @@
     "uploads": "node test/uploads.mjs",
     "roster": "node test/roster.mjs",
     "threads": "node test/threads.mjs",
+    "archive": "node test/archive.mjs",
+    "security": "node test/security.mjs",
     "render": "node test/render.mjs",
+    "backup": "node test/backup.mjs",
     "test": "node test/run-all.mjs"
   },
   "devDependencies": {
