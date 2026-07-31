@@ -350,6 +350,8 @@ as `ConcordServer`, for the same reason.
 | `gdm-create` | `{uids[], name, icon}` | friends only, ≤ 10 members, ≤ 20 groups each |
 | `gdm-open` / `gdm-add` / `gdm-rename` / `gdm-leave` | `{id, …}` | members only |
 | `poke` | `{uid}` | rattles a friend's window |
+| `call-ring` | `{uid | gdm, chanId}` | **a wake-up, not a ring** — see below |
+| `call-end` | `{uid | gdm}` | courtesy retraction |
 
 Caps: `FRIEND_CAP` 250, `GDM_MAX_MEMBERS` 10, `GDM_CAP` 20, tags
 `/^[a-z0-9_.]{2,20}$/`.
@@ -505,3 +507,42 @@ on the realm.
 **Nothing deletes a `dmcode:` row** — same class of load-bearing invariant as
 `user:`. A code the hub has never heard of is grandfathered past the DM gate, so
 deleting the row of a dissolved group would quietly re-open it.
+
+### 13.1 `call-ring` is a wake-up, not a ring
+
+Ringing is **derived** on the client: it's recomputed from voice membership on
+every `member-update`, so it cannot get stuck the way a counter can. That
+property is worth protecting, and it's what shapes this op.
+
+A DM you haven't opened this session has no socket, so nothing can reach you —
+after a page reload, that's most of them. The hub therefore relays *who is
+calling and where*, and the recipient's client responds by **opening the realm
+socket**. The realm's own membership then produces the ring, exactly as it does
+for a conversation you already had open.
+
+The alternative — the hub sending an authoritative "you are being rung" — needs
+a guaranteed retraction, and a guaranteed retraction needs the hub to remember
+who is ringing whom. That's state, state dies with the Durable Object on
+hibernation, and a ring that outlives its retraction is a ring nobody can clear.
+This way the hub stores nothing and that failure mode doesn't exist. The cost is
+one socket-open round-trip before the toast, paid once per incoming call rather
+than once per friend at boot.
+
+**When the caller's socket dies without a `call-end`, nothing needs to happen.**
+The recipient is connected to the realm by then, `ConcordServer` drops the
+caller from voice on close, and the recipient's membership update clears the
+ring. `call-end` only saves a round-trip; losing it changes nothing.
+
+The relay deliberately carries **no DM code**. `hub-welcome.friends[]` already
+carries `dm` per friend and the client already unpacks it, so sending it again
+would add a second source of truth for a string §12 treats as load-bearing.
+
+```js
+RINGS_PER_WINDOW = 6   // per 60s, keyed on the ACCOUNT, not the socket
+```
+
+Six a minute is already someone redialling every ten seconds; a real caller
+sends one per attempt. Keyed per-caller rather than per-target, so one pest
+can't make you unreachable to everyone else. **`call-end` is exempt from the
+budget** — rate-limiting a retraction is precisely how you build a ring nobody
+can clear.
