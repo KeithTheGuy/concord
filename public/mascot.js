@@ -21,7 +21,7 @@ const LINES = {
 };
 
 const CSS = `
-#gorb { position:fixed; z-index:8800; pointer-events:none; width:${SIZE * 0.86}px; height:${SIZE}px;
+#gorb { position:fixed; z-index:100; pointer-events:none; width:${SIZE * 0.86}px; height:${SIZE}px;
   will-change: transform; transition: filter .2s; }
 #gorb svg { width:100%; height:100%; overflow:visible; display:block; }
 #gorb.flip { transform: scaleX(-1); }
@@ -51,11 +51,11 @@ const CSS = `
 #gorb.act-dance .torso { animation: gorb-boogie .34s ease-in-out infinite; }
 #gorb.act-nap .torso   { animation: gorb-snore 1.7s ease-in-out infinite; }
 
-.gorb-spit { position:fixed; z-index:8790; pointer-events:none; width:13px; height:13px; border-radius:50%;
+.gorb-spit { position:fixed; z-index:90; pointer-events:none; width:13px; height:13px; border-radius:50%;
   background:#9fe6b4; box-shadow:0 0 6px rgba(0,0,0,.35); animation: gorb-spit-fly .85s ease-in forwards; }
-.gorb-zzz { position:fixed; z-index:8810; pointer-events:none; font-size:26px;
+.gorb-zzz { position:fixed; z-index:110; pointer-events:none; font-size:26px;
   animation: gorb-zzz 1.6s ease-out forwards; }
-.gorb-say { position:fixed; z-index:8820; pointer-events:none; background:#1e1f22; color:#f2f3f5;
+.gorb-say { position:fixed; z-index:120; pointer-events:none; background:#1e1f22; color:#f2f3f5;
   border:1px solid #3a3c42; border-radius:12px; padding:6px 12px; font-size:14px; font-weight:600;
   font-family:"Segoe UI",system-ui,sans-serif; white-space:nowrap; box-shadow:0 6px 18px rgba(0,0,0,.45);
   animation: gorb-say 2.1s ease-out forwards; }
@@ -67,12 +67,12 @@ const CSS = `
 @keyframes gorb-flinch { 0%,100%{ filter:none } 50%{ filter: brightness(1.6) saturate(.4) } }
 
 body.gorb-armed, body.gorb-armed * { cursor: crosshair !important; }
-#gorb-gun { position:fixed; left:50%; bottom:-14px; z-index:8850; pointer-events:none;
+#gorb-gun { position:fixed; left:50%; bottom:-14px; z-index:150; pointer-events:none;
   font-size:58px; transform-origin:50% 78%; transition: transform .06s linear;
   filter: drop-shadow(0 4px 10px rgba(0,0,0,.5)); }
-.gorb-drop { position:fixed; width:11px; height:11px; border-radius:50%; z-index:8830; pointer-events:none;
+.gorb-drop { position:fixed; width:11px; height:11px; border-radius:50%; z-index:130; pointer-events:none;
   background:#8ddcff; box-shadow:0 0 9px rgba(141,220,255,.9); animation: gorb-squirt .3s linear forwards; }
-.gorb-splash { position:fixed; z-index:8840; pointer-events:none; font-size:40px;
+.gorb-splash { position:fixed; z-index:140; pointer-events:none; font-size:40px;
   animation: gorb-splash .5s ease-out forwards; }
 #gorb.soggy { filter: brightness(.84) saturate(.6); }
 #gorb.hit { animation: gorb-flinch .22s ease-in-out 2; }
