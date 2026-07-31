@@ -90,6 +90,12 @@ export function installVoiceUI(hooks) {
   // The modal can close while getUserMedia is still resolving; without this
   // the meter would come up behind a closed modal and never be stopped.
   let wanted = false;
+  // `wanted` alone only covers open-then-close. Opening, closing and opening
+  // again while the permission prompt is still up leaves *two* getUserMedia
+  // calls in flight, both of which think they're current — which used to leak a
+  // live microphone and a second animation loop that ran forever. Every attempt
+  // takes a ticket, and only the newest one is allowed to publish its stream.
+  let meterGen = 0;
 
   function paintGate() {
     const th = hooks.settings().noiseGate || 0;
@@ -99,6 +105,13 @@ export function installVoiceUI(hooks) {
   }
 
   function draw() {
+    // A stale loop that outlived its meter must die rather than throw sixty
+    // times a second — the reschedule happens first, so a throw here would be
+    // permanent.
+    if (!meter) {
+      meterRaf = 0;
+      return;
+    }
     meterRaf = requestAnimationFrame(draw);
     const pct = rmsToPct(meter.level());
     fill.style.width = pct.toFixed(1) + "%";
@@ -109,29 +122,44 @@ export function installVoiceUI(hooks) {
   async function startMeter() {
     wanted = true;
     if (meter) return;
+    const gen = ++meterGen;
+    // Held locally until we know this attempt is still the current one, so a
+    // superseded attempt can only ever tear down what it opened itself.
+    let ctx = null;
+    let stream = null;
+    let mineCtx = false;
+    let mineStream = false;
     try {
       // Borrow the call's mic and context when there is one — a second
       // getUserMedia on the same device is a coin flip on some drivers, and
       // this way the bar shows the audio actually being sent.
       if (hooks.voice?.ctx && hooks.voice?.localStream) {
-        meterCtx = hooks.voice.ctx;
-        meterStream = hooks.voice.localStream;
+        ctx = hooks.voice.ctx;
+        stream = hooks.voice.localStream;
       } else {
-        meterCtx = new (window.AudioContext || window.webkitAudioContext)();
-        ownCtx = true;
-        meterStream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(hooks.settings()) });
-        ownStream = true;
-        populateOutputs(); // labels were blank until that resolved
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        mineCtx = true;
+        stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints(hooks.settings()) });
+        mineStream = true;
       }
     } catch {
-      stopMeter();
-      hooks.toast("Can't read the microphone for the level meter — check permissions.", true);
+      if (mineCtx && ctx) ctx.close().catch(() => {});
+      if (gen === meterGen) {
+        stopMeter();
+        hooks.toast("Can't read the microphone for the level meter — check permissions.", true);
+      }
       return;
     }
-    if (!wanted) {
-      stopMeter();
+    if (!wanted || gen !== meterGen) {
+      if (mineStream) for (const t of stream.getTracks()) t.stop();
+      if (mineCtx) ctx.close().catch(() => {});
       return;
     }
+    meterCtx = ctx;
+    meterStream = stream;
+    ownCtx = mineCtx;
+    ownStream = mineStream;
+    if (mineStream) populateOutputs(); // labels were blank until permission landed
     if (meterCtx.state === "suspended") meterCtx.resume();
     meter = createMeter(meterCtx, meterStream);
     draw();
@@ -139,6 +167,7 @@ export function installVoiceUI(hooks) {
 
   function stopMeter() {
     wanted = false;
+    meterGen++; // invalidates anything still waiting on getUserMedia
     if (meterRaf) {
       cancelAnimationFrame(meterRaf);
       meterRaf = 0;
