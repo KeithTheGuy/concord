@@ -27,6 +27,7 @@
     "render": "node test/render.mjs",
     "backup": "node test/backup.mjs",
     "outbox": "node test/outbox.mjs",
+    "ringing": "node test/ringing.mjs",
     "test": "node test/run-all.mjs"
   },
   "devDependencies": {

@@ -1,11 +1,11 @@
 // Group DMs across three browsers: create, everyone receives it, messages
 // reach all members, unread fans out, adding and leaving work. Plus the
 // loading splash and the hover toolbar.
-// Usage: node test/groups.mjs
+// Usage: node test/groups.mjs [baseUrl]
 
 import { chromium } from "playwright";
 
-const base = "http://127.0.0.1:4189";
+const base = process.argv[2] || "http://127.0.0.1:4189";
 let failures = 0;
 const ok = (l) => console.log(`  PASS ${l}`);
 const bad = (l, d) => {

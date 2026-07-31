@@ -58,6 +58,23 @@ const ATT_KEY_RE = /^a\/([A-Z0-9]{4,12})\/[a-f0-9-]{36}\/[A-Za-z0-9._-]{1,80}$/;
 // "can you post here?" is a set membership test rather than `type === "text"`.
 const CHATTABLE = new Set(["text", "thread", "voice"]);
 
+// A DM is not a guild with two people in it. Every op below exists so an owner
+// can shape a server, and a DM has no owner — so in a DM they instead let
+// either party quietly destroy the conversation. `create-channel` and
+// `delete-channel` were gated on `joined` alone, which meant a member could
+// clear the "keep one of each type" floor with a decoy channel and then delete
+// the real one, taking the history and its attachments with it; `ban` let
+// whoever opened the conversation first evict the other party from it forever.
+const DM_FORBIDDEN = new Set([
+  "create-channel", "delete-channel", "update-server", "kick", "ban", "unban", "bans",
+]);
+
+// Whether a DM realm still lets an uncredentialed `hello` through. See dmGate():
+// enforcement switches itself on per conversation the first time any member
+// proves an updated client, so this is the lever that closes the window for
+// everyone at once once the client has actually shipped.
+const DM_AUTH_GRACE = true;
+
 // What we are willing to hand back with a real Content-Type. Everything else
 // becomes application/octet-stream and therefore downloads instead of
 // rendering. image/svg+xml and text/html are absent on purpose: both execute
@@ -294,6 +311,24 @@ export class ConcordServer {
       return Response.json({ ok: true });
     }
 
+    // The hub telling us somebody just stopped being a member. Checking
+    // membership on `hello` alone would leave whoever is already connected
+    // sitting inside the conversation they were removed from until they chose
+    // to reconnect, which is not what "removed" means to the person who did it.
+    if (url.pathname === "/internal/evict") {
+      const uid = url.searchParams.get("uid") || "";
+      if (uid) {
+        for (const [ws, s] of this.sessions) {
+          if (s.hubUid !== uid) continue;
+          try {
+            ws.send(JSON.stringify({ type: "dm-denied", error: "You're not in this conversation." }));
+            ws.close(4005, "not a member");
+          } catch {}
+        }
+      }
+      return Response.json({ ok: true });
+    }
+
     if (url.pathname !== "/ws" || request.headers.get("Upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
     }
@@ -314,13 +349,20 @@ export class ConcordServer {
       if (url.searchParams.get("create") !== "1") {
         return new Response("no such server", { status: 404 });
       }
-      const isDm = url.searchParams.get("kind") === "dm";
+      // Whether this code is a conversation is the hub's fact, not the
+      // client's. It used to arrive as `&kind=dm` on the connect URL, which
+      // meant a DM's entire feature set — owner, bans, channel management —
+      // hinged on a string the connecting browser chose for itself.
+      const isDm = await this.hubOwnsCode(joining);
       meta = {
         name: cleanText(url.searchParams.get("name"), 40) || "New Server",
         icon: cleanText(url.searchParams.get("icon"), 8) || "🎮",
         kind: isDm ? "dm" : "guild",
         createdAt: Date.now(),
       };
+      // A DM has nobody to be in charge of it, and `hello` knows not to fill
+      // this in for a conversation.
+      if (isDm) meta.owner = null;
       // A DM is a one-room server: one text channel and one voice channel so
       // "call" is the same code path as joining voice anywhere else.
       const channels = isDm
@@ -335,6 +377,17 @@ export class ConcordServer {
             { id: "c4", type: "voice", name: "Gaming" },
           ];
       await this.state.storage.put({ meta, channels, nextChanId: channels.length + 1 });
+    } else if (meta.kind === "dm" && meta.owner) {
+      // Migration, run once per conversation. DMs minted while `kind` was a URL
+      // parameter were plain servers, so whoever opened one first became its
+      // owner — and could then ban the other party out of their own
+      // conversation with no unban path the victim could reach. Both the title
+      // and everything done with it go: a ban list nobody can administer is
+      // just a permanent exclusion.
+      meta.owner = null;
+      const bans = await this.state.storage.list({ prefix: "ban:" });
+      if (bans.size) await this.state.storage.delete([...bans.keys()]);
+      await this.state.storage.put("meta", meta);
     }
 
     const pair = new WebSocketPair();
@@ -724,6 +777,81 @@ export class ConcordServer {
     return !!userId && meta?.owner === userId;
   }
 
+  async isDirect() {
+    return (await this.state.storage.get("meta"))?.kind === "dm";
+  }
+
+  /* ---------------------------- the hub, asked ---------------------------- */
+  // §12 of CONTRACTS says a code is a bearer capability and the hub's
+  // membership list is bookkeeping, not enforcement. For a conversation that is
+  // wrong in the one place it matters: leaving a group and unfriending are both
+  // supposed to *take something away*, and neither did. So a realm the hub owns
+  // asks the hub who is allowed in — live, on every connect, so a removal takes
+  // effect immediately with no rotation, no expiry window and no history loss.
+  // The cost is one DO-to-DO fetch per DM `hello`; nothing on the message path.
+
+  hubStub() {
+    return this.env.HUB ? this.env.HUB.get(this.env.HUB.idFromName("hub")) : null;
+  }
+
+  async hubOwnsCode(code) {
+    const stub = this.hubStub();
+    if (!stub || !CODE_RE.test(code)) return false;
+    try {
+      const res = await stub.fetch(`https://do/internal/code-kind?code=${encodeURIComponent(code)}`);
+      return res.ok && !!(await res.json()).direct;
+    } catch {
+      return false;
+    }
+  }
+
+  // `known: false` means the hub has never minted this code and has no opinion
+  // about it — a conversation from before the hub wrote its codes down. Those
+  // are grandfathered rather than bricked; see dmGate().
+  async hubMembership(code, uid, token) {
+    const stub = this.hubStub();
+    if (!stub) return { known: false };
+    try {
+      const res = await stub.fetch(
+        `https://do/internal/dm-member?code=${encodeURIComponent(code)}` +
+          `&uid=${encodeURIComponent(uid)}&token=${encodeURIComponent(token)}`
+      );
+      if (!res.ok) return { known: false };
+      return await res.json();
+    } catch {
+      // An unreachable hub must not become an open door.
+      return { known: true, ok: false };
+    }
+  }
+
+  // Backward compatibility, decided deliberately. An older client sends no hub
+  // credentials at all, so refusing every uncredentialed hello would lock every
+  // existing conversation until the update reached every open tab. Instead
+  // enforcement arms itself per conversation the first time *any* member proves
+  // an updated client, and that fact is recorded on the realm. Before the flip a
+  // conversation is exactly as bearer-only as it was yesterday — no worse; after
+  // it, nobody can opt out by simply omitting the credentials, which is the only
+  // property that matters. DM_AUTH_GRACE closes the window for everyone at once.
+  async dmGate(m, meta) {
+    const hubUid = cleanText(m.hubUid, 40);
+    const hubToken = cleanText(m.hubToken, 64);
+    const code = this.code || (await this.state.storage.get("code")) || "";
+    if (!hubUid || !hubToken) {
+      if (meta.dmAuth || !DM_AUTH_GRACE) {
+        return { ok: false, error: "This conversation needs an up-to-date Concord. Reload the page." };
+      }
+      return { ok: true };
+    }
+    const verdict = await this.hubMembership(code, hubUid, hubToken);
+    if (!verdict.known) return { ok: true, hubUid };
+    if (!verdict.ok) return { ok: false, error: "You're not in this conversation." };
+    if (!meta.dmAuth) {
+      meta.dmAuth = true;
+      await this.state.storage.put("meta", meta);
+    }
+    return { ok: true, hubUid };
+  }
+
   // Does this server still know who that userId is, independently of `auth:`?
   async isRemembered(userId) {
     if (await this.state.storage.get(`roster:${userId}`)) return true;
@@ -767,14 +895,34 @@ export class ConcordServer {
   }
 
   // Roster rows outlive sockets, so they need their own ceiling. Anyone with a
-  // socket open is exempt — evicting someone mid-conversation would be absurd.
+  // socket open is exempt, and so is the owner — evicting someone mid-
+  // conversation would be absurd, and evicting the owner unpicks `isRemembered`.
+  //
+  // "Least recently seen" was the wrong rule for the *cap*, because cap pressure
+  // is the half an attacker manufactures. Two hundred throwaway hellos pushed
+  // the oldest real member out of the roster, and sweepAuth only exempts people
+  // the roster still names — so the two sweeps together handed out a remembered
+  // identity. Age still evicts oldest-first, which is what a sweep is for; a cap
+  // breach evicts the *newest* cold rows instead, which are the ones that caused
+  // it. A flood therefore evicts itself.
   async sweepRoster() {
     const rows = await this.state.storage.list({ prefix: "roster:" });
     if (rows.size <= ROSTER_CAP) return;
     const live = new Set();
     for (const s of this.sessions.values()) if (s.userId) live.add(`roster:${s.userId}`);
-    const cold = [...rows].filter(([key]) => !live.has(key)).sort((a, b) => (a[1]?.at || 0) - (b[1]?.at || 0));
-    const doomed = cold.slice(0, rows.size - ROSTER_CAP).map(([key]) => key);
+    const owner = (await this.state.storage.get("meta"))?.owner;
+    if (owner) live.add(`roster:${owner}`);
+    const now = Date.now();
+    const cold = [...rows]
+      .filter(([key]) => !live.has(key))
+      .sort((a, b) => (a[1]?.at || 0) - (b[1]?.at || 0));
+    const doomed = cold.filter(([, e]) => now - (e?.at || 0) > AUTH_TTL_MS).map(([key]) => key);
+    const over = rows.size - doomed.length - ROSTER_CAP;
+    if (over > 0) {
+      const dead = new Set(doomed);
+      const newestFirst = cold.filter(([key]) => !dead.has(key)).reverse();
+      for (const [key] of newestFirst.slice(0, over)) doomed.push(key);
+    }
     if (doomed.length) await this.state.storage.delete(doomed);
   }
 
@@ -872,6 +1020,7 @@ export class ConcordServer {
   async dispatch(ws, s, m) {
     const storage = this.state.storage;
     if (RATE_LIMITED.has(m.type) && this.overRate(s.sid)) return;
+    if (DM_FORBIDDEN.has(m.type) && (await this.isDirect())) return;
 
     switch (m.type) {
       case "hello": {
@@ -879,6 +1028,23 @@ export class ConcordServer {
         // client could re-hello on a live socket to assume another member's
         // userId (their messages, their prank cooldown) at will.
         if (s.joined) return;
+
+        // For a conversation, membership is checked before anything is written:
+        // somebody who was removed should get no session, no roster row and no
+        // storage write out of us.
+        const helloMeta = await storage.get("meta");
+        let gateUid = "";
+        if (helloMeta?.kind === "dm") {
+          const gate = await this.dmGate(m, helloMeta);
+          if (!gate.ok) {
+            ws.send(JSON.stringify({ type: "dm-denied", error: gate.error }));
+            try {
+              ws.close(4005, "not a member");
+            } catch {}
+            return;
+          }
+          gateUid = gate.hubUid || "";
+        }
 
         // A userId is owned by whoever first claimed it here, proven by a
         // server-issued token. Present the wrong token and you get a fresh
@@ -936,12 +1102,17 @@ export class ConcordServer {
         s.tag = cleanText(m.tag, 20).toLowerCase();
         s.voice = null;
         s.joined = true;
+        // Remembered so the hub can have this socket dropped the moment its
+        // owner stops being a member; see /internal/evict.
+        if (gateUid) s.hubUid = gateUid;
         this.saveSession(ws, s);
 
         const meta = await storage.get("meta");
         // Whoever turns up first is in charge. There is no other moment at
-        // which we could possibly tell.
-        if (meta && !meta.owner) {
+        // which we could possibly tell — except in a conversation, which has no
+        // owner at all, because "first to open it" is not a claim to the other
+        // person's messages.
+        if (meta && meta.kind !== "dm" && !meta.owner) {
           meta.owner = userId;
           await storage.put("meta", meta);
         }
@@ -1769,16 +1940,48 @@ export class ConcordServer {
 // and means the hub never sees a word anyone says.
 
 const TAG_RE = /^[a-z0-9_.]{2,20}$/;
+// Counted over accepted friends only. It used to count every `fr:` row, which
+// includes *incoming* requests — so three hundred throwaway accounts each
+// sending one request permanently locked the victim out of adding anybody,
+// and the only way back was three hundred manual declines.
 const FRIEND_CAP = 250;
+// The separate ceiling that flood needed, enforced against the person being
+// asked rather than the person asking. Past it a request is dropped and the
+// sender is told the same thing they'd be told if it had landed.
+const INCOMING_CAP = 60;
 const GDM_MAX_MEMBERS = 10;
 const GDM_CAP = 20; // group conversations per person
+// Tags are short human slugs, which makes an unbounded `friend-add` a
+// directory. The old limiter keyed on s.sid, minted fresh per socket, so it
+// cost an attacker one extra WebSocket per thirty probes.
+const PROBE_WINDOW_MS = 60_000;
+const PROBES_PER_WINDOW = 12;
+// Accounts are free and uncapped, which is what made the flood cheap. Absent
+// under `wrangler dev`, where there is no CF-Connecting-IP to key on.
+const ACCOUNTS_PER_IP_HOUR = 30;
+const IP_WINDOW_MS = 60 * 60 * 1000;
+const IP_SWEEP_EVERY = 50;
 const HUB_RATE_LIMITED = new Set([
   "hello", "friend-add", "friend-accept", "friend-decline", "friend-remove",
   "presence", "set-tag", "dm-open", "dm-nudge", "dm-read", "poke",
   "gdm-create", "gdm-open", "gdm-leave", "gdm-add", "gdm-rename",
+  "friend-block", "friend-unblock", "blocks",
 ]);
 
 const frKey = (a, b) => `fr:${a}:${b}`;
+// `block:<uid>:<other>` — "uid does not want to hear from other". Written on
+// decline, so a declined requester cannot simply ask again forever, and checked
+// anywhere one person can reach another without being friends.
+const blockKey = (a, b) => `block:${a}:${b}`;
+// The record that makes a conversation code more than a bearer capability: what
+// the hub minted this code *for*. ConcordServer asks about it on `hello`.
+// Nothing deletes one, ever, and that is load-bearing in the same way `user:`
+// is: a code the hub has forgotten is a code the realm grandfathers, so tidying
+// these away re-opens every conversation they named.
+const dmCodeKey = (code) => `dmcode:${code}`;
+// Sorted, so the same pair always writes the same reference no matter which of
+// the two happens to register the code first.
+const dmRef = (a, b) => (a < b ? { kind: "dm", a, b } : { kind: "dm", a: b, b: a });
 // Group ids start with "g" and user ids are UUIDs, so one unread namespace
 // serves both without any chance of collision.
 const unreadKey = (owner, other) => `unread:${owner}:${other}`;
@@ -1793,6 +1996,12 @@ export class ConcordHub {
     this.sessions = new Map(); // ws -> session
     this.online = new Map(); // uid -> Set<ws>
     this.rate = new Map();
+    // The IP half of the tag-probe limiter. In memory, unlike the per-account
+    // half: one storage row per distinct IP would grow without bound, and this
+    // object deliberately has no sweep over anything identity-shaped (see
+    // `hello`). Losing it to hibernation costs an attacker a wait, not nothing.
+    this.probes = new Map(); // ip -> [timestamps]
+    this.newAccounts = 0;
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
     );
@@ -1805,12 +2014,37 @@ export class ConcordHub {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+
+    // Only the Worker and other Durable Objects hold a stub for this object, so
+    // these two routes are not reachable from the internet. They are how a
+    // conversation's ConcordServer asks the hub the one question it cannot
+    // answer for itself.
+    if (url.pathname === "/internal/code-kind") {
+      const code = (url.searchParams.get("code") || "").toUpperCase();
+      const ref = CODE_RE.test(code) ? await this.state.storage.get(dmCodeKey(code)) : null;
+      return Response.json({ direct: !!ref });
+    }
+    if (url.pathname === "/internal/dm-member") {
+      return Response.json(
+        await this.dmMember(
+          (url.searchParams.get("code") || "").toUpperCase(),
+          url.searchParams.get("uid") || "",
+          url.searchParams.get("token") || ""
+        )
+      );
+    }
+
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const session = { sid: crypto.randomUUID().slice(0, 8), uid: null };
+    // Cloudflare only sets this at the edge, so under `wrangler dev` it is
+    // absent and every limiter keyed on it degrades to no limit rather than to
+    // a crash. That's the right failure direction for a friend group.
+    const ip = cleanText(request.headers.get("CF-Connecting-IP"), 64);
+    const session = { sid: crypto.randomUUID().slice(0, 8), uid: null, ip };
     server.serializeAttachment(session);
     this.sessions.set(server, session);
     this.state.acceptWebSocket(server);
@@ -1869,17 +2103,182 @@ export class ConcordHub {
     return uid ? await this.state.storage.get(`user:${uid}`) : null;
   }
 
+  /* -------------------- conversations the hub vouches for ------------------- */
+  // The hub always effectively owned the code → conversation mapping; it just
+  // never wrote it down, which is why leaving a group revoked nothing. `dmcode:`
+  // is that mapping, and the three answers below are the whole enforcement
+  // story: what a code is, who is currently in it, and how to throw out someone
+  // already inside.
+
+  async registerCode(code, ref) {
+    if (!CODE_RE.test(code || "")) return;
+    const key = dmCodeKey(code);
+    if (await this.state.storage.get(key)) return;
+    await this.state.storage.put(key, ref);
+  }
+
+  // Answers ConcordServer's `hello`. `known:false` means this code predates the
+  // registry and the hub has no opinion about it — never an implicit yes to a
+  // code it *does* know.
+  async dmMember(code, uid, token) {
+    const storage = this.state.storage;
+    const ref = CODE_RE.test(code) ? await storage.get(dmCodeKey(code)) : null;
+    if (!ref) return { known: false };
+    const acct = uid ? await storage.get(`user:${uid}`) : null;
+    // The hub token is the only proof of a hub identity, so an unproven uid is
+    // simply not that person — same rule as everywhere else in this file.
+    if (!acct || acct.token !== token) return { known: true, ok: false };
+    if (ref.kind === "gdm") {
+      const group = await storage.get(groupKey(ref.id));
+      return { known: true, ok: !!group && group.code === code && group.members.includes(uid) };
+    }
+    const other = ref.a === uid ? ref.b : ref.b === uid ? ref.a : "";
+    if (!other) return { known: true, ok: false };
+    // Read live rather than from the registry, so unfriending revokes on the
+    // next connect with nothing to expire and nothing to re-key.
+    const row = await storage.get(frKey(uid, other));
+    return { known: true, ok: row?.state === "friend" && row.dm === code };
+  }
+
+  // Membership checked on `hello` alone would leave whoever is already
+  // connected sitting inside the conversation they were removed from.
+  async evict(code, uid) {
+    if (!this.env.SERVERS || !CODE_RE.test(code || "") || !uid) return;
+    try {
+      await this.env.SERVERS.get(this.env.SERVERS.idFromName(code)).fetch(
+        `https://do/internal/evict?uid=${encodeURIComponent(uid)}`
+      );
+    } catch {
+      // A realm we cannot reach keeps them until their socket drops on its own.
+    }
+  }
+
+  async isBlocked(by, who) {
+    return !!(by && who && (await this.state.storage.get(blockKey(by, who))));
+  }
+
+  // Groups top out at ten people, so the naive pairwise walk is at most ninety
+  // reads on an op nobody runs in a loop.
+  async blockClash(uids) {
+    for (const a of uids) {
+      for (const b of uids) {
+        if (a !== b && (await this.isBlocked(a, b))) return true;
+      }
+    }
+    return false;
+  }
+
+  async blockList(uid) {
+    const out = [];
+    for (const key of (await this.state.storage.list({ prefix: `block:${uid}:` })).keys()) {
+      out.push(key.slice(`block:${uid}:`.length));
+    }
+    return out;
+  }
+
+  // Ending a friendship has to take the conversation with it. The rows going
+  // away is what `dmMember` reads, so the next connect is already refused; the
+  // eviction is for whoever is sitting in there right now. The audit re-opened a
+  // DM after being unfriended, read new messages and posted into it.
+  async severFriendship(uid, other, row) {
+    await this.state.storage.delete([
+      frKey(uid, other),
+      frKey(other, uid),
+      unreadKey(uid, other),
+      unreadKey(other, uid),
+    ]);
+    if (row?.dm) {
+      await this.evict(row.dm, uid);
+      await this.evict(row.dm, other);
+    }
+  }
+
+  // Keyed on the account and on the source IP rather than on the socket, which
+  // was free to replace: ten sockets answered 250 probes in a second and a half.
+  // The account half lives in storage because an attacker can simply wait for
+  // this object to hibernate and take the in-memory half with it.
+  async probeBudget(s) {
+    const now = Date.now();
+    if (s.ip) {
+      const hits = (this.probes.get(s.ip) || []).filter((t) => now - t < PROBE_WINDOW_MS);
+      if (hits.length >= PROBES_PER_WINDOW) return false;
+      hits.push(now);
+      this.probes.set(s.ip, hits);
+    }
+    const key = `probe:${s.uid}`;
+    const mine = ((await this.state.storage.get(key)) || []).filter((t) => now - t < PROBE_WINDOW_MS);
+    if (mine.length >= PROBES_PER_WINDOW) return false;
+    mine.push(now);
+    await this.state.storage.put(key, mine);
+    return true;
+  }
+
+  // `ipacct:` rows are not identities and nothing in the graph refers to them,
+  // so unlike `user:` they can be swept — carefully, and never anything else.
+  async sweepIpAccounts(now) {
+    const doomed = [];
+    for (const [key, stamps] of await this.state.storage.list({ prefix: "ipacct:" })) {
+      if (!stamps?.length || now - stamps[stamps.length - 1] > IP_WINDOW_MS) doomed.push(key);
+    }
+    if (doomed.length) await this.state.storage.delete(doomed);
+  }
+
+  // Invisible is enforced here, not in the client. It used to be a rendering
+  // rule — `online` and the real `presence` went out on the wire verbatim — so
+  // any friend with devtools open saw the true dot. The custom status goes with
+  // it: it's free text people put "at the dentist" and "in class" into, updated
+  // live, which is exactly the feed the mode promises not to publish. So while
+  // you're invisible the wire says offline, and says nothing else about you.
   publicUser(uid, acct) {
+    const hidden = acct?.presence === "invisible";
     return {
       uid,
       tag: acct?.tag || "",
       name: acct?.name || "Wumpus",
       avatar: acct?.avatar || "🙂",
       color: acct?.color || "#5865f2",
+      status: hidden ? "" : acct?.status || "",
+      presence: hidden ? "offline" : acct?.presence || "online",
+      online: this.isOnline(uid) && !hidden,
+    };
+  }
+
+  // What you are allowed to know about yourself. Redacting your own presence
+  // back at you would leave the settings menu unable to show which mode it is in.
+  privateUser(uid, acct) {
+    return {
+      ...this.publicUser(uid, acct),
       status: acct?.status || "",
       presence: acct?.presence || "online",
-      online: this.isOnline(uid),
+      online: true,
     };
+  }
+
+  // Does the graph still name this uid, independently of its `user:` row? Only
+  // consulted when a uid is claimed and the account row is missing, which today
+  // means data loss or an attack — see the note at `hello`.
+  async isRemembered(uid) {
+    const storage = this.state.storage;
+    if ((await storage.list({ prefix: `fr:${uid}:`, limit: 1 })).size) return true;
+    return !!(await storage.list({ prefix: `ugdm:${uid}:`, limit: 1 })).size;
+  }
+
+  // Returns an error string when this IP has minted too many accounts in the
+  // last hour, and "" when it hasn't. Without CF-Connecting-IP there is nothing
+  // to key on, so it returns "" — a friend group behind one NAT would rather
+  // have no limit than a locked front door.
+  async mintBudget(s) {
+    if (!s.ip) return "";
+    const now = Date.now();
+    const key = `ipacct:${s.ip}`;
+    const recent = ((await this.state.storage.get(key)) || []).filter((t) => now - t < IP_WINDOW_MS);
+    if (recent.length >= ACCOUNTS_PER_IP_HOUR) {
+      return "That's a lot of new accounts from one place. Try again later.";
+    }
+    recent.push(now);
+    await this.state.storage.put(key, recent);
+    if (++this.newAccounts % IP_SWEEP_EVERY === 0) await this.sweepIpAccounts(now);
+    return "";
   }
 
   // Tags are the "add me" handle: a slug, plus digits when the slug is taken.
@@ -1991,6 +2390,16 @@ export class ConcordHub {
       case "hello": {
         if (s.uid) return; // identity is claimed once per socket, as in ConcordServer
 
+        // The load-bearing invariant, written down where it can be broken:
+        // NOTHING here ever deletes a `user:` row. No sweep, no LRU, no account
+        // cap. That is the only reason the hub is immune to the identity
+        // takeover ConcordServer had — the "wrong token" branch below cannot
+        // fail when there is nothing to compare against, so the hub is safe
+        // purely because the precondition is unreachable. Those rows therefore
+        // grow forever, which makes capping them the obvious future maintenance
+        // task, and doing it would hand an attacker the victim's tag, their
+        // whole friend graph and every DM code they hold. The `isRemembered`
+        // guard below is what has to hold instead if that day ever comes.
         const claimed = cleanText(m.uid, 40);
         const presented = cleanText(m.token, 64);
         let uid = claimed;
@@ -1998,8 +2407,21 @@ export class ConcordHub {
         if (acct && acct.token !== presented) {
           acct = null; // wrong token — you get a new account, not theirs
           uid = "";
+        } else if (uid && !acct && (await this.isRemembered(uid))) {
+          // No account row, but the graph still names this uid. That is a hole
+          // in our own bookkeeping, never permission: an identity the server
+          // remembers must not be claimable by someone who can't prove it.
+          uid = "";
         }
         if (!acct) {
+          const denial = await this.mintBudget(s);
+          if (denial) {
+            ws.send(JSON.stringify({ type: "hub-error", error: denial }));
+            try {
+              ws.close(4008, "too many accounts");
+            } catch {}
+            return;
+          }
           uid = crypto.randomUUID();
           const tag = await this.mintTag(m.name);
           acct = {
@@ -2014,6 +2436,13 @@ export class ConcordHub {
           };
           await storage.put({ [`user:${uid}`]: acct, [`tag:${tag}`]: uid });
         } else {
+          // `set-tag` writes the new row before deleting the old one, so a crash
+          // between the two leaves an account whose own tag resolves to nobody.
+          // Heal only an *absent* row — one pointing elsewhere belongs to
+          // whoever claimed it since.
+          if (acct.tag && !(await storage.get(`tag:${acct.tag}`))) {
+            await storage.put(`tag:${acct.tag}`, uid);
+          }
           // Profile travels with the account so friends can see it while
           // you're offline.
           if (m.name !== undefined) acct.name = cleanText(m.name, 32) || acct.name;
@@ -2042,6 +2471,11 @@ export class ConcordHub {
             const unread = (await storage.get(unreadKey(uid, other))) || 0;
             if (unread) dmUnread[other] = unread;
             friends.push({ ...user, dm: row.dm });
+            // Backfill for codes minted before the registry existed. The client
+            // often opens a DM straight from this list without asking `dm-open`
+            // first, so handing the code out is the last moment we are certain
+            // to be holding it.
+            if (row.dm) await this.registerCode(row.dm, dmRef(uid, other));
           } else if (row.state === "in") incoming.push(user);
           else if (row.state === "out") outgoing.push(user);
         }
@@ -2054,22 +2488,33 @@ export class ConcordHub {
           if (!group || !group.members.includes(uid)) continue;
           const unread = (await storage.get(unreadKey(uid, group.id))) || 0;
           if (unread) dmUnread[group.id] = unread;
+          await this.registerCode(group.code, { kind: "gdm", id: group.id });
           groups.push(await this.publicGroup(group));
+        }
+
+        const blocked = [];
+        for (const key of (await storage.list({ prefix: `block:${uid}:` })).keys()) {
+          blocked.push(key.slice(`block:${uid}:`.length));
         }
 
         ws.send(
           JSON.stringify({
             type: "hub-welcome",
-            you: this.publicUser(uid, acct),
+            you: this.privateUser(uid, acct),
             token: acct.token,
             friends,
             incoming,
             outgoing,
             groups,
             dmUnread,
+            blocked,
           })
         );
-        if (cameOnline) {
+        // An invisible connect announces nothing. This used to fire
+        // {online:true, presence:"invisible"} — the true state, on the wire, to
+        // everyone, with only the client's rendering standing between it and
+        // the person who chose not to be seen.
+        if (cameOnline && acct.presence !== "invisible") {
           await this.notifyFriends(uid, { type: "friend-presence", uid, online: true, presence: acct.presence });
         }
         break;
@@ -2092,7 +2537,13 @@ export class ConcordHub {
         const old = acct.tag;
         acct.tag = tag;
         await storage.put({ [`user:${s.uid}`]: acct, [`tag:${tag}`]: s.uid });
-        if (old && old !== tag) await storage.delete(`tag:${old}`);
+        // Only give up a row we still own. These two writes cannot be made
+        // atomic, so a crash between them already strands an orphan `tag:` row
+        // that `friend-add` happily resolves and nobody can ever claim; deleting
+        // unconditionally means a *retry* strands somebody else's row too.
+        if (old && old !== tag && (await storage.get(`tag:${old}`)) === s.uid) {
+          await storage.delete(`tag:${old}`);
+        }
         ws.send(JSON.stringify({ type: "tag-changed", tag }));
         await this.notifyFriends(s.uid, { type: "friend-update", user: this.publicUser(s.uid, acct) });
         break;
@@ -2102,6 +2553,7 @@ export class ConcordHub {
         if (!s.uid) return;
         const acct = await this.account(s.uid);
         if (!acct) return;
+        const wasHidden = acct.presence === "invisible";
         if (m.name !== undefined) acct.name = cleanText(m.name, 32) || acct.name;
         if (m.avatar !== undefined) acct.avatar = cleanText(m.avatar, 8) || acct.avatar;
         if (m.color !== undefined) acct.color = cleanColor(m.color);
@@ -2110,6 +2562,19 @@ export class ConcordHub {
         acct.at = Date.now();
         await storage.put(`user:${s.uid}`, acct);
         await this.notifyFriends(s.uid, { type: "friend-update", user: this.publicUser(s.uid, acct) });
+        // Going invisible has to look like going offline, because that is what
+        // it claims to be. Switching used to send a `friend-update` still
+        // carrying online:true, so the dot never moved. Coming back out has to
+        // announce too, or you stay dark until you reconnect.
+        const nowHidden = acct.presence === "invisible";
+        if (wasHidden !== nowHidden) {
+          await this.notifyFriends(s.uid, {
+            type: "friend-presence",
+            uid: s.uid,
+            online: !nowHidden && this.isOnline(s.uid),
+            presence: nowHidden ? "offline" : acct.presence,
+          });
+        }
         break;
       }
 
@@ -2120,16 +2585,41 @@ export class ConcordHub {
           ws.send(JSON.stringify({ type: "hub-error", error: "That doesn't look like a tag. They look like @keith or @keith4821." }));
           return;
         }
-        const targetUid = await storage.get(`tag:${tag}`);
-        if (!targetUid) {
-          ws.send(JSON.stringify({ type: "hub-error", error: `Nobody here goes by @${tag}.` }));
+        if (!(await this.probeBudget(s))) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "Slow down — try that again in a minute." }));
           return;
         }
+        // The sender's own rows are read before anything is known about the
+        // target, so the storage work either answer costs is roughly the same.
+        // It is not constant time and doesn't pretend to be; it just stops the
+        // *shape* of the reply from being a lookup.
+        const rows = await this.friendRows(s.uid);
+        const targetUid = await storage.get(`tag:${tag}`);
         if (targetUid === s.uid) {
           ws.send(JSON.stringify({ type: "hub-error", error: "You cannot add yourself. Touch grass." }));
           return;
         }
+        // What a stranger gets back is the tag they typed and nothing else.
+        // `friend-outgoing` used to echo publicUser — the target's whole
+        // profile plus live presence — before the target had seen the request
+        // and whether or not they ever accepted it. The `user` field survives
+        // only so an older client's outgoing list still renders; it is a stub
+        // built from what the sender already knew.
+        const sent = () =>
+          ws.send(
+            JSON.stringify({
+              type: "friend-outgoing",
+              tag,
+              user: outgoingStub(targetUid, tag),
+            })
+          );
+        if (!targetUid) {
+          sent(); // a tag that resolves and one that doesn't answer alike
+          return;
+        }
         const mine = await storage.get(frKey(s.uid, targetUid));
+        // These three the sender already knows, so saying them plainly leaks
+        // nothing they could not have worked out from their own friend list.
         if (mine?.state === "friend") {
           ws.send(JSON.stringify({ type: "hub-error", error: "You're already friends." }));
           return;
@@ -2138,15 +2628,25 @@ export class ConcordHub {
           ws.send(JSON.stringify({ type: "hub-error", error: "Already asked. Give them a minute." }));
           return;
         }
-        const targetAcct = await storage.get(`user:${targetUid}`);
-        // They already asked you — adding them back just accepts.
         if (mine?.state === "in") {
-          await this.becomeFriends(s.uid, targetUid);
+          await this.becomeFriends(s.uid, targetUid); // they asked first; adding back accepts
           return;
         }
-        const rows = await this.friendRows(s.uid);
-        if (rows.length >= FRIEND_CAP) {
+        // A block and a full inbox both answer like a delivered request. Naming
+        // either one confirms the tag resolved, and "you are blocked" is
+        // precisely the notification the person who blocked them declined to
+        // send.
+        if (await this.isBlocked(targetUid, s.uid)) {
+          sent();
+          return;
+        }
+        if (rows.filter(([, row]) => row.state === "friend").length >= FRIEND_CAP) {
           ws.send(JSON.stringify({ type: "hub-error", error: "That's a lot of friends. Prune some first." }));
+          return;
+        }
+        const theirs = await this.friendRows(targetUid);
+        if (theirs.filter(([, row]) => row.state === "in").length >= INCOMING_CAP) {
+          sent();
           return;
         }
         const now = Date.now();
@@ -2155,7 +2655,7 @@ export class ConcordHub {
           [frKey(targetUid, s.uid)]: { state: "in", at: now },
         });
         const myAcct = await this.account(s.uid);
-        ws.send(JSON.stringify({ type: "friend-outgoing", user: this.publicUser(targetUid, targetAcct) }));
+        sent();
         this.sendToUser(targetUid, { type: "friend-request", user: this.publicUser(s.uid, myAcct) });
         break;
       }
@@ -2175,14 +2675,45 @@ export class ConcordHub {
         const other = cleanText(m.uid, 40);
         const row = await storage.get(frKey(s.uid, other));
         if (!row) return;
-        await storage.delete([
-          frKey(s.uid, other),
-          frKey(other, s.uid),
-          unreadKey(s.uid, other),
-          unreadKey(other, s.uid),
-        ]);
+        // Declining left no record at all, so the requester could ask again
+        // immediately and forever — there was no "no" anywhere in the product.
+        // A decline is now a block, which `friend-unblock` undoes; a *removal*
+        // is not, because ending a friendship is not the same as refusing one.
+        if (m.type === "friend-decline" && row.state === "in") {
+          await storage.put(blockKey(s.uid, other), { uid: other, at: Date.now() });
+        }
+        await this.severFriendship(s.uid, other, row);
         ws.send(JSON.stringify({ type: "friend-removed", uid: other }));
         this.sendToUser(other, { type: "friend-removed", uid: s.uid });
+        break;
+      }
+
+      case "friend-block": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        if (!other || other === s.uid) return;
+        await storage.put(blockKey(s.uid, other), { uid: other, at: Date.now() });
+        const row = await storage.get(frKey(s.uid, other));
+        if (row) {
+          await this.severFriendship(s.uid, other, row);
+          ws.send(JSON.stringify({ type: "friend-removed", uid: other }));
+          this.sendToUser(other, { type: "friend-removed", uid: s.uid });
+        }
+        ws.send(JSON.stringify({ type: "blocks", list: await this.blockList(s.uid) }));
+        break;
+      }
+
+      case "friend-unblock": {
+        if (!s.uid) return;
+        const other = cleanText(m.uid, 40);
+        if (other) await storage.delete(blockKey(s.uid, other));
+        ws.send(JSON.stringify({ type: "blocks", list: await this.blockList(s.uid) }));
+        break;
+      }
+
+      case "blocks": {
+        if (!s.uid) return;
+        ws.send(JSON.stringify({ type: "blocks", list: await this.blockList(s.uid) }));
         break;
       }
 
@@ -2197,12 +2728,20 @@ export class ConcordHub {
         // Older friendships predate DM codes; mint one on demand for both.
         let code = row.dm;
         if (!code) {
+          const mirror = await storage.get(frKey(other, s.uid));
+          // This used to manufacture the missing half — `|| {state:"friend"}` —
+          // which is exactly the mistake ConcordServer.hello was just patched
+          // out of. Half a friendship means somebody's removal only half
+          // landed, and healing it re-grants the access that removal took away.
+          if (mirror?.state !== "friend") {
+            throw new Error("That friendship is only half here. Remove them and add them again.");
+          }
           code = newServerCode() + newServerCode().slice(0, 4);
-          const mirror = (await storage.get(frKey(other, s.uid))) || { state: "friend", at: Date.now() };
           row.dm = code;
           mirror.dm = code;
           await storage.put({ [frKey(s.uid, other)]: row, [frKey(other, s.uid)]: mirror });
         }
+        await this.registerCode(code, dmRef(s.uid, other));
         await storage.delete(unreadKey(s.uid, other));
         const otherAcct = await storage.get(`user:${other}`);
         ws.send(JSON.stringify({ type: "dm-ready", uid: other, code, user: this.publicUser(other, otherAcct) }));
@@ -2223,6 +2762,7 @@ export class ConcordHub {
           if (!group || !group.members.includes(s.uid)) return;
           for (const uid of group.members) {
             if (uid === s.uid) continue;
+            if (await this.isBlocked(uid, s.uid)) continue;
             const key = unreadKey(uid, group.id);
             const count = Math.min(((await storage.get(key)) || 0) + 1, 999);
             await storage.put(key, count);
@@ -2241,6 +2781,7 @@ export class ConcordHub {
         const other = cleanText(m.uid, 40);
         const row = await storage.get(frKey(s.uid, other));
         if (row?.state !== "friend") return;
+        if (await this.isBlocked(other, s.uid)) return;
         const key = unreadKey(other, s.uid);
         const count = ((await storage.get(key)) || 0) + 1;
         await storage.put(key, Math.min(count, 999));
@@ -2283,6 +2824,12 @@ export class ConcordHub {
           ws.send(JSON.stringify({ type: "hub-error", error: "That's a lot of group chats. Leave one first." }));
           return;
         }
+        // Nobody gets dragged into a room with someone they blocked, in either
+        // direction. `gdm-add` would be theatre without the same check here.
+        if (await this.blockClash([s.uid, ...invited])) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "Someone in that list has blocked someone else in it." }));
+          return;
+        }
         const members = [s.uid, ...invited];
         const group = {
           id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 12),
@@ -2294,6 +2841,7 @@ export class ConcordHub {
           at: Date.now(),
         };
         await this.saveGroup(group);
+        await this.registerCode(group.code, { kind: "gdm", id: group.id });
         const pub = await this.publicGroup(group);
         await this.tellGroup(group, { type: "gdm-added", group: pub });
         break;
@@ -2303,6 +2851,7 @@ export class ConcordHub {
         if (!s.uid) return;
         const group = await this.loadGroup(cleanText(m.id, 40));
         if (!group || !group.members.includes(s.uid)) return;
+        await this.registerCode(group.code, { kind: "gdm", id: group.id });
         await storage.delete(unreadKey(s.uid, group.id));
         ws.send(JSON.stringify({ type: "gdm-ready", group: await this.publicGroup(group) }));
         break;
@@ -2321,6 +2870,10 @@ export class ConcordHub {
         }
         if (group.members.length >= GDM_MAX_MEMBERS) {
           ws.send(JSON.stringify({ type: "hub-error", error: `Groups cap out at ${GDM_MAX_MEMBERS} people.` }));
+          return;
+        }
+        if (await this.blockClash([...group.members, uid])) {
+          ws.send(JSON.stringify({ type: "hub-error", error: "They've blocked someone in this group, or the other way round." }));
           return;
         }
         group.members.push(uid);
@@ -2350,12 +2903,22 @@ export class ConcordHub {
         ws.send(JSON.stringify({ type: "gdm-removed", id: group.id }));
         if (group.members.length < 2) {
           // Nobody left to talk to — drop the record entirely.
+          // The `dmcode:` row deliberately stays. It now points at a group that
+          // no longer exists, which is what makes `dmMember` refuse everybody —
+          // deleting it would make the code unknown to the hub again, and an
+          // unknown code is one the realm grandfathers.
           const leftovers = group.members.map((u) => userGroupKey(u, group.id));
           await storage.delete([groupKey(group.id), ...leftovers]);
+          for (const uid of [s.uid, ...group.members]) await this.evict(group.code, uid);
           await this.tellGroup(group, { type: "gdm-removed", id: group.id });
           break;
         }
         await storage.put(groupKey(group.id), group);
+        // The remaining members' clients get a list without you and reasonably
+        // believe the room is now private. Until this, that belief was wrong:
+        // the code you were told still opened the room, and the audit read a
+        // message posted after it left.
+        await this.evict(group.code, s.uid);
         await this.tellGroup(group, { type: "gdm-added", group: await this.publicGroup(group) });
         break;
       }
@@ -2366,6 +2929,12 @@ export class ConcordHub {
         const other = cleanText(m.uid, 40);
         const row = await storage.get(frKey(s.uid, other));
         if (row?.state !== "friend") return;
+        // A blocked poke reports the same "they're offline" it would if they
+        // simply weren't there — a block that announces itself isn't one.
+        if (await this.isBlocked(other, s.uid)) {
+          ws.send(JSON.stringify({ type: "poke-sent", landed: false }));
+          return;
+        }
         const acct = await this.account(s.uid);
         const landed = this.sendToUser(other, { type: "poked", uid: s.uid, name: acct?.name || "Someone" });
         ws.send(JSON.stringify({ type: "poke-sent", landed }));
@@ -2385,6 +2954,11 @@ export class ConcordHub {
       [frKey(a, b)]: { state: "friend", at: now, dm: code },
       [frKey(b, a)]: { state: "friend", at: now, dm: code },
     });
+    // Accepting is where a code first becomes a conversation, so it is where the
+    // realm's membership question first has an answer.
+    await this.registerCode(code, dmRef(a, b));
+    // Becoming friends with someone you blocked is consent to hear from them.
+    await storage.delete([blockKey(a, b), blockKey(b, a)]);
     const [acctA, acctB] = await Promise.all([this.account(a), this.account(b)]);
     this.sendToUser(a, { type: "friend-added", user: { ...this.publicUser(b, acctB), dm: code } });
     this.sendToUser(b, { type: "friend-added", user: { ...this.publicUser(a, acctA), dm: code } });
@@ -2411,6 +2985,22 @@ export class ConcordHub {
       ws.close(1011, "session dropped");
     } catch {}
   }
+}
+
+// The placeholder that stands where the target's profile used to go. A miss
+// gets a throwaway uid so the frame a stranger sees is the same size and shape
+// either way; nothing is written against it, and it never reaches the target.
+function outgoingStub(uid, tag) {
+  return {
+    uid: uid || crypto.randomUUID(),
+    tag,
+    name: tag,
+    avatar: "🙂",
+    color: "#5865f2",
+    status: "",
+    presence: "offline",
+    online: false,
+  };
 }
 
 const PRESENCES = new Set(["online", "idle", "dnd", "invisible"]);

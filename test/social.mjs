@@ -3,11 +3,11 @@
 // Also checks the things most likely to be silently broken by the rewrite:
 // no console errors on boot, the emoji button is to the RIGHT of the textbox,
 // and slash commands / mentions / spoilers actually render.
-// Usage: node test/social.mjs
+// Usage: node test/social.mjs [baseUrl]
 
 import { chromium } from "playwright";
 
-const base = "http://127.0.0.1:4189";
+const base = process.argv[2] || "http://127.0.0.1:4189";
 let failures = 0;
 const ok = (l) => console.log(`  PASS ${l}`);
 const bad = (l, d) => {

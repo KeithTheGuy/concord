@@ -29,6 +29,7 @@ const SUITES = [
   ["identity", "protocol"],
   ["uploads", "protocol"],
   ["security", "protocol"],
+  ["hubsec", "protocol"],
   ["archive", "protocol"],
   ["roster", "protocol"],
   ["threads", "protocol"],
@@ -38,6 +39,7 @@ const SUITES = [
   ["social", "browser"],
   ["groups", "browser"],
   ["multirealm", "browser"],
+  ["ringing", "browser"],
   ["e2e", "browser"],
 ];
 
