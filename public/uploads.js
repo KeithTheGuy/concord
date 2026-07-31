@@ -192,6 +192,10 @@ export function createUploader(hooks) {
 
   function handleTickets(msg) {
     if (!pending) return; // nothing waiting — a stray or duplicate frame
+    // Tickets are minted for a specific list of files in a specific order, so
+    // pairing them with the wrong batch hands a PNG the ticket cut for a video.
+    // An older Worker won't echo the nonce, so only a *mismatch* is rejected.
+    if (msg.nonce && msg.nonce !== pending.nonce) return;
     clearTimeout(pending.timer);
     const p = pending;
     pending = null;
@@ -200,9 +204,18 @@ export function createUploader(hooks) {
 
   function requestTickets(staged) {
     return new Promise((resolve, reject) => {
+      // One slot, deliberately. Overwriting it used to strand the first
+      // caller's promise forever and then resolve the second caller with the
+      // first one's tickets — refusing is both safer and easier to explain.
+      if (pending) {
+        reject(new Error("Another upload is already starting. Give it a second."));
+        return;
+      }
+      const nonce = "u" + Math.random().toString(36).slice(2);
       pending = {
         resolve,
         reject,
+        nonce,
         // A socket that dies mid-request would otherwise hang the composer
         // forever waiting for a reply that's never coming.
         timer: setTimeout(() => {
@@ -212,6 +225,7 @@ export function createUploader(hooks) {
       };
       hooks.send({
         type: "upload-ticket",
+        nonce,
         files: staged.map((it) => ({ name: it.name, size: it.size, mime: it.mime })),
       });
     });
