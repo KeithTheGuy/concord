@@ -29,6 +29,7 @@
     "outbox": "node test/outbox.mjs",
     "ringing": "node test/ringing.mjs",
     "callring": "node test/callring.mjs",
+    "mobile": "node test/mobile.mjs",
     "test": "node test/run-all.mjs"
   },
   "devDependencies": {

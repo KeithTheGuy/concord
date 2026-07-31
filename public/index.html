@@ -129,6 +129,9 @@
   <!-- main column -->
   <main id="main">
     <header id="chat-header">
+      <!-- Only ever visible under the narrow breakpoint, where the rail and the
+           sidebar have become a drawer and this is the handle on it. -->
+      <button id="nav-toggle" aria-label="Channels and servers" aria-expanded="false">☰</button>
       <span id="chan-hash">#</span>
       <span id="chan-name">general</span>
       <!-- Only ever shown for a thread (where it goes back to the parent) and
@@ -142,6 +145,8 @@
         <button id="btn-search" title="Search messages (Ctrl+F)">🔍</button>
         <button id="btn-squirt" class="pill-btn" title="Squirt gun — spray Gorb (Esc to put it away)">💦</button>
         <button id="btn-gremlin" class="pill-btn" title="Gremlin Mode — troll your friends">🃏</button>
+        <!-- Where the two joke buttons go when the row runs out of width. -->
+        <button id="btn-more" title="More things you can do here">⋯</button>
         <button id="btn-invite" class="pill-btn">Invite</button>
         <span id="member-count" class="hidden"></span>
         <button id="btn-members" title="Toggle member list">👥</button>
@@ -207,6 +212,9 @@
 
   <!-- member list -->
   <aside id="member-list"></aside>
+
+  <!-- Dims and catches taps on whatever the drawer is covering. -->
+  <div id="nav-scrim"></div>
 </div>
 
 <!-- ======================= MODALS ======================= -->
@@ -215,6 +223,8 @@
   <!-- first-run profile -->
   <div class="modal hidden" id="onboard-modal">
     <h1>Welcome to Concord</h1>
+    <!-- Filled in only when the URL carries an invite code. -->
+    <p id="ob-invite" class="invite-note hidden"></p>
     <p class="modal-sub">It's like Discord, but agreeable. Set up your profile:</p>
     <label>Display name</label>
     <input id="ob-name" maxlength="32" placeholder="e.g. Keith the Guy" autocomplete="off">

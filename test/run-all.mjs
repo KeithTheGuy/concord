@@ -48,6 +48,7 @@ const SUITES = [
   ["groups", "browser"],
   ["multirealm", "browser"],
   ["ringing", "browser"],
+  ["mobile", "browser"],
   ["e2e", "browser"],
 ];
 

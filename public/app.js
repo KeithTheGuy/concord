@@ -1919,7 +1919,36 @@ function applyView() {
   renderChatHeader();
 }
 
+/* ---------------------------- narrow-screen nav -------------------------- */
+// Under the CSS breakpoint the rail and the sidebar stop being columns and
+// become one drawer laid over the chat pane. Which means every navigation has
+// to put it away again — otherwise you land on the channel you just picked
+// with the list still covering it.
+
+const navOpen = () => document.body.classList.contains("nav-open");
+
+function setNav(open) {
+  document.body.classList.toggle("nav-open", open);
+  $("nav-toggle").setAttribute("aria-expanded", String(open));
+}
+function openNav() {
+  if (navOpen()) return;
+  setNav(true);
+  // A drawer is somewhere you can be, so Back should get you out of it rather
+  // than off the page entirely.
+  history.pushState({ nav: true }, "");
+}
+function closeNav() {
+  if (!navOpen()) return;
+  setNav(false);
+  if (history.state?.nav) history.back();
+}
+$("nav-toggle").onclick = () => (navOpen() ? closeNav() : openNav());
+$("nav-scrim").onclick = closeNav;
+window.addEventListener("popstate", () => setNav(false));
+
 function goHome() {
+  closeNav();
   stashDraft(); // the chat pane is going away, and with it the box
   state.view = "home";
   state.fvTab = hub.pendingCount() ? "pending" : "online";
@@ -1935,6 +1964,7 @@ function switchToRealm(code) {
   if (!code) return null;
   const realm = state.realms.get(code);
   if (!realm) return null;
+  closeNav();
   stashDraft(); // the composer is about to belong to a different conversation
   showAllOffline = false;
   state.activeCode = code;
@@ -3225,7 +3255,7 @@ function buildMsgNode(msg, realm = R()) {
       const span = el("span", "reaction-face");
       span.innerHTML = face.html;
       btn.append(span, el("span", "reaction-count", String(users.length)));
-      btn.title = users.length + " reaction" + (users.length > 1 ? "s" : "");
+      btn.title = reactionTitle(users, emoji, realm);
       btn.onclick = () => wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji });
       row.appendChild(btn);
     }
@@ -3234,6 +3264,32 @@ function buildMsgNode(msg, realm = R()) {
 
   finishMsgNode(node, msg, realm);
   return node;
+}
+
+// "2 reactions" was throwing away the only part anybody wanted. The app already
+// knows exactly who reacted — that list is where the `mine` highlight comes
+// from — so say the names. Past eight it becomes a crowd and stops being worth
+// reading, hence the tail.
+const REACTORS_SHOWN = 8;
+
+function reactorName(userId, realm) {
+  if (userId === realmUserId(realm)) return "You";
+  const known = realm?.roster.get(userId);
+  if (known?.name) return known.name;
+  for (const member of (realm?.members || NO_MAP).values()) {
+    if (member.userId === userId) return member.name;
+  }
+  return "someone";
+}
+
+function reactionTitle(users, emoji, realm) {
+  const names = users.map((u) => reactorName(u, realm));
+  const rest = names.length - REACTORS_SHOWN;
+  const who =
+    rest > 0
+      ? `${names.slice(0, REACTORS_SHOWN).join(", ")} and ${rest} other${rest > 1 ? "s" : ""}`
+      : names.join(", ");
+  return `${who} reacted with ${emoji}`;
 }
 
 // An un-acked message has no server id, so none of the actions would work on
@@ -3437,6 +3493,7 @@ function activateChannel(chanId) {
   // clears once you leave it — otherwise it vanishes before you can see it.
   if (realm.activeChan && realm.activeChan !== chanId) realm.firstUnread.delete(realm.activeChan);
   realm.activeChan = chanId;
+  closeNav();
   realm.unread.delete(chanId);
   if (!realm.unread.size) realm.mentions = 0;
   renderServerRail();
@@ -3891,7 +3948,10 @@ function renderVoicePanel() {
       : `${chan?.name || "voice"} / ${realm.meta?.name || ""}`;
   const label = $("vs-channel");
   label.textContent = where;
-  label.title = "Jump to the call";
+  // Which server the call is in is the whole point of the multi-realm design,
+  // and at the sidebar's width one line of it read "General / …". The CSS gives
+  // it two; the tooltip covers the names long enough to need three.
+  label.title = `${where} — click to jump to the call`;
   label.onclick = () => switchToRealm(realm.code);
   // The quality readout owns these words and repaints them every two seconds;
   // all this owns is the "↗ the call is somewhere else" arrow. Rewriting the
@@ -4065,9 +4125,23 @@ function pickerRow(container, options, selected, onPick, isColor = false) {
   }
 }
 
+// Somebody who followed an invite link got the identical screen a stranger
+// gets — no confirmation the link had even worked until after they'd picked a
+// name and an avatar. The server's own name and the inviter would be better,
+// but both live behind `hello`, which we can't send until there's a profile to
+// send it with; the code is what we have at this point and it beats silence.
+function noteInvite() {
+  const code = (new URLSearchParams(location.search).get("join") || "").toUpperCase();
+  const note = $("ob-invite");
+  const real = /^[A-Z0-9]{4,12}$/.test(code);
+  if (real) note.textContent = `You've been invited to join ${code} — pick a name and you're in.`;
+  note.classList.toggle("hidden", !real);
+}
+
 function openOnboard() {
   hideSplash(); // nothing to load for a first-time visitor
   showModal("onboard-modal");
+  noteInvite();
   pickerRow($("ob-avatars"), AVATARS, obAvatar, (v) => (obAvatar = v));
   pickerRow($("ob-colors"), COLORS, obColor, (v) => (obColor = v), true);
   setTimeout(() => $("ob-name").focus(), 0);
@@ -4265,6 +4339,19 @@ function openGremlinModal(preselectSid) {
   }
 }
 $("btn-gremlin").onclick = () => openGremlinModal();
+
+// 💦 and 🃏 are jokes, and on a phone they were taking the header row from the
+// things you came for. They keep working — they just live one tap deeper. The
+// CSS hides them and reveals this only under the narrow breakpoint.
+$("btn-more").onclick = (e) => {
+  e.stopPropagation();
+  const box = e.currentTarget.getBoundingClientRect();
+  const items = [{ label: "💦 Squirt gun", onClick: () => $("btn-squirt").click() }];
+  if (!$("btn-gremlin").classList.contains("hidden")) {
+    items.push({ label: "🃏 Gremlin Mode", onClick: () => $("btn-gremlin").click() });
+  }
+  ctxMenu(box.left, box.bottom + 6, items);
+};
 
 /* ------------------------------- settings ------------------------------- */
 
@@ -4963,6 +5050,26 @@ async function uploadAsset(file) {
   return key;
 }
 
+// flush() re-tries whatever is in "error" and leaves the files it already
+// finished alone, so a retry is just a flush with no message behind it — the
+// file stays staged in the tray and rides out with whatever you send next.
+async function retryUpload(id) {
+  const realm = R();
+  const uploader = realm?.uploader;
+  if (!uploader || realm.flushing) return;
+  realm.flushing = true;
+  renderTray();
+  try {
+    await uploader.flush();
+  } catch {
+    // the uploader has already said what went wrong
+  }
+  realm.flushing = false;
+  renderTray();
+  const still = uploader.items().find((it) => it.id === id);
+  if (still?.state === "error") toast(still.error || "Still no luck with that one.", true);
+}
+
 function renderTray() {
   const tray = $("att-tray");
   const uploader = R()?.uploader;
@@ -4995,7 +5102,7 @@ function renderTray() {
 
     const meta = el("div", "att-card-meta");
     meta.appendChild(el("div", "att-card-name", item.name));
-    meta.appendChild(el("div", "att-card-size", item.error || humanSize(item.size)));
+    meta.appendChild(el("div", "att-card-size", humanSize(item.size)));
     card.appendChild(meta);
 
     const spoil = el("button", "att-card-spoil" + (item.spoiler ? " on" : ""), item.spoiler ? "🙈" : "👁");
@@ -5011,6 +5118,20 @@ function renderTray() {
       renderTray();
     };
     card.append(spoil, remove);
+
+    // The reason a file failed used to share a one-line ellipsis with its size,
+    // which cut the sentence off exactly where the reason was, and the only
+    // ways out were "spoiler" and "delete". flush() has always re-tried
+    // anything sitting in "error"; this is the button that was never built.
+    if (item.state === "error") {
+      const row = el("div", "att-card-error");
+      row.appendChild(el("span", "att-card-why", item.error || "That upload didn't land."));
+      const again = el("button", "att-card-retry", "↻ Retry");
+      again.title = "Send this one up again";
+      again.onclick = () => retryUpload(item.id);
+      row.appendChild(again);
+      card.appendChild(row);
+    }
 
     if (item.state === "uploading") {
       const bar = el("div", "att-card-bar");
@@ -5152,16 +5273,25 @@ $("messages").addEventListener("scroll", () => {
 
 /* ----------------------------- voice buttons ----------------------------- */
 
+// Deafening silences your mic too, so the mute button lights up — but its
+// tooltip still read "Mute", the one thing clicking it wouldn't do. Both
+// buttons get their words from one place now, so the pair can't disagree.
+// `title`, not `data-tip`: the stylesheet's own tooltip is drawn for
+// .msg-actions buttons only, and these two aren't in that row.
+function syncVoiceButtons() {
+  const { muted, deafened } = voice;
+  $("btn-mute").classList.toggle("on", muted || deafened);
+  $("btn-mute").title = deafened ? "Deafened — undeafen to be heard" : muted ? "Unmute" : "Mute";
+  $("btn-deafen").classList.toggle("on", deafened);
+  $("btn-deafen").title = deafened ? "Undeafen" : "Deafen";
+}
 $("btn-mute").onclick = () => {
   voice.setMuted(!voice.muted);
-  $("btn-mute").classList.toggle("on", voice.muted);
-  $("btn-mute").title = voice.muted ? "Unmute" : "Mute";
+  syncVoiceButtons();
 };
 $("btn-deafen").onclick = () => {
   voice.setDeafened(!voice.deafened);
-  $("btn-deafen").classList.toggle("on", voice.deafened);
-  $("btn-mute").classList.toggle("on", voice.muted || voice.deafened);
-  $("btn-deafen").title = voice.deafened ? "Undeafen" : "Deafen";
+  syncVoiceButtons();
 };
 $("btn-hangup").onclick = () => leaveVoice();
 $("btn-share").onclick = async () => {
@@ -5284,7 +5414,12 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === "Escape") {
     hideProfile();
     $("soundboard").classList.add("hidden");
-    if (!$("modal-backdrop").classList.contains("hidden") && !modalIsBlocking()) closeModals();
+    // The picker was the one overlay you had to click away from.
+    $("emoji-picker").classList.add("hidden");
+    // A modal sits over the drawer, so it's the thing Escape means first.
+    if (!$("modal-backdrop").classList.contains("hidden")) {
+      if (!modalIsBlocking()) closeModals();
+    } else closeNav();
   }
 });
 

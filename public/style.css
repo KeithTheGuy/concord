@@ -5747,3 +5747,336 @@ body.turbo #composer:focus-within {
     animation: none;
   }
 }
+
+/* =========================================================================
+   NARROW SCREENS
+
+   The shell was three fixed columns and one breakpoint (the member list, at
+   900px) with nothing after it, so a 390px phone got a 118px chat pane and a
+   composer with no width left in it at all — page.fill("#input") timed out
+   because the textarea was 0px wide. Below 760px the rail and the sidebar stop
+   being columns and become one drawer laid over the chat pane, and #main gets
+   the whole viewport.
+   ========================================================================= */
+
+/* All three exist only for the drawer; on a wide screen they are inert. */
+#nav-toggle,
+#nav-scrim,
+#btn-more {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  /* The drawer is the rail and the sidebar travelling together. They stay two
+     elements — wrapping them would have meant re-parenting half the shell — so
+     they share one width and one transform instead. 272px leaves ~90px of the
+     conversation showing behind it, which is what tells you the drawer is a
+     layer and not a new page. */
+  #app {
+    --rail-w: 72px;
+    --drawer-w: min(272px, 84vw);
+  }
+
+  #server-rail,
+  #sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 150;
+    transform: translateX(calc(-1 * var(--drawer-w)));
+    transition: transform var(--dur-2) var(--ease);
+  }
+
+  #server-rail {
+    left: 0;
+    flex-basis: var(--rail-w);
+    width: var(--rail-w);
+  }
+
+  #sidebar {
+    left: var(--rail-w);
+    flex-basis: calc(var(--drawer-w) - var(--rail-w));
+    width: calc(var(--drawer-w) - var(--rail-w));
+  }
+
+  body.nav-open #server-rail,
+  body.nav-open #sidebar {
+    transform: none;
+  }
+
+  #nav-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 140;
+    background: color-mix(in srgb, var(--bg-rail) 62%, transparent);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--dur-2) var(--ease);
+  }
+
+  body.nav-open #nav-scrim {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* A channel's context menu opens from inside the drawer, so it has to clear
+     the scrim the drawer put down. */
+  #ctx-menu {
+    z-index: 160;
+  }
+
+  /* ----------------------------- chat header -----------------------------
+     Seven buttons and a worded pill in a 48px bar with no overflow strategy.
+     The name gives ground, the topic and the joke buttons leave, and the
+     member-list toggle goes with the member list it can no longer show. */
+
+  #chat-header {
+    padding: 0 var(--sp-2);
+    gap: var(--sp-1);
+    overflow: hidden;
+  }
+
+  #nav-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: var(--ctl-md);
+    height: var(--ctl-md);
+    border: none;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  #nav-toggle:hover,
+  body.nav-open #nav-toggle {
+    background: var(--tint);
+    color: var(--text-header);
+  }
+
+  #chan-name,
+  #chan-crumb,
+  #chan-incall {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* A topic already clipped to an ellipsis is worth less than the width it
+     costs everything else in the row. */
+  #chan-topic {
+    display: none;
+  }
+
+  #btn-members,
+  #member-count {
+    display: none;
+  }
+
+  #btn-squirt,
+  #btn-gremlin {
+    display: none;
+  }
+
+  #btn-more {
+    display: inline-flex;
+  }
+
+  .header-actions > #btn-invite {
+    margin-left: 0;
+    padding: 0 var(--sp-2);
+  }
+
+  /* ------------------------- composer and message pane ------------------- */
+
+  #composer,
+  #att-tray,
+  #reply-bar {
+    margin-left: var(--sp-2);
+    margin-right: var(--sp-2);
+  }
+
+  #composer {
+    padding: 8px var(--sp-2);
+  }
+
+  #typing-bar,
+  #jump-present {
+    padding-left: var(--sp-2);
+    padding-right: var(--sp-2);
+  }
+
+  /* 320px of picker on a 360px screen hung off the edge. */
+  #emoji-picker {
+    left: var(--sp-2);
+    right: var(--sp-2);
+    width: auto;
+    bottom: 78px;
+  }
+
+  /* Clear of the header and of a modal's ✕. A ring toast stays up for as long
+     as the phone is ringing, and at this width the old top-centred one sat
+     squarely over ☰ — the only way to navigate anywhere. */
+  #toasts {
+    top: 56px;
+    left: var(--sp-2);
+    right: var(--sp-2);
+    transform: none;
+  }
+
+  .toast,
+  .ring-toast {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+  }
+
+  /* ------------------------------- modals -------------------------------
+     Settings is 1643px tall. Centred inside a 24px-padded backdrop it was a
+     box you could scroll but never leave: .modal-close is positioned against
+     the modal, so the ✕ scrolled off the top with everything else and nothing
+     brought it back. The backdrop does the scrolling now and the ✕ is pinned
+     to the viewport. */
+
+  #modal-backdrop {
+    padding: 0;
+    align-items: flex-start;
+    overflow-y: auto;
+    /* Not decoration: a backdrop-filter makes this element the containing
+       block for every fixed-position descendant, so the pinned ✕ below rode
+       the scroll 2200px off the top of the screen. There is nothing to blur
+       here anyway — the modal covers the whole viewport. */
+    backdrop-filter: none;
+  }
+
+  .modal,
+  #join-modal,
+  #settings-modal {
+    width: 100%;
+    max-width: none;
+    max-height: none;
+    min-height: 100%;
+    border-radius: 0;
+    padding: 52px var(--sp-4) var(--sp-5);
+  }
+
+  .modal-close {
+    position: fixed;
+    top: var(--sp-2);
+    right: var(--sp-2);
+    background: var(--tint-strong);
+    color: var(--text-header);
+  }
+
+  .settings-grid,
+  .join-split {
+    grid-template-columns: 1fr;
+  }
+
+  .confirm-actions {
+    flex-wrap: wrap;
+  }
+}
+
+/* The drawer travels, so it is the one thing here that has to ask first. */
+@media (prefers-reduced-motion: reduce) {
+  #server-rail,
+  #sidebar,
+  #nav-scrim {
+    transition: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Voice panel subtitle. The panel exists to say which call you are in and
+   which server it is in — and at the sidebar's width that sentence rendered
+   as "General / …", losing the half the multi-realm design was built to show.
+   ------------------------------------------------------------------------- */
+
+#vs-channel {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+/* -------------------------------------------------------------------------
+   Failed uploads. The reason shared a one-line ellipsis with the file size, so
+   the sentence was cut off exactly where the reason lived, and the only things
+   on offer were "spoiler" and "delete".
+   ------------------------------------------------------------------------- */
+
+.att-card.error {
+  width: 280px;
+  flex-wrap: wrap;
+}
+
+/* Wrapping is for the error line only. The name's max-content width is the
+   whole file name, which — once wrapping is legal — is enough to shove the
+   spoiler and remove buttons onto lines of their own. A zero basis keeps the
+   top row a top row and lets the name ellipsis do its job. */
+.att-card.error .att-card-meta {
+  flex: 1 1 0;
+}
+
+/* Red belongs to the sentence explaining the failure, not to the file size. */
+.att-card.error .att-card-size {
+  color: var(--text-muted);
+}
+
+.att-card-error {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin-top: var(--sp-1);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.att-card-why {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--danger-ink);
+  white-space: normal;
+}
+
+.att-card-retry {
+  flex: 0 0 auto;
+  padding: 2px var(--sp-2);
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--tint-strong);
+  color: var(--text-header);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.att-card-retry:hover {
+  background: var(--bg-active);
+}
+
+/* -------------------------------------------------------------------------
+   Invite note on the first-run screen, so an invited friend can tell the link
+   worked before they have filled the whole form in.
+   ------------------------------------------------------------------------- */
+
+.invite-note {
+  margin: 0 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--blurple);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--tint);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.4;
+}
