@@ -31,6 +31,10 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   if (url.origin !== location.origin) return;
   if (url.pathname === "/ws" || url.pathname.startsWith("/api/")) return;
+  // Attachments are immutable and can be 25 MB each. Caching them here would
+  // grow Cache Storage without bound for no benefit — they already carry a
+  // one-year immutable Cache-Control, so the HTTP cache handles them properly.
+  if (url.pathname.startsWith("/f/")) return;
 
   event.respondWith(
     (async () => {
