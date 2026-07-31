@@ -36,6 +36,14 @@ to the server, so only share it with people you want in.
 - **Direct messages** — full 1:1 chat with history, reactions, edits, replies, pins,
   and **DM voice calls** (the 📞 button). Unread counts survive being offline.
   Click anyone in a server's member list to see their profile and DM them
+- **Calling someone actually rings them** — a toast with Join / Ignore that doesn't
+  time out, the join sound, a desktop notification, a green pill on their row in
+  your sidebar, and 📞 in the tab title. Do Not Disturb keeps the toast but drops
+  the noise; a muted server stays silent entirely. Server voice channels
+  deliberately don't ring — people wander in and out of those all day, and the
+  sidebar already shows who's sitting in each one
+- **Blocking**, and declining a friend request now means it. Invisible is
+  enforced by the server rather than politely observed by the client
 - **Group chats** — 👥 in the DM sidebar. Up to 10 people, rename it, add friends,
   leave whenever. Unnamed groups name themselves after whoever's in them. Group
   voice calls work identically, because a group is the same machinery as a 1:1
@@ -44,6 +52,17 @@ to the server, so only share it with people you want in.
   call carries on untouched. The rail shows a green ring on whichever server holds it,
   unread badges on the rest, and the voice panel clicks through to jump back
 - **Servers** with invite codes; join as many as you want (left rail)
+- **Drafts** — half a sentence survives switching channels, and the channel gets a
+  pencil so you remember it's there. The reply you were writing to comes back too
+- **Nothing is lost when your connection isn't** — a message sent while the socket
+  is down waits and goes when you're back. One written to a socket that then died
+  gets a Retry button rather than a guess, because there's no way to tell whether
+  the server saw it and a silent retry would post it twice
+- **Back up your identity** — Settings → Export writes a file (or a string you can
+  paste into a note). It's the only thing standing between a cleared browser and
+  losing every DM you have, so it's also on the welcome screen
+- **History goes past 300 messages.** Older ones move to cold storage and page back
+  in when you scroll, instead of being deleted
 - **Files, images and video** — drag them in, paste a screenshot, or hit 📎. Images
   render inline in a grid that reserves its space so the chat never reflows under
   you as they load; video and audio get real players; anything else becomes a
@@ -190,8 +209,12 @@ Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wr
   each other directly. Carrier-grade NAT on mobile and symmetric NAT on
   corporate/campus Wi-Fi make this maybe 5–15% of pairs, so in a group of six
   there's a real chance one specific pair can't hear each other while everyone
-  else is fine. That's a baffling thing to debug, so: it's this, not you. A TURN
-  service (Cloudflare Calls sells one) is the fix.
+  else is fine. That's a baffling thing to debug, so the app now says so out loud
+  when it happens, naming the person it couldn't reach. A TURN service
+  (Cloudflare Calls sells one) is the actual fix.
+- **A guild invite code is a permanent key.** Anyone you give it to is in until
+  the server is abandoned; there is no un-inviting. DMs and groups are different —
+  leaving or unfriending genuinely revokes access there.
 - Voice is a full mesh: great for friend groups (~2–8 people), not for a 50-person raid.
   Screen share is the tighter constraint, since one sharer sends an independent
   video encode to every single person in the call.
