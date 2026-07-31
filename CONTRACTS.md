@@ -313,3 +313,108 @@ SOUND_CAP        = 20
 SOUND_MAX_BYTES  = 512 * 1024
 SLOWMODE_MAX_S   = 300
 ```
+
+---
+
+## 11. The hub — accounts, friends, DMs, groups
+
+Everything above is one server talking to one `ConcordServer`. The hub is the
+other half: a **singleton** Durable Object at `/ws?hub=1` that owns the things
+which can't belong to any single server. It never sees message content.
+
+### 11.1 `hello`
+
+```jsonc
+{ "type": "hello", "uid": "…", "token": "…", "name": "Keith", "avatar": "🙂",
+  "color": "#5865f2", "status": "", "presence": "online" }
+```
+
+→ `hub-welcome` carrying `you`, `token`, `friends` (each with its `dm` code),
+`incoming`, `outgoing`, `groups` (each with its `code`), and `dmUnread`.
+
+Identity is claimed once per socket. Present the wrong token for a known `uid`
+and you are silently issued a **new** account rather than an error — same rule
+as `ConcordServer`, for the same reason.
+
+### 11.2 Ops
+
+| op | payload | effect |
+|---|---|---|
+| `set-tag` | `{tag}` | claims `@tag`; refused if it points at someone else |
+| `presence` | `{name, avatar, color, status, presence}` | updates the account, notifies friends |
+| `friend-add` | `{tag}` | request, or auto-accept if they already asked you |
+| `friend-accept` / `friend-decline` / `friend-remove` | `{uid}` | |
+| `dm-open` | `{uid}` | → `dm-ready {uid, code, user}` |
+| `dm-nudge` | `{uid \| gdm, preview}` | the thing that lights up a sidebar you aren't connected to |
+| `dm-read` | `{uid}` | clears your own badge |
+| `gdm-create` | `{uids[], name, icon}` | friends only, ≤ 10 members, ≤ 20 groups each |
+| `gdm-open` / `gdm-add` / `gdm-rename` / `gdm-leave` | `{id, …}` | members only |
+| `poke` | `{uid}` | rattles a friend's window |
+
+Caps: `FRIEND_CAP` 250, `GDM_MAX_MEMBERS` 10, `GDM_CAP` 20, tags
+`/^[a-z0-9_.]{2,20}$/`.
+
+### 11.3 Why a DM has no storage of its own
+
+When two people become friends the hub mints a random 12-character code and
+tells only those two. **The conversation is an ordinary `ConcordServer` at that
+code.** Groups work identically. That's what makes DM voice calls, history,
+pins and reactions free — a DM call is literally joining a voice channel.
+
+---
+
+## 12. The security model, stated plainly
+
+Read this before adding anything that removes a person from something.
+
+### A code is a bearer capability
+
+Possession of a server code **is** the authority to read and write that
+conversation. There is no per-user access list on a `ConcordServer` — `hello`
+establishes *who you are*, never *whether you're allowed in*. Consequences that
+are easy to miss:
+
+* Handing someone a code is irreversible by any mechanism the app currently has.
+* The hub's membership list is **bookkeeping, not enforcement**. It decides who
+  gets *told* a code. It cannot take one back.
+* Therefore any UI that says "left the group" or "removed friend" is describing
+  the hub's records, not the other person's access. If you add a `gdm-kick`, it
+  will not kick anyone until the enforcement gap below is closed.
+
+Closing that gap means membership has to be checked where the messages are: a
+`ConcordServer` that knows it is a DM should verify with the hub, on `hello`,
+that the connecting account is currently a member — checked live, so revocation
+is immediate and there is no expiry window to reason about.
+
+### Entropy
+
+`newServerCode()` maps 8 random bytes through a 31-character alphabet, so there
+is a small modulo bias: 8 symbols land with p=9/256 and 23 with p=8/256, giving
+**4.83 bits of min-entropy per character** rather than log₂(31)=4.95.
+
+* A **DM/group code is 12 characters ≈ 58 bits.** At 1000 guesses/second a
+  specific code takes millions of years. Fine.
+* A **guild invite code is 8 characters ≈ 38.6 bits.** Against a population of
+  live servers that is *not* comfortable — expected probes to hit *some* server
+  falls linearly with how many exist, and `/ws?server=CODE` without `create=1`
+  answers 404 vs 101, which is a clean existence oracle.
+
+The DM maths only works because of the extra four characters. Don't shorten it,
+and think hard before treating the 8-character guild code as a secret.
+
+### The load-bearing invariant nobody would guess
+
+**Nothing anywhere deletes a `user:` row, and the hub has no sweep, no LRU and
+no account cap. That is what keeps the hub safe.**
+
+`ConcordServer` had an identity-takeover bug precisely because it *did* evict
+dormant `auth:` rows: once a row was gone, `hello` with that userId and no token
+succeeded, because the "wrong token" guard cannot fail when there is nothing to
+compare against. The hub is immune only because the precondition is unreachable.
+
+So if you ever add the obvious LRU cap to `user:` — and it is obvious, because
+those rows grow forever — **you hand an attacker the victim's tag, their entire
+friend graph, and every DM code they hold.** If you need that cap, add the
+belt-and-braces check first: refuse a uid that has no `user:` row but still
+appears anywhere in the graph. An identity the server still remembers must never
+be claimable by someone who can't prove it.
