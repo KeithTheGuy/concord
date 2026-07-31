@@ -180,10 +180,21 @@ Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wr
 
 ## Known limitations (a.k.a. the free tier speaks)
 
-- **No TURN server** — on rare strict-NAT networks (some corporate/campus Wi-Fi, some
-  mobile carriers) voice may fail to connect between two specific people. Everything
-  else still works. A TURN service (e.g. Cloudflare Calls) is the fix if it ever matters.
+- **Your identity lives only in this browser.** Your `@tag`, your friend graph, the
+  secret code behind every DM, and who you are on each server are all in
+  `localStorage` and nowhere else. There is no email, no password, no recovery
+  code. Clear your browser storage and every DM becomes permanently unreachable
+  and everyone has to re-friend you. Use **Settings → Export** and keep the file
+  somewhere; it's also how you get onto a second device.
+- **No TURN server** — voice is peer-to-peer, and some pairs of people can't reach
+  each other directly. Carrier-grade NAT on mobile and symmetric NAT on
+  corporate/campus Wi-Fi make this maybe 5–15% of pairs, so in a group of six
+  there's a real chance one specific pair can't hear each other while everyone
+  else is fine. That's a baffling thing to debug, so: it's this, not you. A TURN
+  service (Cloudflare Calls sells one) is the fix.
 - Voice is a full mesh: great for friend groups (~2–8 people), not for a 50-person raid.
+  Screen share is the tighter constraint, since one sharer sends an independent
+  video encode to every single person in the call.
 - Anyone with the invite code is a full member — there are no roles/permissions. It's
   a clubhouse, not a moderation platform.
 - Friend tags are global and first-come-first-served across everyone using the app.
