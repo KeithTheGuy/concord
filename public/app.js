@@ -1002,12 +1002,25 @@ function handleServerMessage(realm, m) {
       break;
     }
 
-    // The message never left the composer, so the text is still in the box —
-    // all that's needed is to stop you sending it again until the clock runs out.
+    // The send was refused, so the optimistic copy has to come back out —
+    // otherwise it sits there greyed out forever waiting on an ack that is
+    // never coming, and the words go with it.
     case "slowmode": {
       slowUntil.set(`${realm.code}/${m.chanId}`, Date.now() + m.seconds * 1000);
       startSlowTicker();
+      const bounced = unsendOptimistic(realm, m.chanId);
       if (live) {
+        if (m.chanId === realm.activeChan) {
+          if (bounced) renderMessages();
+          // Handing the text back beats making someone retype it. Only into an
+          // empty box: they may have started something else while they waited.
+          const box = $("input");
+          if (bounced?.content && !box.value.trim()) {
+            box.value = bounced.content;
+            autoGrow(box);
+            updateCharCount();
+          }
+        }
         syncComposer();
         toast(`🐌 Slowmode — ${m.seconds}s before you can post again.`, true);
       }
@@ -1189,6 +1202,22 @@ function pushMessage(realm, msg) {
     renderMessages();
     renderTyping();
   }
+}
+
+// Takes the newest un-acked message in a channel back off the screen. The
+// newest is the only one it can be: a refusal names no nonce, and the composer
+// only ever has one message in flight at a time.
+function unsendOptimistic(realm, chanId) {
+  const list = realm.messages.get(chanId) || [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!list[i].pending) continue;
+    const [msg] = list.splice(i, 1);
+    realm.pendingByNonce.forEach((pending, nonce) => {
+      if (pending === msg) realm.pendingByNonce.delete(nonce);
+    });
+    return msg;
+  }
+  return null;
 }
 
 // A message mentions you if it says @everyone, @here, your display name, or
@@ -2134,6 +2163,8 @@ function appendChanRow(wrap, c, threadsOf, folded) {
   // clicking it means. Once you're in, the same click opens the chat that
   // channel has always had; the 💬 gets you that chat without joining, since a
   // voice channel takes messages whether or not you're listening to it.
+  // Joining deliberately does NOT drag your reading position into the call:
+  // people join a room and carry on reading the channel they were in.
   const inThisCall = voiceChan && state.voiceCode === state.currentCode && state.voiceChan === c.id;
   row.title = voiceChan ? (inThisCall ? "Open this channel's chat" : "Join the call") : "";
   row.onclick = () => {
