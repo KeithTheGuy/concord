@@ -35,7 +35,13 @@ async function onboard(u) {
   await u.page.click("#join-modal .modal-close");
 }
 
-const tagOf = (u) => u.page.evaluate(() => window.__concord.hub.me?.tag);
+// The tag only exists once the hub socket has delivered hub-welcome, which is
+// a separate connection from the server realm the UI is already showing. Read
+// it once and you get undefined on a slow run, which then surfaces as a
+// baffling page.fill type error rather than as the timeout it really is.
+const tagOf = (u) =>
+  u.page.waitForFunction(() => window.__concord.hub.me?.tag || null, null, { timeout: 15000 })
+    .then((h) => h.jsonValue());
 
 // A drives the friendship with B, from A's side.
 async function befriend(a, b) {

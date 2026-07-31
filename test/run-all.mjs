@@ -12,8 +12,11 @@
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const PORT = 4189;
-const BASE = `http://localhost:${PORT}`;
+// A private port is worth having: wrangler hot-reloads on every save, and a
+// reload kills in-flight sockets mid-suite. Sharing the dev server you're also
+// editing against produces failures that look like bugs and aren't.
+const PORT = Number(process.env.CONCORD_PORT) || 4189;
+const BASE = `http://127.0.0.1:${PORT}`;
 
 // Order matters: the cheap protocol suites run first so an obvious breakage
 // fails in seconds instead of after the four-minute browser suites.
@@ -31,6 +34,7 @@ const SUITES = [
   ["threads", "protocol"],
   ["voicefx", "audio"],
   ["flair", "audio"],
+  ["render", "browser"],
   ["social", "browser"],
   ["groups", "browser"],
   ["multirealm", "browser"],
@@ -66,7 +70,8 @@ async function startServer() {
 function run(name) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const proc = spawn(process.execPath, [`test/${name}.mjs`], { stdio: ["ignore", "pipe", "pipe"] });
+    // Every suite takes the base URL as argv[2] and defaults to :4189.
+    const proc = spawn(process.execPath, [`test/${name}.mjs`, BASE], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     proc.stdout.on("data", (d) => (out += d));
     proc.stderr.on("data", (d) => (out += d));

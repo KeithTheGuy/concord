@@ -142,7 +142,11 @@ try {
   await a.page.click(`.server-bubble[title="Main Hangout"]`);
   await a.page.waitForTimeout(500);
   // Become friends first (DMs are friends-only), via the member list profile.
-  const tagB = await b.page.evaluate(() => window.__concord.hub.me?.tag);
+  // Wait for it rather than sampling — the hub is a second socket, and on a
+  // loaded machine hub-welcome can land well after the server realm is up.
+  const tagB = await b.page
+    .waitForFunction(() => window.__concord.hub.me?.tag || null, null, { timeout: 15000 })
+    .then((h) => h.jsonValue());
   await a.page.click("#home-btn");
   await a.page.click('#fv-tabs button[data-tab="add"]');
   await a.page.fill(".add-friend-row input", tagB);

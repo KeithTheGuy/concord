@@ -238,6 +238,9 @@ function makeRealm(code, kind) {
     historyLoaded: new Set(),
     historyPending: new Set(),
     noMoreHistory: new Set(),
+    // Channels whose next history response is a refill after a dropped socket,
+    // so it can be counted as unread instead of arriving silently.
+    resync: new Set(),
     activeChan: null,
     unread: new Map(), // chanId -> count
     firstUnread: new Map(), // chanId -> id of the first message you missed
@@ -375,8 +378,25 @@ function rememberIdentity(code, userId, token) {
 const myUserId = () =>
   state.me?.userId || identityFor(state.currentCode)?.userId || state.profile?.userId;
 
+// Control characters go first, because renderMarkdown uses U+0000 as a sentinel
+// for protected fragments. The worker strips them on the way in, but the
+// composer's optimistic local render never goes near the worker — a typed
+// U+0000 forged a sentinel there and duplicated the reader's links. Holding the
+// invariant here means the renderer no longer depends on who fed it.
 const esc = (s) =>
-  s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  s
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// A lone surrogate paints as U+FFFD. Ours are prevented by clip(), but a quote
+// can arrive already cut — from durable storage written before that was true,
+// or from another client — and the reader should not see the wreckage.
+const dropHalfPairs = (s) =>
+  s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+
+// Previews are cut by code point, not by UTF-16 unit: slicing "…😀" mid-pair
+// leaves a lone surrogate, which every renderer draws as �.
+const clip = (s, n) => (s.length <= n ? s : [...s].slice(0, n).join(""));
 
 /* ============================ voice engine ============================== */
 
@@ -457,10 +477,12 @@ const hub = new HubConnection({
   },
   toast,
   onWelcome() {
+    bumpMentions();
     renderHomeBadge();
     if (state.view === "home") renderFriendsView();
   },
   onChange() {
+    bumpMentions();
     renderHomeBadge();
     renderDmList();
     if (state.view === "home") renderFriendsView();
@@ -749,6 +771,7 @@ function handleServerMessage(realm, m) {
       realm.meta = m.meta;
       realm.channels = m.channels;
       realm.members = new Map(m.members.map((mm) => [mm.sid, mm]));
+      bumpMentions();
       realm.roster = new Map((m.roster || []).map((e) => [e.userId, e]));
       realm.owner = m.owner || null;
       realm.sounds = m.sounds || [];
@@ -759,6 +782,20 @@ function handleServerMessage(realm, m) {
       realm.resume = null;
       const wasIntent = realm.intent;
       realm.intent = null;
+
+      // While the socket was down we heard nothing, so every channel in here is
+      // stale — not just the one on screen. Invalidating the whole realm costs
+      // one refetch per channel you actually reopen; invalidating only the
+      // resumed one would leave the rest quietly missing messages forever, with
+      // no badge to hint at it. `resync` marks them so the refill still counts
+      // as unread; `historyPending` is cleared because any request in flight
+      // died with the socket and would otherwise block the refill for 8s.
+      if (resume) {
+        realm.resync = new Set(realm.historyLoaded);
+        realm.historyLoaded.clear();
+        realm.historyPending.clear();
+        realm.noMoreHistory.clear();
+      }
 
       // A DM is a ConcordServer too, but it never belongs in the server rail.
       if (isDirect(realm)) {
@@ -821,6 +858,7 @@ function handleServerMessage(realm, m) {
 
     case "member-join": {
       realm.members.set(m.member.sid, m.member);
+      bumpMentions();
       if (live) {
         renderMembers();
         renderChannels();
@@ -831,6 +869,7 @@ function handleServerMessage(realm, m) {
     case "member-leave": {
       const member = realm.members.get(m.sid);
       realm.members.delete(m.sid);
+      bumpMentions();
       realm.typing.delete(m.sid);
       if (inCall && member?.voice?.chanId && member.voice.chanId === state.voiceChan) {
         voice.peerLeft(m.sid);
@@ -884,6 +923,7 @@ function handleServerMessage(realm, m) {
     case "member-update": {
       const prev = realm.members.get(m.member.sid);
       realm.members.set(m.member.sid, m.member);
+      bumpMentions();
       if (inCall && m.member.sid !== realm.me?.sid && state.voiceChan) {
         const was = prev?.voice?.chanId === state.voiceChan;
         const is = m.member.voice?.chanId === state.voiceChan;
@@ -911,15 +951,21 @@ function handleServerMessage(realm, m) {
       const pending = realm.pendingByNonce.get(m.nonce);
       realm.pendingByNonce.delete(m.nonce);
       const list = realm.messages.get(m.msg.chanId) || [];
+      let swapped = null;
       if (pending) {
         const i = list.indexOf(pending);
-        if (i >= 0) list[i] = m.msg;
-        else list.push(m.msg);
+        if (i >= 0) {
+          list[i] = m.msg;
+          swapped = pending.id;
+        } else list.push(m.msg);
       } else {
         list.push(m.msg);
       }
       realm.messages.set(m.msg.chanId, list);
-      if (live && m.msg.chanId === realm.activeChan) renderMessages();
+      if (live && m.msg.chanId === realm.activeChan) {
+        const done = swapped ? swapMsgNode(realm, swapped, m.msg) : appendMessage(realm, m.msg);
+        if (!done) renderMessages(false, realm);
+      }
       break;
     }
 
@@ -935,11 +981,14 @@ function handleServerMessage(realm, m) {
         // raced in before this response (deduped by id).
         const known = new Set(m.messages.map((x) => x.id));
         const extras = existing.filter((x) => x.pending || !known.has(x.id));
+        const refill = realm.resync.delete(m.chanId);
+        const had = refill ? new Set(existing.map((x) => x.id)) : null;
         realm.messages.set(m.chanId, [...m.messages, ...extras]);
         realm.historyLoaded.add(m.chanId);
         if (m.messages.length < 60) realm.noMoreHistory.add(m.chanId);
+        if (refill) noteMissed(realm, m.chanId, m.messages.filter((x) => !had.has(x.id)));
       }
-      if (live && m.chanId === realm.activeChan) renderMessages(!m.before);
+      if (live && m.chanId === realm.activeChan) renderMessages(!m.before, realm, !!m.before);
       break;
     }
 
@@ -1199,7 +1248,7 @@ function pushMessage(realm, msg) {
     if (realm.members.get(sid)?.userId === msg.author.userId) realm.typing.delete(sid);
   });
   if (realm.code === state.activeCode && msg.chanId === realm.activeChan) {
-    renderMessages();
+    if (!appendMessage(realm, msg)) renderMessages(false, realm);
     renderTyping();
   }
 }
@@ -1244,7 +1293,12 @@ const realmUserId = (realm) =>
 function notifyIfNeeded(realm, msg) {
   if (msg.author.userId === realmUserId(realm)) return;
   const isDm = isDirect(realm);
-  const pinged = isDm || mentionsMe(msg, realm);
+  // A DM announces itself while you're away for the same reason a mention does,
+  // so it counts as `pinged` for notification purposes — but it is NOT a
+  // mention, and treating it as one flashed the whole app and rang the mention
+  // chime for every ordinary line of a conversation you were already reading.
+  const mentioned = mentionsMe(msg, realm);
+  const pinged = isDm || mentioned;
   const looking =
     realm.code === state.activeCode &&
     msg.chanId === realm.activeChan &&
@@ -1269,15 +1323,45 @@ function notifyIfNeeded(realm, msg) {
     return;
   }
 
-  // A direct mention or a DM always announces itself, even in the channel
-  // you're staring at — that's the entire point.
-  if (!looking || pinged) {
-    if (state.settings.sounds) voice.playCue(pinged ? "mention" : "ping");
+  // A direct mention always announces itself, even in the channel you're
+  // staring at — that's the entire point. A DM you're already reading doesn't.
+  if (!looking || mentioned) {
+    if (state.settings.sounds) voice.playCue(mentioned ? "mention" : "ping");
     updateTitle();
     if (!looking) desktopNotify(realm, msg, pinged);
-    if (pinged && !document.hidden) flashMention();
+    if (mentioned && !document.hidden) flashMention();
   }
   if (looking && state.settings.tts) speakMessage(msg);
+}
+
+// Messages recovered by a post-reconnect refill arrive as plain history, so
+// nothing has counted them. They're announced as one batch rather than fed
+// through notifyIfNeeded one at a time — an outage's worth of backlog would
+// otherwise fire sixty pings and sixty desktop notifications at once.
+function noteMissed(realm, chanId, missed) {
+  const mine = realmUserId(realm);
+  const fresh = missed.filter((msg) => msg.author.userId !== mine);
+  if (!fresh.length) return;
+  const looking =
+    realm.code === state.activeCode &&
+    chanId === realm.activeChan &&
+    state.view !== "home" &&
+    !document.hidden &&
+    document.hasFocus();
+  if (looking) return;
+
+  realm.unread.set(chanId, (realm.unread.get(chanId) || 0) + fresh.length);
+  if (!realm.firstUnread.has(chanId)) realm.firstUnread.set(chanId, fresh[0].id);
+  const mentioned = fresh.filter((msg) => mentionsMe(msg, realm)).length;
+  const pinged = isDirect(realm) ? fresh.length : mentioned;
+  if (pinged) realm.mentions = (realm.mentions || 0) + pinged;
+  if (realm.code === state.activeCode) renderChannels();
+  renderServerRail();
+  renderDmList();
+  updateTitle();
+  if (!state.settings.muted?.[realm.code] && state.settings.sounds) {
+    voice.playCue(mentioned ? "mention" : "ping");
+  }
 }
 
 /* --------------------------- read messages aloud ------------------------- */
@@ -1285,11 +1369,13 @@ function notifyIfNeeded(realm, msg) {
 // else's machine, which is the flaw in the version Discord shipped.
 function speakMessage(msg) {
   if (typeof speechSynthesis === "undefined") return;
-  const text = msg.content
-    .replace(/```[\s\S]*?```/g, " code block ")
-    .replace(/https?:\/\/\S+/g, " link ")
-    .replace(/[*_~`|]/g, "")
-    .slice(0, 240);
+  const text = clip(
+    msg.content
+      .replace(/```[\s\S]*?```/g, " code block ")
+      .replace(/https?:\/\/\S+/g, " link ")
+      .replace(/[*_~`|]/g, ""),
+    240
+  );
   if (!text.trim()) return;
   try {
     const u = new SpeechSynthesisUtterance(`${msg.author.name} says ${text}`);
@@ -1316,7 +1402,7 @@ function desktopNotify(realm, msg, urgent) {
       : `${msg.author.name} • #${chan?.name || "?"} — ${realm.meta?.name || "Concord"}`;
   try {
     const n = new Notification(urgent ? `🔔 ${where}` : where, {
-      body: msg.content.slice(0, 140),
+      body: clip(msg.content, 140),
       icon: "/icon-192.png",
       tag: "concord-" + realm.code + "-" + msg.chanId, // coalesce per channel
       renotify: !!urgent,
@@ -1366,9 +1452,13 @@ async function ensureNotificationPermission({ ask } = { ask: true }) {
   return false;
 }
 
+// DM and group unread belongs to the hub, which counts it whether or not the
+// conversation has a socket open. Counting it here too would double every DM in
+// the tab title — the same trap `onDmNudge` already sidesteps for the chime.
 function totalUnread() {
   let n = 0;
   for (const realm of state.realms.values()) {
+    if (isDirect(realm)) continue;
     realm.unread.forEach((v) => (n += v));
   }
   return n;
@@ -1461,9 +1551,9 @@ async function sendCurrentMessage() {
   // The other half of a DM isn't connected to its Durable Object unless they
   // have it open, so the hub is what lights up their sidebar.
   if (realm?.kind === "dm" && realm.peer) {
-    hub.nudgeDm(realm.peer.uid, content.slice(0, 120));
+    hub.nudgeDm(realm.peer.uid, clip(content, 120));
   } else if (realm?.kind === "group" && realm.group) {
-    hub.nudgeGroup(realm.group.id, content.slice(0, 120));
+    hub.nudgeGroup(realm.group.id, clip(content, 120));
   }
   state.lastTypingSent = 0; // sending ends "typing"; next keystroke signals fresh
   input.value = "";
@@ -1471,7 +1561,7 @@ async function sendCurrentMessage() {
   updateCharCount();
   hideAutocomplete();
   clearReply();
-  renderMessages();
+  renderMessages(true, realm); // sending is a deliberate act; always show the result
 
   // Progression + the little burst of light, both entirely local.
   const sent = bumpStat("messages");
@@ -1491,11 +1581,13 @@ async function sendCurrentMessage() {
 
 // `code` says which server's :names: are in scope. Passed in rather than read
 // off the active realm, because a pin or a search hit is rendered for the realm
-// it came from, not the one the eye happens to be on.
-function renderMarkdown(text, code) {
+// it came from, not the one the eye happens to be on. `realm` is that same
+// realm — derived from `code` so no caller has to remember, since the member
+// list backing @mentions has to travel with the emoji or they disagree.
+function renderMarkdown(text, code, realm = state.realms.get(code) || R()) {
   const codeBlocks = [];
-  // U+0000 can never appear in user content (the server strips control
-  // chars), so it's a collision-free sentinel for protected fragments.
+  // esc() has just removed every control character, so U+0000 cannot appear in
+  // the text below and is a collision-free sentinel for protected fragments.
   const placeholder = (i) => `\u0000${i}\u0000`;
   let t = esc(text);
   t = t.replace(/```([\s\S]*?)```/g, (_, code) => {
@@ -1510,28 +1602,46 @@ function renderMarkdown(text, code) {
   // mangle characters inside an emitted href.
   // \u0000 excluded so a URL can't swallow an earlier fragment's sentinel.
   t = t.replace(/(https?:\/\/[^\s<\u0000]+)/g, (url) => {
-    codeBlocks.push(`<a href="${url}" target="_blank" rel="noreferrer noopener">${url}</a>`);
-    return placeholder(codeBlocks.length - 1);
+    // A trailing pipe closes a spoiler far more often than it belongs to an
+    // address, and swallowing it left the link someone meant to hide in plain
+    // sight with no spoiler around it at all.
+    const tail = url.match(/\|+$/)?.[0] || "";
+    const href = url.slice(0, url.length - tail.length);
+    codeBlocks.push(`<a href="${href}" target="_blank" rel="noreferrer noopener">${href}</a>`);
+    return placeholder(codeBlocks.length - 1) + tail;
   });
-  t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  // Lazy rather than [^*]+, so bold can contain an italic run instead of
+  // failing to form and showing the reader its own asterisks.
+  t = t.replace(/\*\*([\s\S]+?)\*\*/g, "<strong>$1</strong>");
   t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   t = t.replace(/\|\|([\s\S]+?)\|\|/g, '<span class="spoiler" title="Click to reveal">$1</span>');
-  t = highlightMentions(t);
+  t = highlightMentions(t, realm);
   // After code and links are behind sentinels, before those come back: a
   // ":shrug:" typed inside a fenced block has to stay literal both ways round.
   t = renderCustomEmoji(t, code, emojiReg);
-  t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => codeBlocks[+i]);
+  t = t.replace(/\u0000(\d+)\u0000/g, (whole, i) => codeBlocks[+i] ?? whole);
   return t;
 }
 
 const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-// Runs on already-escaped text, so names are matched in their escaped form
-// too. Only names we actually know light up — a stray @ is left alone.
-function highlightMentions(t) {
+// Sorting a few hundred names and compiling the alternation costs more than the
+// markdown does, and it happens once per message rendered. The set only moves
+// when someone joins, leaves or is renamed, so those bump the epoch and
+// everything in between reuses the compiled pattern. Your own name and tag are
+// in the key directly rather than needing a bump of their own.
+let mentionEpoch = 0;
+const bumpMentions = () => mentionEpoch++;
+let mentionCache = { key: null, re: null, mine: null };
+
+function mentionMatcher(realm) {
+  const key = `${realm?.code || ""} ${mentionEpoch} ${realm?.members.size ?? 0} ${hub.friends.size} ${
+    state.profile?.name || ""
+  } ${state.account?.tag || ""}`;
+  if (mentionCache.key === key) return mentionCache;
   const names = new Set(["everyone", "here"]);
-  for (const member of state.members.values()) names.add(member.name);
+  for (const member of (realm?.members || NO_MAP).values()) names.add(member.name);
   for (const f of hub.friends.values()) {
     names.add(f.name);
     if (f.tag) names.add(f.tag);
@@ -1544,13 +1654,23 @@ function highlightMentions(t) {
     .filter(Boolean)
     .sort((a, b) => b.length - a.length)
     .map((n) => reEsc(esc(n)));
-  if (!alts.length) return t;
-  let re;
+  let re = null;
   try {
-    re = new RegExp(`@(${alts.join("|")})`, "gi");
+    if (alts.length) re = new RegExp(`@(${alts.join("|")})`, "gi");
   } catch {
-    return t; // a pathological name broke the pattern; render it plain
+    re = null; // a pathological name broke the pattern; render it plain
   }
+  mentionCache = { key, re, mine };
+  return mentionCache;
+}
+
+// Runs on already-escaped text, so names are matched in their escaped form
+// too. Only names we actually know light up — a stray @ is left alone. The
+// realm is a parameter because "who is in this conversation" is a property of
+// the message being rendered, not of whichever server you happen to be on.
+function highlightMentions(t, realm = R()) {
+  const { re, mine } = mentionMatcher(realm);
+  if (!re) return t;
   return t.replace(re, (whole, name) => {
     const isMe = mine.has(name.toLowerCase());
     return `<span class="mention${isMe ? " me" : ""}">@${name}</span>`;
@@ -2629,20 +2749,60 @@ function fmtDay(ts) {
   return new Date(ts).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
 }
 
-function renderMessages(scrollToBottom = false) {
+const GROUP_WINDOW = 5 * 60 * 1000; // consecutive posts inside this share a header
+
+// The message array only ever grows — history prepends, live messages append,
+// nothing removes — and every full render rebuilds the pane from all of it. A
+// tab left open in a busy channel therefore gets permanently slower. Once you
+// are at the live edge the head is off-screen anyway, so drop it; the slack
+// keeps the trim (and the rebuild that performs it) to once per hundred
+// messages instead of once per message.
+const MSG_KEEP = 200;
+const MSG_TRIM_AT = 300;
+
+// What the pane currently has painted, so appendMessage can tell whether adding
+// one node would land where a full pass would have put it.
+let painted = { code: null, chanId: null, anchor: undefined, author: null, ts: 0, day: "" };
+
+function trimToLiveEdge(realm, chanId) {
+  const list = realm.messages.get(chanId);
+  if (!list || list.length <= MSG_TRIM_AT) return;
+  let cut = list.length - MSG_KEEP;
+  // Never cut past the "new messages" line — it is the one thing on screen
+  // someone is using to find their place.
+  const anchor = realm.firstUnread.get(chanId);
+  if (anchor !== undefined) {
+    const at = list.findIndex((x) => x.id === anchor);
+    if (at >= 0 && at < cut) cut = at;
+  }
+  if (cut <= 0) return;
+  list.splice(0, cut);
+  realm.noMoreHistory.delete(chanId); // there is a head to fetch again now
+}
+
+// `prepended` says content went in ABOVE the viewport, which is the only case
+// where scrollTop has to move to keep the same words under the eye. Applying
+// that delta to an append instead drags the view down by the height of the new
+// message — 582px for a 4000-character one — and a tall composer is enough to
+// push you out of `nearBottom` and into that branch without scrolling at all.
+function renderMessages(scrollToBottom = false, realm = R(), prepended = false) {
   const pane = $("messages");
   const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
   const prevHeight = pane.scrollHeight;
   const prevTop = pane.scrollTop;
+  const chanId = realm?.activeChan ?? null;
+  // Only while they're at the bottom: trimming under someone who has scrolled
+  // up to read would pull the ground out from under them.
+  if (realm && (scrollToBottom || nearBottom)) trimToLiveEdge(realm, chanId);
   pane.textContent = "";
 
-  const list = state.messages.get(state.activeChan) || [];
+  const list = realm?.messages.get(chanId) || NO_ARR;
   let lastAuthor = null;
   let lastTs = 0;
   let lastDay = "";
   let group = null;
 
-  const firstUnread = R()?.firstUnread.get(state.activeChan);
+  const firstUnread = realm?.firstUnread.get(chanId);
   let markedUnread = false;
 
   for (const msg of list) {
@@ -2658,56 +2818,98 @@ function renderMessages(scrollToBottom = false) {
       markedUnread = true;
       lastAuthor = null;
     }
-    const sameGroup = lastAuthor === msg.author.userId && msg.ts - lastTs < 5 * 60 * 1000 && !msg.replyTo;
+    const sameGroup = lastAuthor === msg.author.userId && msg.ts - lastTs < GROUP_WINDOW && !msg.replyTo;
     if (!sameGroup) {
-      group = el("div", "msg-group");
-      const av = el("div", "mg-avatar", msg.author.avatar);
-      av.style.background = msg.author.color;
-      av.title = "View profile";
-      av.onclick = (e) => {
-        e.stopPropagation();
-        const known = [...state.members.values()].find((mm) => mm.userId === msg.author.userId);
-        openProfile(e.clientX + 12, e.clientY - 40, known || msg.author);
-      };
-      group.appendChild(av);
-      const body = el("div", "mg-body");
-      const head = el("div", "mg-head");
-      const name = el("span", "mg-name", msg.author.name);
-      name.style.color = msg.author.color;
-      name.title = "View profile";
-      name.style.cursor = "pointer";
-      name.onclick = (e) => {
-        e.stopPropagation();
-        const known = [...state.members.values()].find((mm) => mm.userId === msg.author.userId);
-        openProfile(e.clientX + 12, e.clientY - 40, known || msg.author);
-      };
-      head.appendChild(name);
-      head.appendChild(el("span", "mg-time", fmtTime(msg.ts)));
-      body.appendChild(head);
-      body.appendChild(el("div", "mg-msgs"));
-      group.appendChild(body);
+      group = buildMsgGroup(msg, realm);
       pane.appendChild(group);
     }
     lastAuthor = msg.author.userId;
     lastTs = msg.ts;
-    group.querySelector(".mg-msgs").appendChild(buildMsgNode(msg));
+    group.querySelector(".mg-msgs").appendChild(buildMsgNode(msg, realm));
   }
 
-  if (scrollToBottom || nearBottom) {
-    pane.scrollTop = pane.scrollHeight;
-  } else {
-    // Preserve position (e.g. after prepending history).
-    pane.scrollTop = prevTop + (pane.scrollHeight - prevHeight);
-  }
+  painted = { code: realm?.code ?? null, chanId, anchor: firstUnread, author: lastAuthor, ts: lastTs, day: lastDay };
+
+  if (scrollToBottom || nearBottom) pane.scrollTop = pane.scrollHeight;
+  else if (prepended) pane.scrollTop = prevTop + (pane.scrollHeight - prevHeight);
+  else pane.scrollTop = prevTop;
 }
 
-function buildMsgNode(msg) {
-  const node = el("div", "msg" + (msg.pending ? " pending" : "") + (mentionsMe(msg) ? " pinged" : ""));
+// `msg` and `msg-ack` are the events that arrive in bulk and both only ever add
+// to the tail, so they get one new node instead of several hundred rebuilt.
+// Anything a full pass would decide differently — a new day, an unread line
+// that hasn't been drawn yet, a trim that's due — hands back false and lets it
+// rebuild. Reads layout once at the top and writes once at the bottom.
+function appendMessage(realm, msg) {
+  if (painted.code !== realm.code || painted.chanId !== msg.chanId) return false;
+  if (painted.anchor !== realm.firstUnread.get(msg.chanId)) return false;
+  if (new Date(msg.ts).toDateString() !== painted.day) return false;
+
+  const pane = $("messages");
+  const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
+  if (nearBottom && (realm.messages.get(msg.chanId)?.length || 0) > MSG_TRIM_AT) return false;
+
+  const sameGroup = painted.author === msg.author.userId && msg.ts - painted.ts < GROUP_WINDOW && !msg.replyTo;
+  let slot = sameGroup ? pane.lastElementChild?.querySelector(":scope > .mg-body > .mg-msgs") : null;
+  if (sameGroup && !slot) return false; // pane isn't shaped the way we think
+  if (!slot) {
+    const group = buildMsgGroup(msg, realm);
+    pane.appendChild(group);
+    slot = group.querySelector(".mg-msgs");
+  }
+  slot.appendChild(buildMsgNode(msg, realm));
+  painted.author = msg.author.userId;
+  painted.ts = msg.ts;
+  if (nearBottom) pane.scrollTop = pane.scrollHeight;
+  return true;
+}
+
+// An ack swaps the optimistic copy for the server's: same words, same place,
+// one node different. Rebuilding the pane for that costs as much again as the
+// send did.
+function swapMsgNode(realm, oldId, msg) {
+  if (painted.code !== realm.code || painted.chanId !== msg.chanId) return false;
+  const node = $("messages").querySelector(`.msg[data-id="${CSS.escape(oldId)}"]`);
+  if (!node) return false;
+  node.replaceWith(buildMsgNode(msg, realm));
+  return true;
+}
+
+// The avatar + name + timestamp header a run of messages hangs off.
+function buildMsgGroup(msg, realm = R()) {
+  const group = el("div", "msg-group");
+  const openAuthor = (e) => {
+    e.stopPropagation();
+    const known = [...(realm?.members || NO_MAP).values()].find((mm) => mm.userId === msg.author.userId);
+    openProfile(e.clientX + 12, e.clientY - 40, known || msg.author);
+  };
+  const av = el("div", "mg-avatar", msg.author.avatar);
+  av.style.background = msg.author.color;
+  av.title = "View profile";
+  av.onclick = openAuthor;
+  group.appendChild(av);
+  const body = el("div", "mg-body");
+  const head = el("div", "mg-head");
+  const name = el("span", "mg-name", msg.author.name);
+  name.style.color = msg.author.color;
+  name.title = "View profile";
+  name.style.cursor = "pointer";
+  name.onclick = openAuthor;
+  head.appendChild(name);
+  head.appendChild(el("span", "mg-time", fmtTime(msg.ts)));
+  body.appendChild(head);
+  body.appendChild(el("div", "mg-msgs"));
+  group.appendChild(body);
+  return group;
+}
+
+function buildMsgNode(msg, realm = R()) {
+  const node = el("div", "msg" + (msg.pending ? " pending" : "") + (mentionsMe(msg, realm) ? " pinged" : ""));
   node.dataset.id = msg.id;
   if (msg.pinned) node.classList.add("is-pinned");
 
   if (msg.replyTo) {
-    const r = el("div", "msg-reply", `↩ ${msg.replyTo.name}: ${msg.replyTo.content}`);
+    const r = el("div", "msg-reply", dropHalfPairs(`↩ ${msg.replyTo.name}: ${msg.replyTo.content}`));
     r.onclick = () => {
       const target = document.querySelector(`.msg[data-id="${msg.replyTo.id}"]`);
       if (target) {
@@ -2719,7 +2921,7 @@ function buildMsgNode(msg) {
     node.appendChild(r);
   }
 
-  if (state.editingId === msg.id) {
+  if (realm?.editingId === msg.id) {
     const editor = document.createElement("textarea");
     editor.className = "edit-box";
     editor.value = msg.content;
@@ -2745,13 +2947,13 @@ function buildMsgNode(msg) {
   const poll = parsePoll(msg.content);
   if (poll) {
     node.appendChild(buildPollNode(msg, poll));
-    if (!msg.pending) node.appendChild(msgActions(msg));
+    if (!msg.pending) node.appendChild(msgActions(msg, realm));
     return node;
   }
 
-  const code = state.currentCode;
+  const code = realm?.code || null;
   const content = el("div", "msg-content" + (isOnlyEmoji(msg.content, code, emojiReg) ? " ce-big" : ""));
-  content.innerHTML = renderMarkdown(msg.content, code);
+  content.innerHTML = renderMarkdown(msg.content, code, realm);
   content.querySelectorAll(".spoiler").forEach((s) => {
     s.onclick = () => s.classList.add("revealed");
   });
@@ -2773,7 +2975,7 @@ function buildMsgNode(msg) {
   // A thread hangs off the message that started it, which is the only place
   // you'd think to look for it.
   if (msg.threadId) {
-    const thread = state.channels.find((c) => c.id === msg.threadId);
+    const thread = (realm?.channels || NO_ARR).find((c) => c.id === msg.threadId);
     const chip = el("button", "thread-chip", `💬 ${thread?.name || msg.threadName || "Thread"}`);
     chip.title = "Open this thread";
     chip.onclick = () => activateChannel(msg.threadId);
@@ -2782,8 +2984,9 @@ function buildMsgNode(msg) {
 
   if (msg.reactions) {
     const row = el("div", "msg-reactions");
+    const me = realmUserId(realm);
     for (const [emoji, users] of Object.entries(msg.reactions)) {
-      const btn = el("button", "reaction" + (users.includes(myUserId()) ? " mine" : ""));
+      const btn = el("button", "reaction" + (users.includes(me) ? " mine" : ""));
       const face = reactionLabel(emoji, code, emojiReg);
       const span = el("span", "reaction-face");
       span.innerHTML = face.html;
@@ -2795,12 +2998,12 @@ function buildMsgNode(msg) {
     node.appendChild(row);
   }
 
-  if (!msg.pending) node.appendChild(msgActions(msg));
+  if (!msg.pending) node.appendChild(msgActions(msg, realm));
   return node;
 }
 
 // The hover toolbar on a message.
-function msgActions(msg) {
+function msgActions(msg, realm = R()) {
   {
     const actions = el("div", "msg-actions");
     for (const q of QUICK_REACTS.slice(0, 3)) {
@@ -2827,7 +3030,7 @@ function msgActions(msg) {
       thread.title = msg.threadId ? "Open this thread" : "Start a thread";
       thread.onclick = () => {
         if (msg.threadId) return activateChannel(msg.threadId);
-        promptModal("Name this thread", msg.content.slice(0, 40), (v) =>
+        promptModal("Name this thread", clip(msg.content, 40), (v) =>
           wsSend({ type: "create-thread", chanId: msg.chanId, msgId: msg.id, name: v })
         );
       };
@@ -2845,7 +3048,7 @@ function msgActions(msg) {
     copy.title = "Copy text";
     copy.onclick = () => copyText(msg.content, "Message copied");
     actions.appendChild(copy);
-    if (msg.author.userId === myUserId()) {
+    if (msg.author.userId === realmUserId(realm)) {
       actions.appendChild(el("span", "sep"));
       const edit = el("button", "", "✏");
       edit.title = "Edit";
@@ -2999,7 +3202,7 @@ function activateChannel(chanId) {
 /* ------------------------------ reply state ------------------------------ */
 
 function setReply(msg) {
-  state.replyTo = { id: msg.id, name: msg.author.name, content: msg.content.slice(0, 120) };
+  state.replyTo = { id: msg.id, name: msg.author.name, content: clip(msg.content, 120) };
   $("reply-label").textContent = `Replying to ${msg.author.name}`;
   $("reply-bar").classList.remove("hidden");
   $("input").focus();
@@ -3983,12 +4186,25 @@ $("chat-view").addEventListener("drop", (e) => {
   addFiles(e.dataTransfer.files);
 });
 
-// How screenshots actually get shared.
+// How screenshots actually get shared. A text paste is left to the browser —
+// but maxlength drops the tail without a word, and the counter only appears
+// with 400 characters to go, so a wall of text loses its ending invisibly. Say
+// so, after the fact, because that's the only point at which the real figure is
+// known (the browser normalises line endings as it inserts).
 input.addEventListener("paste", (e) => {
   const files = e.clipboardData?.files;
-  if (!files?.length) return;
-  e.preventDefault();
-  addFiles(files);
+  if (files?.length) {
+    e.preventDefault();
+    addFiles(files);
+    return;
+  }
+  const pasted = (e.clipboardData?.getData("text") || "").replace(/\r\n/g, "\n");
+  if (!pasted) return;
+  const kept = input.value.length - (input.selectionEnd - input.selectionStart);
+  setTimeout(() => {
+    const dropped = pasted.length - (input.value.length - kept);
+    if (dropped > 0) toast(`Paste was ${dropped.toLocaleString()} characters too long — the end was cut off.`, true);
+  }, 0);
 });
 
 // Revealed spoilers are remembered per attachment key, so a repaint (a new
@@ -4277,7 +4493,7 @@ function saveMessage(msg) {
     code,
     chanId: msg.chanId,
     msgId: msg.id,
-    preview: `${msg.author.name}: ${msg.content}`.slice(0, 120),
+    preview: clip(`${msg.author.name}: ${msg.content}`, 120),
     ts: Date.now(),
   });
   state.settings.saved = kept.slice(0, SAVED_CAP);

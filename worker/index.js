@@ -13,8 +13,11 @@ const MSG_CAP = 300; // messages kept per channel
 const HISTORY_PAGE = 60;
 const MAX_REACTION_KEYS = 20; // distinct emoji per message
 const MAX_PINS = 50;
-const SEARCH_SCAN = 1200; // messages examined per search
+const SEARCH_SCAN = 1200; // messages examined per search, split across channels
 const SEARCH_HITS = 40;
+const ARCH_BATCH = 50; // evicted messages per archive object
+const ARCH_BUF_CAP = 400; // evictions we hold in the DO while R2 is unreachable
+const ARCH_LIST_PAGES = 10; // R2 list pages walked per archive read
 const SOUNDS = new Set([
   "airhorn", "bruh", "vine", "sad", "yeet", "rimshot", "bonk", "quack",
   "wow", "fart", "applause", "windows",
@@ -108,9 +111,41 @@ export default {
       return serveFile(request, env, url);
     }
 
-    return env.ASSETS.fetch(request);
+    return withCsp(await env.ASSETS.fetch(request));
   },
 };
+
+// Second line of defence behind the escaping, for a message pipeline that ends
+// in innerHTML. Only the HTML document carries it: /f/ serves user uploads and
+// already has its own non-negotiable headers, and a policy on a WebSocket
+// upgrade means nothing.
+//
+// img-src is deliberately wide open. Pasting a link to a picture and having the
+// picture appear is a feature this app has, so locking images down to 'self'
+// would quietly delete it — and an <img> is not a script-execution vector, which
+// is what the rest of this policy is for. 'unsafe-inline' in style-src is
+// likewise not optional: the client sets element.style all over the place.
+// No frame-src: the YouTube embed is a thumbnail and a link, never an iframe.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src * data: blob:",
+  "media-src 'self' blob:",
+  "connect-src 'self' ws: wss:",
+  "base-uri 'none'",
+  "object-src 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+function withCsp(res) {
+  if (!/^text\/html/i.test(res.headers.get("Content-Type") || "")) return res;
+  const headers = new Headers(res.headers);
+  headers.set("Content-Security-Policy", CSP);
+  headers.set("X-Content-Type-Options", "nosniff");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
 
 // Spend an upload ticket. The ticket is the only identity this request has —
 // there is no socket here — so the DO validates it and hands back the key it
@@ -140,9 +175,17 @@ async function handleUpload(request, env, url) {
 
   // The mime on the ticket wins. Believing Content-Type here would let anyone
   // declare image/png and upload markup we then serve from our own origin.
-  await env.FILES.put(claim.key, request.body, {
-    httpMetadata: { contentType: claim.mime },
-  });
+  try {
+    await env.FILES.put(claim.key, request.body, {
+      httpMetadata: { contentType: claim.mime },
+    });
+  } catch {
+    // The claim already wrote `att:<key>`, which is the client's permission to
+    // attach this key to a message. If the bytes never landed, that permission
+    // has to go with them, or a dropped connection posts a 404 into history.
+    await stub.fetch(`https://do/internal/unclaim?key=${encodeURIComponent(claim.key)}`);
+    return new Response("upload failed", { status: 502 });
+  }
 
   return Response.json({
     ok: true,
@@ -194,6 +237,16 @@ function newServerCode() {
 
 const msgKey = (chanId, seq) => `msg:${chanId}:${String(seq).padStart(8, "0")}`;
 
+// Archive keys pad to the same width as `msg:` for the same reason: both DO
+// storage and R2 order keys as strings, so the padding is the only thing that
+// makes "sorted" and "chronological" the same sentence.
+const archBufPrefix = (chanId) => `archbuf:${chanId}:`;
+const archBufKey = (chanId, seq) => archBufPrefix(chanId) + String(seq).padStart(8, "0");
+const archPrefix = (code, chanId) => `arch/${code}/${chanId}/`;
+const archKey = (code, chanId, first, last) =>
+  `${archPrefix(code, chanId)}${String(first).padStart(8, "0")}-${String(last).padStart(8, "0")}.jsonl`;
+const archFirstSeq = (key) => Number(key.split("/").pop().split("-")[0]);
+
 export class ConcordServer {
   constructor(state, env) {
     this.state = state;
@@ -208,7 +261,10 @@ export class ConcordServer {
     // deliberate trade: persisting a counter per keystroke costs more than the
     // one extra emoji a friend group might squeeze through.
     this.slowAt = new Map(); // `${userId}:${chanId}` -> last message
-    this.uploadAt = new Map(); // userId -> recent upload timestamps
+    // The upload budget is the one limiter that is NOT allowed to fail open:
+    // everything else it guards costs a broadcast, that one costs 25 MB of R2
+    // per call, so it lives in storage instead of here.
+    this.flushing = new Set(); // chanIds with an archive flush in flight
     this.authWrites = 0;
     this.code = ""; // this server's invite code; see fetch()
     this.state.setWebSocketAutoResponse(
@@ -228,6 +284,14 @@ export class ConcordServer {
     // reachable from the internet — it is the trusted half of an upload.
     if (url.pathname === "/internal/claim") {
       return this.claimTicket(url.searchParams.get("ticket") || "");
+    }
+
+    // The other half of a claim: an upload that never made it to R2 gives back
+    // the permission it was handed.
+    if (url.pathname === "/internal/unclaim") {
+      const key = url.searchParams.get("key") || "";
+      if (ATT_KEY_RE.test(key)) await this.state.storage.delete(`att:${key}`);
+      return Response.json({ ok: true });
     }
 
     if (url.pathname !== "/ws" || request.headers.get("Upgrade") !== "websocket") {
@@ -354,13 +418,24 @@ export class ConcordServer {
   }
 
   // Identities are stored per server and never expire on their own, so sweep
-  // dormant ones. Anyone currently connected is always kept.
+  // dormant ones. What must never be swept is an identity the server still
+  // remembers anywhere else: an `auth:` row is the *only* proof a userId is
+  // taken, so deleting one while a roster row still names that person turns
+  // them into an unclaimed identity anybody can walk up and assume. Exempting
+  // only live sockets meant flooding 300 throwaway hellos while the owner had
+  // their tab shut was enough to inherit the server. ROSTER_CAP (200) is below
+  // AUTH_CAP (300), so keeping every remembered member always fits.
   async sweepAuth(now) {
     const rows = await this.state.storage.list({ prefix: "auth:" });
     const live = new Set();
     for (const s of this.sessions.values()) {
       if (s.userId) live.add(`auth:${s.userId}`);
     }
+    for (const entry of await this.rosterList()) {
+      if (entry?.userId) live.add(`auth:${entry.userId}`);
+    }
+    const meta = await this.state.storage.get("meta");
+    if (meta?.owner) live.add(`auth:${meta.owner}`);
     const entries = [];
     for (const [key, value] of rows) {
       if (live.has(key)) continue;
@@ -390,6 +465,11 @@ export class ConcordServer {
     }
     for (const [key, rec] of await storage.list({ prefix: "tkt:" })) {
       if (!(rec?.exp > now)) doomed.push(key);
+    }
+    // Upload budgets are windows, not records — once the window has rolled past
+    // the row says nothing and is just a per-identity leak.
+    for (const [key, stamps] of await storage.list({ prefix: "ub:" })) {
+      if (!(stamps?.length && now - stamps[stamps.length - 1] < 600_000)) doomed.push(key);
     }
     await this.dropObjects(orphans);
     if (doomed.length) await storage.delete(doomed);
@@ -439,6 +519,165 @@ export class ConcordServer {
     await this.dropObjects(keys);
   }
 
+  /* ------------------------------ the archive ------------------------------ */
+  // The 300-message ring used to be the whole story: whatever fell off the end
+  // was deleted and that was that, which is fine for a demo and useless for a
+  // group that talks. Now the evicted message lands in a durable per-channel
+  // buffer and, every ARCH_BATCH evictions, in one immutable JSONL object in
+  // R2. R2 cannot append, so the alternative — one growing object per channel —
+  // would mean reading and rewriting the entire history of a channel on every
+  // single message. Batches of 50 keep each write O(50) forever.
+
+  async archiveCode() {
+    const code = this.code || (await this.state.storage.get("code")) || "";
+    return CODE_RE.test(code) ? code : "";
+  }
+
+  // Called from the `msg` hot path, so the only thing it waits on is the DO
+  // write. The R2 upload is deliberately *not* awaited — a person pressing
+  // enter should never pay for a bucket round trip — and rides waitUntil so the
+  // runtime keeps us alive until it lands.
+  async archivePush(chanId, msg) {
+    await this.state.storage.put(archBufKey(chanId, msg.id), msg);
+    if (msg.id % ARCH_BATCH !== 0) return;
+    const flush = this.archiveFlush(chanId).catch(() => {});
+    this.state.waitUntil?.(flush);
+  }
+
+  // Crash tolerance lives in the ordering here: the buffer is written before
+  // the flush starts and cleared only after R2 has acknowledged, so a DO that
+  // dies mid-flush loses nothing and simply replays. A replay writes the same
+  // messages to the same key, which overwrites rather than duplicates — and the
+  // read path dedupes by id anyway, for the window where both copies exist.
+  async archiveFlush(chanId) {
+    if (!this.env.FILES || this.flushing.has(chanId)) return;
+    const code = await this.archiveCode();
+    if (!code) return;
+    this.flushing.add(chanId);
+    try {
+      const rows = await this.state.storage.list({
+        prefix: archBufPrefix(chanId),
+        limit: ARCH_BUF_CAP + ARCH_BATCH,
+      });
+      if (!rows.size) return;
+      const msgs = [...rows.values()];
+      await this.env.FILES.put(
+        archKey(code, chanId, msgs[0].id, msgs[msgs.length - 1].id),
+        msgs.map((x) => JSON.stringify(x)).join("\n"),
+        { httpMetadata: { contentType: "application/x-ndjson" } }
+      );
+      await this.state.storage.delete([...rows.keys()]);
+    } catch {
+      await this.archiveTrim(chanId);
+    } finally {
+      this.flushing.delete(chanId);
+    }
+  }
+
+  // An R2 outage must not turn the buffer into an unbounded leak inside the DO.
+  // Past the cap we drop the *oldest* unflushed messages: they are the furthest
+  // from anything someone is about to scroll back to, and dropping from that
+  // end leaves the surviving range contiguous with the live window. Their
+  // attachments become orphans in the bucket — the same deal sweepUploads
+  // already accepts, for the same reason.
+  async archiveTrim(chanId) {
+    try {
+      const rows = await this.state.storage.list({
+        prefix: archBufPrefix(chanId),
+        limit: ARCH_BUF_CAP + ARCH_BATCH,
+      });
+      if (rows.size <= ARCH_BUF_CAP) return;
+      await this.state.storage.delete([...rows.keys()].slice(0, rows.size - ARCH_BUF_CAP));
+    } catch {}
+  }
+
+  async archiveObjects(code, chanId) {
+    const prefix = archPrefix(code, chanId);
+    const keys = [];
+    let cursor;
+    for (let page = 0; page < ARCH_LIST_PAGES; page++) {
+      const res = await this.env.FILES.list({ prefix, cursor, limit: 1000 });
+      for (const o of res.objects) keys.push(o.key);
+      if (!res.truncated) break;
+      cursor = res.cursor;
+    }
+    return keys;
+  }
+
+  // The newest `need` archived messages older than `ceiling`. The unflushed
+  // buffer is consulted first because it holds the ones nearest the live
+  // window — which is exactly where someone scrolling up arrives first.
+  async archiveRead(chanId, ceiling, need) {
+    if (need <= 0 || !(ceiling > 1)) return [];
+    const byId = new Map();
+    const rows = await this.state.storage.list({
+      prefix: archBufPrefix(chanId),
+      end: archBufKey(chanId, ceiling),
+      reverse: true,
+      limit: need,
+    });
+    for (const msg of rows.values()) byId.set(msg.id, msg);
+    if (byId.size < need && this.env.FILES) {
+      const code = await this.archiveCode();
+      try {
+        const keys = code
+          ? (await this.archiveObjects(code, chanId)).filter((k) => archFirstSeq(k) < ceiling)
+          : [];
+        // Backwards: objects sort by their first seq, so the tail of the list
+        // is the newest history and the first thing wanted.
+        for (let i = keys.length - 1; i >= 0 && byId.size < need; i--) {
+          const obj = await this.env.FILES.get(keys[i]);
+          if (!obj) continue;
+          for (const msg of parseJsonl(await obj.text())) {
+            if (msg.id < ceiling) byId.set(msg.id, msg);
+          }
+        }
+      } catch {
+        // A bucket we cannot reach means a short page, not a broken channel.
+      }
+    }
+    return [...byId.values()].sort((a, b) => a.id - b.id).slice(-need);
+  }
+
+  // Is there anything older than `oldest`? Answered from the cheap end first:
+  // a channel that never filled its ring has no archive at all, and the DO-side
+  // buffer answers most of the rest without touching R2.
+  async archiveHasOlder(chanId, oldest) {
+    if (!(oldest > 1)) return false;
+    if (((await this.state.storage.get(`chanseq:${chanId}`)) || 0) <= MSG_CAP) return false;
+    const rows = await this.state.storage.list({ prefix: archBufPrefix(chanId), limit: 1 });
+    for (const msg of rows.values()) if (msg.id < oldest) return true;
+    if (!this.env.FILES) return false;
+    const code = await this.archiveCode();
+    if (!code) return false;
+    try {
+      const res = await this.env.FILES.list({ prefix: archPrefix(code, chanId), limit: 1 });
+      return !!res.objects.length && archFirstSeq(res.objects[0].key) < oldest;
+    } catch {
+      return false;
+    }
+  }
+
+  // Deleting a channel has to take its archive with it, or the channel is gone
+  // from every list while everything it ever held stays in the bucket.
+  async archivePurge(chanId) {
+    const storage = this.state.storage;
+    const rows = await storage.list({ prefix: archBufPrefix(chanId) });
+    await this.dropMessageFiles([...rows.values()]);
+    if (rows.size) await storage.delete([...rows.keys()]);
+    if (!this.env.FILES) return;
+    const code = await this.archiveCode();
+    if (!code) return;
+    try {
+      const keys = await this.archiveObjects(code, chanId);
+      for (const key of keys) {
+        const obj = await this.env.FILES.get(key);
+        if (obj) await this.dropMessageFiles(parseJsonl(await obj.text()));
+      }
+      for (let i = 0; i < keys.length; i += 1000) await this.dropObjects(keys.slice(i, i + 1000));
+    } catch {}
+  }
+
   // Turns client-declared attachments into stored ones. Each key must have an
   // `att:` record minted by *this* person's upload; anything else is dropped
   // without comment, because a client that sends a bad key is a bug, not a user.
@@ -451,12 +690,18 @@ export class ConcordServer {
       if (!ATT_KEY_RE.test(key)) continue;
       const rec = await storage.get(`att:${key}`);
       if (!rec || rec.userId !== s.userId) continue;
+      // The `att:` row is minted when the ticket is claimed, which is *before*
+      // the bytes are streamed — so an upload that died halfway leaves a record
+      // pointing at nothing. Ask the bucket, the way consumeAsset already does,
+      // or a flaky connection writes a permanently broken image into history.
+      const head = await this.env.FILES?.head(key);
       await storage.delete(`att:${key}`);
+      if (!head) continue;
       const att = {
         key,
         url: `/f/${key}`,
         name: cleanFileName(a.name) || key.split("/").pop(),
-        size: clampInt(a.size, 0, MAX_FILE_BYTES),
+        size: clampInt(head.size, 0, MAX_FILE_BYTES),
         mime: safeMime(rec.mime),
       };
       // Dimensions and duration are measured by the browser purely so the
@@ -477,6 +722,12 @@ export class ConcordServer {
   async isOwner(userId) {
     const meta = await this.state.storage.get("meta");
     return !!userId && meta?.owner === userId;
+  }
+
+  // Does this server still know who that userId is, independently of `auth:`?
+  async isRemembered(userId) {
+    if (await this.state.storage.get(`roster:${userId}`)) return true;
+    return await this.isOwner(userId);
   }
 
   async banList() {
@@ -547,7 +798,11 @@ export class ConcordServer {
   }
 
   // Removing the owner has to hand the keys to someone, or the server locks
-  // itself out of its own moderation forever.
+  // itself out of its own moderation forever. But only to *someone*: an owner
+  // of `null` was a takeover waiting to happen, because the next hello through
+  // the door claims an unowned server. When the last member walks out there is
+  // nobody to inherit, so the departing owner keeps the title — they can come
+  // back with their token, and nobody else can.
   async removeMember(userId, closeSockets) {
     const storage = this.state.storage;
     await storage.delete(`roster:${userId}`);
@@ -555,9 +810,11 @@ export class ConcordServer {
     if (meta?.owner === userId) {
       const rows = await this.rosterList();
       const heir = rows.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0))[0];
-      meta.owner = heir?.userId || null;
-      await storage.put("meta", meta);
-      this.broadcast({ type: "server-meta", meta });
+      if (heir?.userId) {
+        meta.owner = heir.userId;
+        await storage.put("meta", meta);
+        this.broadcast({ type: "server-meta", meta });
+      }
     }
     this.broadcast({ type: "roster-remove", userId });
     if (!closeSockets) return;
@@ -580,11 +837,16 @@ export class ConcordServer {
     return r.count > 30; // 30 messages per 5s is plenty for humans
   }
 
-  uploadBudget(userId, count, now) {
-    const recent = (this.uploadAt.get(userId) || []).filter((t) => now - t < 600_000);
+  // Kept in storage rather than in a Map. Every other limiter here fails open
+  // after a hibernation wake-up and that's a fair trade for one extra emoji;
+  // this one guards 25 MB writes into a bucket, and "wait for the DO to sleep"
+  // is not a lock anyone should have to respect voluntarily.
+  async uploadBudget(userId, count, now) {
+    const key = `ub:${userId}`;
+    const recent = ((await this.state.storage.get(key)) || []).filter((t) => now - t < 600_000);
     if (recent.length + count > UPLOADS_PER_10MIN) return false;
     for (let i = 0; i < count; i++) recent.push(now);
-    this.uploadAt.set(userId, recent);
+    await this.state.storage.put(key, recent);
     return true;
   }
 
@@ -627,7 +889,15 @@ export class ConcordServer {
         let userId = claimed;
         if (userId) {
           const owner = tokenOf(await storage.get(`auth:${userId}`));
-          if (owner && owner !== presented) userId = "";
+          if (owner) {
+            if (owner !== presented) userId = "";
+          } else if (await this.isRemembered(userId)) {
+            // No `auth:` row, but the server still knows this person — they hold
+            // a roster row, or they own the place. The absence of a token row is
+            // then a hole in our own bookkeeping, not permission: an identity we
+            // remember must never be claimable by someone who can't prove it.
+            userId = "";
+          }
         }
 
         // Before the identity is minted, not after: a banned member should
@@ -726,9 +996,9 @@ export class ConcordServer {
         const wanted = Array.isArray(m.attachments) ? m.attachments.length : 0;
         if (!content && !wanted) return;
 
-        if (chan.slow && !(await this.isOwner(s.userId))) {
-          const now = Date.now();
-          const waited = now - (this.slowAt.get(`${s.userId}:${chanId}`) || 0);
+        const slowKey = chan.slow && !(await this.isOwner(s.userId)) ? `${s.userId}:${chanId}` : "";
+        if (slowKey) {
+          const waited = Date.now() - (this.slowAt.get(slowKey) || 0);
           if (waited < chan.slow * 1000) {
             ws.send(
               JSON.stringify({
@@ -739,11 +1009,14 @@ export class ConcordServer {
             );
             return;
           }
-          this.slowAt.set(`${s.userId}:${chanId}`, now);
         }
 
         const attachments = await this.claimAttachments(s, m.attachments);
         if (!content && !attachments.length) return;
+        // Only a message that actually posts spends the slowmode slot. Charging
+        // for one the server then drops leaves you waiting out a cooldown for
+        // something nobody ever saw.
+        if (slowKey) this.slowAt.set(slowKey, Date.now());
 
         const seqKey = `chanseq:${chanId}`;
         const seq = ((await storage.get(seqKey)) || 0) + 1;
@@ -761,18 +1034,31 @@ export class ConcordServer {
             msg.replyTo = {
               id: parent.id,
               name: parent.author.name,
-              content: parent.content.slice(0, 120),
+              content: clip(parent.content, 120),
             };
           }
         }
         const writes = { [seqKey]: seq, [msgKey(chanId, seq)]: msg };
         await storage.put(writes);
         if (seq > MSG_CAP) {
-          // Read the message falling off the end before dropping it, or its
-          // files sit in the bucket forever with nothing left pointing at them.
-          const evicted = msgKey(chanId, seq - MSG_CAP);
-          await this.dropMessageFiles([await storage.get(evicted)]);
-          await storage.delete(evicted);
+          // What falls off the end is archived, not destroyed — and its
+          // attachments deliberately go with it rather than being deleted. An
+          // archive full of broken images would be worse than no archive, so
+          // attachment storage now grows with history instead of staying capped
+          // at 300 messages a channel. Against a 10 GB free tier and a friend
+          // group that is the trade we want; an explicit `delete` still takes
+          // the files with it, and so does deleting the channel.
+          const evictedKey = msgKey(chanId, seq - MSG_CAP);
+          const evicted = await storage.get(evictedKey);
+          if (evicted) await this.archivePush(chanId, evicted);
+          await storage.delete(evictedKey);
+          // The pin index used to only notice its dead entries when someone
+          // opened the pin list. Eviction knows exactly which id just left.
+          if (evicted?.pinned) {
+            const idxKey = `pins:${chanId}`;
+            const ids = ((await storage.get(idxKey)) || []).filter((id) => id !== evicted.id);
+            await storage.put(idxKey, ids);
+          }
         }
         this.broadcast({ type: "msg", msg }, ws);
         // The author instead gets an ack carrying the nonce so their
@@ -784,15 +1070,35 @@ export class ConcordServer {
       case "history": {
         if (!s.joined) return;
         const chanId = String(m.chanId || "");
+        const before = Number(m.before) || 0;
         const opts = {
           prefix: `msg:${chanId}:`,
           reverse: true,
           limit: HISTORY_PAGE,
         };
-        if (m.before) opts.end = msgKey(chanId, Number(m.before));
+        if (before) opts.end = msgKey(chanId, before);
         const map = await storage.list(opts);
-        const messages = [...map.values()].reverse();
-        ws.send(JSON.stringify({ type: "history", chanId, messages, before: m.before || null }));
+        let messages = [...map.values()].reverse();
+        // Once the live window runs out the archive fills the rest of the page.
+        // Deliberately the same `history` frame: the client already knows how
+        // to render one, and paging past 300 messages shouldn't need it to
+        // learn a second way of receiving the same thing.
+        if (messages.length < HISTORY_PAGE) {
+          const ceiling = messages.length ? messages[0].id : before || Number.MAX_SAFE_INTEGER;
+          const older = await this.archiveRead(chanId, ceiling, HISTORY_PAGE - messages.length);
+          if (older.length) messages = older.concat(messages);
+        }
+        ws.send(
+          JSON.stringify({
+            type: "history",
+            chanId,
+            messages,
+            before: m.before || null,
+            // So the client can offer "load older" instead of guessing from a
+            // short page whether it has reached the beginning.
+            hasArchive: await this.archiveHasOlder(chanId, messages.length ? messages[0].id : before),
+          })
+        );
         break;
       }
 
@@ -919,20 +1225,36 @@ export class ConcordServer {
         const targets = scope
           ? channels.filter((c) => c.id === scope && CHATTABLE.has(c.type))
           : channels.filter((c) => CHATTABLE.has(c.type));
+        // One budget consumed in channel order meant the first four full
+        // channels ate all 1200 and every channel after them was never looked
+        // at — silently, because `truncated` only ever meant "40 hits". Each
+        // target gets its own share instead, and anything we didn't finish
+        // reading says so. Stopping early is fine; not admitting it isn't.
+        const budget = Math.max(1, Math.floor(SEARCH_SCAN / (targets.length || 1)));
         const hits = [];
-        let scanned = 0;
+        let partial = false;
         for (const c of targets) {
-          if (hits.length >= SEARCH_HITS || scanned >= SEARCH_SCAN) break;
-          const rows = await storage.list({ prefix: `msg:${c.id}:`, reverse: true, limit: SEARCH_SCAN - scanned });
+          if (hits.length >= SEARCH_HITS) break;
+          const rows = await storage.list({ prefix: `msg:${c.id}:`, reverse: true, limit: budget });
           for (const msg of rows.values()) {
-            scanned++;
             if (msg.content.toLowerCase().includes(q)) {
               hits.push({ ...msg, chanName: c.name });
               if (hits.length >= SEARCH_HITS) break;
             }
           }
+          // Either we stopped at this channel's share, or the channel is full
+          // and the rest of it is in the archive, which search does not read.
+          if (rows.size >= Math.min(budget, MSG_CAP)) partial = true;
         }
-        ws.send(JSON.stringify({ type: "search-results", q: m.q, chanId: scope, hits, truncated: hits.length >= SEARCH_HITS }));
+        ws.send(
+          JSON.stringify({
+            type: "search-results",
+            q: m.q,
+            chanId: scope,
+            hits,
+            truncated: hits.length >= SEARCH_HITS || partial,
+          })
+        );
         break;
       }
 
@@ -968,7 +1290,12 @@ export class ConcordServer {
         const type = m.chanType === "voice" ? "voice" : "text";
         if (!name) return;
         const channels = (await storage.get("channels")) || [];
-        if (channels.length >= CHANNEL_CAP) return;
+        // Threads share this budget, so hitting the ceiling is realistic now and
+        // a button that just stops working is the worst way to find out.
+        if (channels.length >= CHANNEL_CAP) {
+          ws.send(JSON.stringify({ type: "error", error: `${CHANNEL_CAP} channels is the ceiling. Delete something.` }));
+          return;
+        }
         const nextChanId = ((await storage.get("nextChanId")) || 100) + 1;
         const chan = { id: `c${nextChanId}`, type, name };
         if (type === "text") chan.topic = cleanText(m.topic, 100);
@@ -1010,12 +1337,26 @@ export class ConcordServer {
         // by nature, so the floor never applies to them.
         if (chan.type !== "thread" && channels.filter((c) => c.type === chan.type).length <= 1) return;
         // A thread without its parent is just an orphan nobody can reach.
-        const doomed = [chan.id, ...channels.filter((c) => c.parent === chan.id).map((c) => c.id)];
+        const dying = [chan, ...channels.filter((c) => c.parent === chan.id)];
+        const doomed = dying.map((c) => c.id);
         channels = channels.filter((c) => !doomed.includes(c.id));
         await storage.put("channels", channels);
+        // A thread's chip lives on the message it grew from. Leave it behind and
+        // the client renders a link into a channel that no longer exists, where
+        // everything typed is silently dropped.
+        for (const t of dying) {
+          if (t.type !== "thread" || !t.parent || doomed.includes(t.parent)) continue;
+          const rootKey = msgKey(t.parent, Number(t.rootId));
+          const root = await storage.get(rootKey);
+          if (!root || root.threadId !== t.id) continue;
+          delete root.threadId;
+          await storage.put(rootKey, root);
+          this.broadcast({ type: "msg-thread", chanId: t.parent, msgId: root.id, threadId: null, name: "" });
+        }
         for (const id of doomed) {
           const rows = await storage.list({ prefix: `msg:${id}:` });
           await this.dropMessageFiles([...rows.values()]);
+          await this.archivePurge(id);
           await storage.delete([...rows.keys(), `chanseq:${id}`, `pins:${id}`]);
           this.broadcast({ type: "channel-delete", chanId: id });
         }
@@ -1077,37 +1418,45 @@ export class ConcordServer {
       // over HTTP. The DO picks the key; the client never gets to name it.
       case "upload-ticket": {
         if (!s.joined) return;
+        // Every refusal on this path is tagged `for: "upload-ticket"` and echoes
+        // the nonce. Without that, the client can't tell "your files were
+        // refused" from an unrelated error thrown anywhere else in dispatch, so
+        // one stray failure aborted the batch and stranded up to ten tickets in
+        // storage for their whole five-minute TTL.
+        const nonce = cleanText(m.nonce, 64) || undefined;
+        const refuse = (error) =>
+          ws.send(JSON.stringify({ type: "error", error, for: "upload-ticket", nonce }));
         if (!this.env.FILES) {
-          ws.send(JSON.stringify({ type: "error", error: "Uploads aren't switched on here." }));
+          refuse("Uploads aren't switched on here.");
           return;
         }
         const files = Array.isArray(m.files) ? m.files : [];
         if (!files.length || files.length > MAX_FILES_PER_MSG) {
-          ws.send(JSON.stringify({ type: "error", error: `${MAX_FILES_PER_MSG} files at a time, tops.` }));
+          refuse(`${MAX_FILES_PER_MSG} files at a time, tops.`);
           return;
         }
         for (const f of files) {
           const size = Number(f?.size);
           if (!Number.isFinite(size) || size <= 0 || size > MAX_FILE_BYTES) {
-            ws.send(JSON.stringify({ type: "error", error: "Files cap out at 25 MB." }));
+            refuse("Files cap out at 25 MB.");
             return;
           }
         }
         const now = Date.now();
-        if (!this.uploadBudget(s.userId, files.length, now)) {
-          ws.send(JSON.stringify({ type: "error", error: "That's a lot of uploading. Give it ten minutes." }));
+        if (!(await this.uploadBudget(s.userId, files.length, now))) {
+          refuse("That's a lot of uploading. Give it ten minutes.");
           return;
         }
         const pending = await storage.list({ prefix: "tkt:" });
         let mine = 0;
         for (const t of pending.values()) if (t?.userId === s.userId && t.exp > now) mine++;
         if (mine + files.length > MAX_PENDING_TICKETS) {
-          ws.send(JSON.stringify({ type: "error", error: "Finish the uploads you already started." }));
+          refuse("Finish the uploads you already started.");
           return;
         }
         const code = this.code || (await storage.get("code")) || "";
         if (!CODE_RE.test(code)) {
-          ws.send(JSON.stringify({ type: "error", error: "This server can't take uploads yet. Reconnect." }));
+          refuse("This server can't take uploads yet. Reconnect.");
           return;
         }
         const writes = {};
@@ -1118,14 +1467,21 @@ export class ConcordServer {
           writes[`tkt:${id}`] = {
             key,
             mime: safeMime(f?.mime),
-            max: MAX_FILE_BYTES,
+            // The size the client declared is what it may actually spend. It was
+            // MAX_FILE_BYTES here, which made the declaration decorative — you
+            // could announce 10 bytes and upload 25 MB. The wire still quotes
+            // the protocol ceiling, because that's the number a client needs to
+            // know before it picks a file.
+            max: clampInt(f?.size, 1, MAX_FILE_BYTES),
             userId: s.userId,
             exp: now + TICKET_TTL_MS,
           };
           tickets.push({ id, key, max: MAX_FILE_BYTES });
         }
         await storage.put(writes);
-        ws.send(JSON.stringify({ type: "upload-tickets", tickets }));
+        // The nonce pairs this reply with the batch that asked for it; two
+        // overlapping batches otherwise zip filenames against the wrong tickets.
+        ws.send(JSON.stringify({ type: "upload-tickets", tickets, nonce }));
         break;
       }
 
@@ -2079,7 +2435,32 @@ function publicMember(s) {
 
 function cleanText(v, max) {
   if (typeof v !== "string") return "";
-  return v.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").slice(0, max).trim();
+  const stripped = v.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  return clip(stripped, max).trim();
+}
+
+// Truncates by code point, not by UTF-16 code unit, so a cut never lands in the
+// middle of an emoji and leaves a lone surrogate behind — which, for the stored
+// reply quote, meant a permanent replacement character in durable storage. It
+// does mean every `max` in this file now counts characters rather than code
+// units: a slightly more generous cap, and the more correct one. The limits
+// didn't drift, the unit did.
+function clip(v, max) {
+  if (typeof v !== "string") return "";
+  return v.length > max ? [...v].slice(0, max).join("") : v;
+}
+
+// One archive object is one message per line. A line that won't parse gets
+// dropped: most of an archive beats none of it.
+function parseJsonl(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {}
+  }
+  return out;
 }
 
 function cleanChannelName(v) {
