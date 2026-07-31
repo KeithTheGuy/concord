@@ -21,6 +21,7 @@
     "uploads": "node test/uploads.mjs",
     "roster": "node test/roster.mjs",
     "threads": "node test/threads.mjs",
+    "render": "node test/render.mjs",
     "test": "node test/run-all.mjs"
   },
   "devDependencies": {

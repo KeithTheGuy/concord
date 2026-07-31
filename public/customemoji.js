@@ -5,8 +5,17 @@
 // user sees gets the picture. Keyed by server code because two servers can
 // both mint a ":blobcat:" and they are not the same file.
 
+// Control characters are stripped, not escaped, and U+0000 is the reason.
+// This substitution runs while renderMarkdown still has its \u0000N\u0000
+// placeholders parked in the string, and its final pass rewrites the whole
+// string — attributes included. So a URL carrying a forged sentinel would get
+// a code block or an <a href> spliced into the middle of a src attribute,
+// terminating the tag early. Escaping & < > " ' cannot help, because the
+// sentinel is none of them.
 const esc = (s) =>
-  s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  String(s)
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 export function nameOk(name) {
   return typeof name === "string" && /^[a-z0-9_]{2,20}$/.test(name);
