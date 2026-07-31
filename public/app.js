@@ -299,6 +299,12 @@ function makeRealm(code, kind) {
     ringNotif: null, // …and its OS notification, for the same reason
     ringSig: null, // what the toast currently says, so it only repaints on news
     ringHushed: false,
+    wokenAt: 0, // when the hub's call wake-up opened this, if that's why it's here
+    // Channels whose "new messages" line you put there on purpose. The
+    // automatic one clears the moment you leave the channel; a deliberate one
+    // has to survive that, or Mark As Unread would only last until you looked
+    // away.
+    markedUnread: new Set(),
     replyTo: null,
     editingId: null,
     pendingByNonce: new Map(),
@@ -561,8 +567,10 @@ const voiceUiHooks = {
   qualityEl: () => $("vs-quality"),
   // app.js owns the modal, so the voice panel's gear has to borrow it. Without
   // this the gear isn't drawn at all, which is the right failure — a dead
-  // button is worse than a missing one.
-  openSettings: () => openSettings(),
+  // button is worse than a missing one. Straight to the Voice section: that
+  // gear is on the voice panel, and somebody pressing it has already told you
+  // what they came for.
+  openSettings: () => openSettings("voice"),
 };
 installVoiceUI(voiceUiHooks);
 
@@ -674,6 +682,13 @@ const hub = new HubConnection({
     document.body.classList.add("poked");
     setTimeout(() => document.body.classList.remove("poked"), 700);
   },
+  onCallRing(key, info) {
+    wakeForCall(key, info);
+  },
+  // Deliberately empty. The conversation's own membership update is what takes
+  // a ring down, and anything here would be a second, weaker opinion about the
+  // same fact — one that could disagree with what's on screen.
+  onCallEnd() {},
 });
 
 // Your name/avatar/colour should change everywhere at once, not just in the
@@ -722,11 +737,22 @@ function openRealm(code, kind, intent) {
   return realm;
 }
 
+// A conversation woken by the hub has no ring node yet — it has no membership
+// yet either — so for this long it is exempt on the strength of having been
+// woken at all. Without it, opening two more DMs inside the handshake evicts
+// the wake and the call never rings.
+const WAKE_GRACE_MS = 5000;
+
 function evictStaleDms() {
   // A conversation that is ringing at you is exempt: quietly hanging up the
   // socket to make room would drop the call you were about to answer.
   const dms = [...state.realms.values()].filter(
-    (r) => isDirect(r) && r.code !== state.activeCode && r.code !== state.voiceCode && !r.ringNode
+    (r) =>
+      isDirect(r) &&
+      r.code !== state.activeCode &&
+      r.code !== state.voiceCode &&
+      !r.ringNode &&
+      !(r.wokenAt && Date.now() - r.wokenAt < WAKE_GRACE_MS)
   );
   if (dms.length <= MAX_DM_REALMS) return;
   dms.sort((a, b) => a.touched - b.touched);
@@ -1158,6 +1184,7 @@ function handleServerMessage(realm, m) {
         if (refill) noteMissed(realm, m.chanId, m.messages.filter((x) => !had.has(x.id)));
       }
       if (live && m.chanId === realm.activeChan) renderMessages(!m.before, realm, !!m.before);
+      if (!m.before) takeJump(realm, m.chanId);
       break;
     }
 
@@ -1490,9 +1517,9 @@ function notifyIfNeeded(realm, msg) {
     renderServerRail();
   }
 
-  // A muted server still counts unread — it just doesn't make a sound or
-  // throw a notification at you.
-  if (state.settings.muted?.[realm.code]) {
+  // A muted server — or a muted channel of one — still counts unread. It just
+  // doesn't make a sound or throw a notification at you.
+  if (mutedFor(realm.code, msg.chanId)) {
     updateTitle();
     return;
   }
@@ -1533,7 +1560,7 @@ function noteMissed(realm, chanId, missed) {
   renderServerRail();
   renderDmList();
   updateTitle();
-  if (!state.settings.muted?.[realm.code] && state.settings.sounds) {
+  if (!mutedFor(realm.code, chanId) && state.settings.sounds) {
     voice.playCue(mentioned ? "mention" : "ping");
   }
 }
@@ -2418,16 +2445,33 @@ function renderServerRail() {
   }
 }
 
-// Muting is per server and purely local — it silences pings without telling
-// anyone or leaving anything.
-function setServerMuted(code, muted) {
+// Muting is purely local — it silences pings without telling anyone or leaving
+// anything. One map holds both scopes: a bare `code` is the whole server,
+// `code/chanId` is one channel of it. A muted server covers its channels
+// already, so the channel key is only ever the finer of the two.
+const muteKey = (code, chanId) => `${code}/${chanId}`;
+const mutedFor = (code, chanId) =>
+  !!state.settings.muted?.[code] || (!!chanId && !!state.settings.muted?.[muteKey(code, chanId)]);
+
+function setMuted(key, muted) {
   const all = { ...(state.settings.muted || {}) };
-  if (muted) all[code] = true;
-  else delete all[code];
+  if (muted) all[key] = true;
+  else delete all[key];
   state.settings.muted = all;
   store.set("settings", state.settings);
+}
+
+function setServerMuted(code, muted) {
+  setMuted(code, muted);
   renderServerRail();
   const name = state.servers.find((s) => s.code === code)?.name || "Server";
+  toast(muted ? `🔕 ${name} muted — still unread, just quiet.` : `🔔 ${name} unmuted.`);
+}
+
+function setChannelMuted(code, c, muted) {
+  setMuted(muteKey(code, c.id), muted);
+  renderChannels();
+  const name = (c.type === "text" ? "#" : "") + c.name;
   toast(muted ? `🔕 ${name} muted — still unread, just quiet.` : `🔔 ${name} unmuted.`);
 }
 
@@ -2555,6 +2599,16 @@ function appendChanRow(wrap, c, threadsOf, folded) {
     channelMenu(e, c);
   };
   row.appendChild(gear);
+  // The gear is a 14px target you have to hover the row to find at all. Every
+  // other list in the app answers a right-click, and this one didn't.
+  row.oncontextmenu = (e) => {
+    e.preventDefault();
+    channelMenu(e, c);
+  };
+  if (state.settings.muted?.[muteKey(state.currentCode, c.id)]) {
+    row.classList.add("muted");
+    row.appendChild(el("span", "chan-mute", "🔕"));
+  }
   wrap.appendChild(row);
 
   for (const t of threadsOf.get(c.id) || []) {
@@ -2623,6 +2677,10 @@ function threadRow(t) {
     channelMenu(e, t);
   };
   row.appendChild(gear);
+  row.oncontextmenu = (e) => {
+    e.preventDefault();
+    channelMenu(e, t);
+  };
   return row;
 }
 
@@ -2631,8 +2689,31 @@ const slowLabel = (seconds) =>
 
 const chanTypeOf = (chanId) => state.channels.find((c) => c.id === chanId)?.type || "text";
 
+// Clears one channel rather than the whole server, which is what the rail's
+// Mark As Read already does. The deliberate marker goes too — you have just
+// said you're done with this one.
+function markChannelRead(chanId) {
+  const realm = R();
+  if (!realm) return;
+  realm.unread.delete(chanId);
+  realm.firstUnread.delete(chanId);
+  realm.markedUnread.delete(chanId);
+  if (!realm.unread.size) realm.mentions = 0;
+  renderChannels();
+  renderServerRail();
+  if (chanId === realm.activeChan) renderMessages();
+  updateTitle();
+}
+
 function channelMenu(e, c) {
+  const code = state.currentCode;
+  const isMuted = !!state.settings.muted?.[muteKey(code, c.id)];
   const items = [
+    { label: "Mark As Read", onClick: () => markChannelRead(c.id) },
+    {
+      label: isMuted ? "🔔 Unmute Channel" : "🔕 Mute Channel",
+      onClick: () => setChannelMuted(code, c, !isMuted),
+    },
     {
       label: "Rename Channel",
       onClick: () =>
@@ -3207,6 +3288,19 @@ function buildMsgNode(msg, realm = R()) {
     return node;
   }
 
+  // Everything the hover toolbar offers, minus the hovering. The toolbar is
+  // eight unlabelled glyphs that only exist while the pointer is on the right
+  // row; a right-click is where anyone raised on Discord looks first. Links,
+  // images and video keep the browser's own menu, because "Save image as…" is
+  // the one thing this can't offer.
+  if (!msg.pending) {
+    node.oncontextmenu = (e) => {
+      if (e.target.closest("a, img, video")) return;
+      e.preventDefault();
+      msgMenu(e, msg, realm);
+    };
+  }
+
   // Polls render as their own widget; the reactions underneath ARE the votes.
   const poll = parsePoll(msg.content);
   if (poll) {
@@ -3302,6 +3396,88 @@ function finishMsgNode(node, msg, realm) {
   if (!realm || !msg.nonce) return;
   const row = buildOutboxRow(realm, msg.nonce, outboxEntries(realm.code).get(msg.nonce));
   if (row) node.appendChild(row);
+}
+
+/* --------------------------- the message menu ---------------------------- */
+
+// A shareable anchor for one message. `join` is the invite code the rest of the
+// app already deals in, so following one gets whoever you sent it to into the
+// server first if they weren't in it — which is most of what makes a link worth
+// pasting. A DM code is nobody else's to open, so those don't get one.
+const linkable = (realm) => !!realm && !isDirect(realm);
+
+function messageLink(realm, msg) {
+  return `${location.origin}/?join=${realm.code}&c=${encodeURIComponent(msg.chanId)}&m=${encodeURIComponent(msg.id)}`;
+}
+
+// Four ways to mark something read and none to put it back was a strange place
+// for the app to have settled. Everything from this message down is unread
+// again, and the NEW MESSAGES line lands on it — which is the part you'll
+// actually navigate by when you come back.
+function markUnreadFrom(realm, msg) {
+  const list = realm.messages.get(msg.chanId) || NO_ARR;
+  const at = list.findIndex((x) => x.id === msg.id);
+  if (at < 0) {
+    toast("That one has scrolled out of what's loaded — try a message further down.", true);
+    return;
+  }
+  realm.unread.set(msg.chanId, list.length - at);
+  realm.firstUnread.set(msg.chanId, msg.id);
+  realm.markedUnread.add(msg.chanId);
+  renderChannels();
+  renderServerRail();
+  renderMessages(false, realm);
+  updateTitle();
+  toast("Marked unread from here down.");
+}
+
+function msgMenu(e, msg, realm) {
+  const mine = msg.author.userId === realmUserId(realm);
+  const items = [
+    { label: "↩ Reply", onClick: () => setReply(msg) },
+    // A tick later for the same reason the slowmode picker needs one: the
+    // click that chose this is still on its way to the handler that closes
+    // anything the document isn't focused on.
+    {
+      label: "😀 Add Reaction…",
+      onClick: () => setTimeout(() => openEmojiPicker({ mode: "react", msg }), 0),
+    },
+    {
+      label: msg.pinned ? "📌 Unpin" : "📌 Pin",
+      onClick: () => wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id }),
+    },
+    { label: "🔖 Save Message", onClick: () => saveMessage(msg) },
+    { label: "📋 Copy Text", onClick: () => copyText(msg.content, "Message copied") },
+  ];
+  if (linkable(realm)) {
+    items.push({
+      label: "🔗 Copy Message Link",
+      onClick: () => copyText(messageLink(realm, msg), "Link copied — it opens right on this message."),
+    });
+  }
+  items.push({ label: "📩 Mark As Unread", onClick: () => markUnreadFrom(realm, msg) });
+  if (mine) {
+    items.push({
+      label: "✏ Edit Message",
+      onClick: () => {
+        state.editingId = msg.id;
+        renderMessages();
+      },
+    });
+  }
+  // The owner can clear up after anyone; the server checks it again anyway,
+  // so this is only about not offering a button that would bounce.
+  if (mine || isOwnerOf(realm, realmUserId(realm))) {
+    items.push({
+      label: "🗑 Delete Message",
+      danger: true,
+      onClick: () =>
+        confirmModal("Delete message?", "It'll be gone for everyone. Forever. Wow.", () =>
+          wsSend({ type: "delete", chanId: msg.chanId, msgId: msg.id })
+        ),
+    });
+  }
+  ctxMenu(e.clientX, e.clientY, items);
 }
 
 // The hover toolbar on a message.
@@ -3490,10 +3666,17 @@ function activateChannel(chanId) {
   // restoreDraft is about to overwrite the box either way.
   if (realm.activeChan) stashDraft();
   // The "new messages" line survives while you're reading the channel, and
-  // clears once you leave it — otherwise it vanishes before you can see it.
-  if (realm.activeChan && realm.activeChan !== chanId) realm.firstUnread.delete(realm.activeChan);
+  // clears once you leave it — otherwise it vanishes before you can see it. A
+  // line you put there yourself is the exception: it has to still be there
+  // when you come back, which is the entire point of marking it.
+  if (realm.activeChan && realm.activeChan !== chanId && !realm.markedUnread.has(realm.activeChan)) {
+    realm.firstUnread.delete(realm.activeChan);
+  }
   realm.activeChan = chanId;
   closeNav();
+  // Coming back is reading it, so the line shows for this visit and then goes
+  // the ordinary way.
+  realm.markedUnread.delete(chanId);
   realm.unread.delete(chanId);
   if (!realm.unread.size) realm.mentions = 0;
   renderServerRail();
@@ -3704,7 +3887,7 @@ function syncRing(realm) {
     // Ignore is safe: it silences this call, not every call they'll ever make.
     realm.ringHushed = false;
     stopRing(realm);
-  } else if (call.mine || realm.ringHushed || state.settings.muted?.[realm.code]) {
+  } else if (call.mine || realm.ringHushed || mutedFor(realm.code, call.chan.id)) {
     stopRing(realm);
   } else if (!realm.ringNode) {
     startRing(realm, call);
@@ -3714,6 +3897,26 @@ function syncRing(realm) {
   renderDmList();
   renderHomeBadge(); // ends in updateTitle(), which flies the 📞 flag
   renderCallButton();
+}
+
+// The hub's wake-up frame, spent. A DM you haven't opened this session has no
+// socket, so there is no membership to derive a ring from — all this does is
+// open one and get out of the way. It deliberately isn't openDm(): that would
+// yank your view somewhere you didn't ask to go and mark the conversation read
+// on the way past.
+function wakeForCall(key, { isGroup }) {
+  const code = isGroup ? hub.groups.get(key)?.code : hub.dmCodes.get(key);
+  if (!code) return; // legacy friendship minted before DM codes
+  if (state.realms.has(code)) return; // already connected — syncRing has it
+  const realm = openRealm(
+    code,
+    isGroup ? "group" : "dm",
+    isGroup ? { kind: "dm", code, gdm: key } : { kind: "dm", code, uid: key }
+  );
+  // The ring toast reads these for the name and the avatar.
+  if (isGroup) realm.group = hub.groups.get(key);
+  else realm.peer = hub.friends.get(key);
+  realm.wokenAt = Date.now();
 }
 
 function startRing(realm, call) {
@@ -3893,6 +4096,10 @@ function joinVoice(chanId) {
 async function joinVoiceIn(realm, chanId) {
   if (state.voiceCode === realm.code && state.voiceChan === chanId) return;
   if (state.voiceCode) leaveVoice({ silent: true });
+  // Read before the join, because joining is what makes it live. Walking into
+  // a call that was already going is answering it, not starting it, and
+  // ringing there would go off at people who have already decided.
+  const wasLive = !!callIn(realm);
   try {
     await voice.join(chanId);
   } catch {
@@ -3901,6 +4108,7 @@ async function joinVoiceIn(realm, chanId) {
   state.voiceCode = realm.code;
   state.voiceChan = chanId;
   realm.send({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
+  if (isDirect(realm) && !wasLive) ringOut(realm, chanId);
   syncRing(realm); // answering is one of the three ways a ring stops
   renderVoicePanel();
   renderChannels();
@@ -3909,10 +4117,21 @@ async function joinVoiceIn(realm, chanId) {
   startQualityMeter(voiceUiHooks);
 }
 
+// Which conversation a direct realm is, in the hub's namespace.
+const convKey = (realm) => (realm?.kind === "group" ? realm.group?.id : realm?.peer?.uid) || null;
+
+function ringOut(realm, chanId) {
+  const key = convKey(realm);
+  if (key) hub.ringCall(key, chanId, realm.kind === "group");
+}
+
 function leaveVoice({ silent } = {}) {
   stopQualityMeter();
   if (!state.voiceCode) return;
   const realm = voiceRealm();
+  // Only the last one out retracts it. Anybody else leaving a call that is
+  // still going would take down a ring for people who are still in it.
+  const lastOut = isDirect(realm) && (callIn(realm)?.people.length || 0) <= 1;
   state.voiceCode = null;
   state.voiceChan = null;
   voice.leave({ silent });
@@ -3920,6 +4139,10 @@ function leaveVoice({ silent } = {}) {
   // Hanging up hushes this call for you. Without it, the people still sitting
   // in it ring you back the instant you walk out, which reads as a bug.
   if (realm && isDirect(realm)) realm.ringHushed = true;
+  if (lastOut) {
+    const key = convKey(realm);
+    if (key) hub.endCall(key, realm.kind === "group");
+  }
   $("voice-status").classList.add("hidden");
   $("btn-share").classList.remove("on");
   $("btn-camera").classList.remove("on");
@@ -4221,12 +4444,18 @@ $("add-server-btn").onclick = openJoinModal;
 function pruneServerData(code, realm) {
   for (const chanId of drafts.chansWithDrafts(code)) drafts.clear(code, chanId);
 
-  const muted = { ...(state.settings.muted || {}) };
-  delete muted[code];
+  const prefix = code + "/";
+
+  // Both scopes: the server's own key, and one per channel of it that was
+  // muted individually. A channel key nobody can ever see again is exactly the
+  // dead weight this function exists to sweep up.
+  const muted = {};
+  for (const [key, on] of Object.entries(state.settings.muted || {})) {
+    if (key !== code && !key.startsWith(prefix)) muted[key] = on;
+  }
   state.settings.muted = muted;
 
   const collapsed = {};
-  const prefix = code + "/";
   for (const [key, on] of Object.entries(state.settings.collapsed || {})) {
     if (!key.startsWith(prefix)) collapsed[key] = on;
   }
@@ -4355,8 +4584,27 @@ $("btn-more").onclick = (e) => {
 
 /* ------------------------------- settings ------------------------------- */
 
-function openSettings() {
+// Which pane is showing. Not persisted: Settings is somewhere you go for one
+// thing, and reopening it on wherever you last were is how you lose the thing
+// you actually came back for.
+function showSettingsSection(id) {
+  const modal = $("settings-modal");
+  for (const b of modal.querySelectorAll("#set-nav button")) {
+    b.classList.toggle("active", b.dataset.sec === id);
+  }
+  for (const pane of modal.querySelectorAll(".set-pane")) {
+    pane.classList.toggle("active", pane.dataset.sec === id);
+  }
+  modal.scrollTop = 0;
+}
+
+for (const b of $("set-nav").querySelectorAll("button")) {
+  b.onclick = () => showSettingsSection(b.dataset.sec);
+}
+
+function openSettings(section = "profile") {
   showModal("settings-modal");
+  showSettingsSection(section);
   $("set-name").value = state.profile.name;
   $("set-status").value = state.profile.status || "";
   pickerRow($("set-avatars"), AVATARS, state.profile.avatar, (v) => (state.profile.avatar = v));
@@ -4466,7 +4714,7 @@ function openRestoreInput() {
 // actually lost their storage that is the onboarding screen, not Settings.
 function backFromRestore() {
   closeModals();
-  if (state.profile) openSettings();
+  if (state.profile) openSettings("backup");
   else openOnboard();
 }
 
@@ -4656,7 +4904,7 @@ async function populateMics() {
   }
 }
 
-$("btn-settings").onclick = openSettings;
+$("btn-settings").onclick = () => openSettings();
 $("set-done").onclick = () => {
   state.profile.name = $("set-name").value.trim() || state.profile.name;
   state.profile.status = $("set-status").value.trim();
@@ -5566,6 +5814,22 @@ function jumpToSaved(item) {
   }, 400);
 }
 
+// A message link somebody followed, waiting for that channel's first history
+// response. Kept here rather than on the realm because it is spent the moment
+// it lands — a link you already followed must not fire again when you scroll
+// back for older messages.
+let pendingJump = null; // {code, chanId, msgId}
+
+function takeJump(realm, chanId) {
+  if (!pendingJump || pendingJump.code !== realm.code || pendingJump.chanId !== chanId) return;
+  const { msgId } = pendingJump;
+  pendingJump = null;
+  // The server keeps the last 300 messages per channel, so a link can outlive
+  // what it points at. You still end up in the right room.
+  if (document.querySelector(`.msg[data-id="${CSS.escape(msgId)}"]`)) jumpToMessage(msgId);
+  else toast("That message has aged out of the server's memory — this is the channel it was in.", true);
+}
+
 function jumpToMessage(id) {
   const target = document.querySelector(`.msg[data-id="${id}"]`);
   if (!target) {
@@ -6275,7 +6539,16 @@ function afterProfileReady() {
   if (joinCode && /^[A-Z0-9]{4,12}$/.test(joinCode)) {
     history.replaceState(null, "", location.pathname);
     splashSay("joining the server…");
-    openRealm(joinCode, "guild", { kind: "join", code: joinCode });
+    const realm = openRealm(joinCode, "guild", { kind: "join", code: joinCode });
+    // A message link is an invite with an address on it. Naming the channel
+    // here is what makes `welcome` open that one instead of the first text
+    // channel; the jump itself waits for its history to arrive.
+    const chanId = params.get("c");
+    const msgId = params.get("m");
+    if (chanId && msgId) {
+      realm.activeChan = chanId;
+      pendingJump = { code: joinCode, chanId, msgId };
+    }
     state.activeCode = joinCode;
     state.view = "server";
     renderAll();

@@ -6080,3 +6080,156 @@ body.turbo #composer:focus-within {
   font-size: 14px;
   line-height: 1.4;
 }
+
+/* -------------------------------------------------------------------------
+   Settings navigation
+
+   Settings was 1643px of content in an 810px modal, laid out in two columns
+   with nothing to steer by. Everything the audio work added — the noise gate
+   and its live meter, the output device, the test tone, share quality, stereo
+   — sat below the fold of the *second* column, which is a place you only
+   reach by already knowing it's there. One section at a time, chosen from a
+   list, is the whole fix.
+   ------------------------------------------------------------------------- */
+
+.settings-body {
+  display: grid;
+  grid-template-columns: 176px minmax(0, 1fr);
+  gap: var(--sp-5);
+  margin-top: var(--sp-3);
+}
+
+.set-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-self: start;
+  /* The panes are the tall thing; the nav should still be there when you get
+     to the bottom of one. */
+  position: sticky;
+  top: 0;
+}
+
+.set-nav button {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) 10px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.set-nav button:hover {
+  background: var(--tint);
+  color: var(--text);
+}
+
+.set-nav button.active {
+  background: var(--bg-active);
+  color: var(--text-header);
+}
+
+.set-panes {
+  min-width: 0;
+}
+
+.set-pane {
+  display: none;
+}
+
+.set-pane.active {
+  display: block;
+}
+
+/* Two sections in one pane (Appearance carries Server Emoji) need a rule
+   between them, or the second heading reads as part of the first. */
+.set-pane section + section {
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--line-soft);
+}
+
+/* The first heading in a pane sits directly under the nav it was chosen from,
+   so the usual top margin is a gap between a label and its own answer. */
+.set-pane section:first-child > h2:first-child {
+  margin-top: 0;
+}
+
+/* Under the mobile breakpoint the modal is a full-screen sheet, so a 176px
+   column would eat half of a 390px phone. The nav becomes a strip you swipe
+   instead — pinned to the top of the sheet, because the sheet is what
+   scrolls. */
+@media (max-width: 760px) {
+  .settings-body {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-3);
+  }
+
+  .set-nav {
+    flex-direction: row;
+    gap: var(--sp-1);
+    overflow-x: auto;
+    overflow-y: hidden;
+    /* Not decoration: without it the strip scrolls away with the page and
+       switching sections means scrolling back up to find the nav. */
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: var(--sp-2) 0;
+    background: var(--bg-chat);
+    scrollbar-width: none;
+  }
+
+  .set-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .set-nav button {
+    width: auto;
+    flex: 0 0 auto;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-pill);
+    padding: var(--sp-2) var(--sp-3);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .set-nav button {
+    transition: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   A muted channel
+
+   `settings.muted` used to be keyed by server code alone, so one loud channel
+   meant silencing the whole server. The row has to say so, or an unread badge
+   that never made a sound reads as a bug rather than as the thing you asked
+   for.
+   ------------------------------------------------------------------------- */
+
+.chan-row.muted .chan-label {
+  opacity: 0.55;
+}
+
+.chan-mute {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+/* The gear slides in over the right-hand end on hover, and a 🔕 sitting there
+   is one glyph of clutter between you and it. */
+.chan-row:hover .chan-mute {
+  display: none;
+}

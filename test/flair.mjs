@@ -127,6 +127,8 @@ try {
 
   /* ------------------------------- turbo -------------------------------- */
   await a.page.click("#btn-settings");
+  // Settings shows one section at a time now, and turbo lives under Appearance.
+  await a.page.click('#set-nav button:has-text("Appearance")');
   await a.page.check("#set-turbo");
   await a.page.waitForTimeout(200);
   if (!(await a.page.locator("body.turbo").count())) bad("turbo mode switches on");
@@ -177,6 +179,7 @@ try {
   else ok("running a poll unlocks Pollster");
 
   await a.page.click("#btn-settings");
+  await a.page.click('#set-nav button:has-text("Appearance")');
   await a.page.click("#set-achievements");
   await a.page.waitForSelector("#achievements-modal:not(.hidden)");
   const achRows = await a.page.locator("#ach-list .friend-row").count();

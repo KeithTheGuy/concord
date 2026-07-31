@@ -273,114 +273,149 @@
   <!-- settings -->
   <div class="modal hidden" id="settings-modal">
     <h1>Settings</h1>
-    <div class="settings-grid">
-      <section>
-        <h2>Profile</h2>
-        <label>Display name</label>
-        <input id="set-name" maxlength="32">
-        <label>Friend tag <span class="hint">— this is how people add you</span></label>
-        <div class="tag-row">
-          <span class="tag-at">@</span>
-          <input id="set-tag" maxlength="20" placeholder="keith" autocomplete="off">
-          <button id="set-tag-save" class="pill-btn">Save</button>
+    <!-- One column at a time, chosen from the nav. Two columns of everything
+         put the noise gate, the output device and the share quality 1600px
+         down a modal 810px tall, where nobody had any reason to believe they
+         existed. voiceui.js appends its own controls to whichever section
+         holds #set-mic, so that one has to stay a <section>. -->
+    <div class="settings-body">
+      <nav class="set-nav" id="set-nav" aria-label="Settings sections">
+        <button data-sec="profile" class="active">🙂 Profile</button>
+        <button data-sec="voice">🎙️ Voice &amp; Video</button>
+        <button data-sec="notifs">🔔 Notifications</button>
+        <button data-sec="look">🎨 Appearance</button>
+        <button data-sec="backup">💾 Backup</button>
+      </nav>
+      <div class="set-panes">
+        <div class="set-pane active" data-sec="profile">
+          <section>
+            <h2>Profile</h2>
+            <label>Display name</label>
+            <input id="set-name" maxlength="32">
+            <label>Friend tag <span class="hint">— this is how people add you</span></label>
+            <div class="tag-row">
+              <span class="tag-at">@</span>
+              <input id="set-tag" maxlength="20" placeholder="keith" autocomplete="off">
+              <button id="set-tag-save" class="pill-btn">Save</button>
+            </div>
+            <label>Avatar</label>
+            <div id="set-avatars" class="emoji-row"></div>
+            <label>Color</label>
+            <div id="set-colors" class="color-row"></div>
+            <label>Custom status</label>
+            <input id="set-status" maxlength="60" placeholder="playing Sea of Thieves">
+            <label>Presence</label>
+            <select id="set-presence">
+              <option value="online">🟢 Online</option>
+              <option value="idle">🌙 Idle</option>
+              <option value="dnd">⛔ Do Not Disturb</option>
+              <option value="invisible">⚫ Invisible</option>
+            </select>
+            <label class="check-row"><input type="checkbox" id="set-autoidle" checked> Go idle after 6 minutes away</label>
+          </section>
         </div>
-        <label>Avatar</label>
-        <div id="set-avatars" class="emoji-row"></div>
-        <label>Color</label>
-        <div id="set-colors" class="color-row"></div>
-        <label>Custom status</label>
-        <input id="set-status" maxlength="60" placeholder="playing Sea of Thieves">
-        <label>Presence</label>
-        <select id="set-presence">
-          <option value="online">🟢 Online</option>
-          <option value="idle">🌙 Idle</option>
-          <option value="dnd">⛔ Do Not Disturb</option>
-          <option value="invisible">⚫ Invisible</option>
-        </select>
-        <h2>Appearance</h2>
-        <label>Theme</label>
-        <select id="set-theme">
-          <option value="midnight">🌑 Midnight (default)</option>
-          <option value="synthwave">🌆 Synthwave</option>
-          <option value="vapor">🫧 Vaporwave</option>
-          <option value="nord">🧊 Nord</option>
-          <option value="matrix">🖥️ Matrix</option>
-          <option value="gold">🏆 Gold</option>
-          <option value="blossom">🌸 Blossom</option>
-        </select>
-        <label class="check-row"><input type="checkbox" id="set-turbo"> ⚡ TURBO MODE (aurora, glow, animations)</label>
-        <label>Your progress</label>
-        <div id="level-row">
-          <span class="level-badge" id="level-badge">1</span>
-          <span id="level-text">0 XP</span>
-        </div>
-        <div id="xp-bar"><div id="xp-fill" style="width:0%"></div></div>
-        <button id="set-achievements" class="pill-btn">🏅 Achievements</button>
-      </section>
-      <section>
-        <h2>Voice</h2>
-        <label>Input device</label>
-        <select id="set-mic"></select>
-        <label>Voice changer</label>
-        <select id="set-fx"></select>
-        <p class="fx-blurb" id="set-fx-blurb"></p>
-        <label>Pitch <span id="set-fx-label">+0</span> semitones</label>
-        <input type="range" id="set-fx-pitch" min="-12" max="12" step="1" value="0">
-        <label class="check-row"><input type="checkbox" id="set-ptt"> Push to talk</label>
-        <div id="ptt-key-row" class="hidden">
-          <label>Push-to-talk key</label>
-          <button id="set-ptt-key" class="pill-btn">ControlLeft</button>
-        </div>
-        <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification &amp; voice sounds</label>
-        <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
-        <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
-        <label class="check-row"><input type="checkbox" id="set-board" checked> Allow soundboard clips</label>
-        <label class="check-row"><input type="checkbox" id="set-embeds" checked> Show image &amp; video previews</label>
-        <label class="check-row"><input type="checkbox" id="set-tts"> Read new messages aloud</label>
-        <label class="check-row"><input type="checkbox" id="set-autoidle" checked> Go idle after 6 minutes away</label>
-        <label class="check-row"><input type="checkbox" id="set-mascot" checked> Let Gorb wander the app</label>
-        <button id="set-revive" class="pill-btn">Revive Gorb</button>
-        <label>Output volume <span id="set-vol-label">100%</span></label>
-        <input type="range" id="set-volume" min="0" max="200" value="100">
-      </section>
-      <section id="emoji-section" class="hidden">
-        <h2>Server Emoji</h2>
-        <p class="modal-sub">Everyone on this server can use them by typing <code>:name:</code>. 256 KB each.</p>
-        <div id="emoji-list"></div>
-        <div class="emoji-add-row">
-          <button id="emoji-pick" class="pill-btn">Choose image</button>
-          <span id="emoji-file-name" class="hint">No image picked</span>
-        </div>
-        <div class="tag-row">
-          <span class="tag-at">:</span>
-          <input id="emoji-name" maxlength="20" placeholder="blobcat" autocomplete="off">
-          <button id="emoji-add" class="pill-btn">Add</button>
-        </div>
-        <input id="emoji-picker-file" type="file" accept="image/*" class="hidden">
-      </section>
 
-      <!-- There is no email and no password here, so losing this browser's
-           storage is the end of the account. This section is the only way back. -->
-      <section id="backup-section">
-        <h2>Your Account</h2>
-        <p class="modal-sub">Concord has no password and no email. If this browser loses its
-          storage, your account, your friends, your DMs and who you are on every server go with
-          it — permanently. A backup is the only way back.</p>
-        <div id="bk-danger" class="bk-danger"></div>
-
-        <label class="check-row"><input type="checkbox" id="bk-prefs" checked> Include my preferences</label>
-        <label class="check-row"><input type="checkbox" id="bk-extras"> Include extras — saved messages
-          and private notes, which are free text you wrote about other people</label>
-        <div class="bk-actions">
-          <button id="bk-download" class="primary-btn">Download backup</button>
-          <button id="bk-copy" class="pill-btn">Copy to clipboard</button>
+        <div class="set-pane" data-sec="voice">
+          <section>
+            <h2>Voice &amp; Video</h2>
+            <label>Input device</label>
+            <select id="set-mic"></select>
+            <label>Voice changer</label>
+            <select id="set-fx"></select>
+            <p class="fx-blurb" id="set-fx-blurb"></p>
+            <label>Pitch <span id="set-fx-label">+0</span> semitones</label>
+            <input type="range" id="set-fx-pitch" min="-12" max="12" step="1" value="0">
+            <label class="check-row"><input type="checkbox" id="set-ptt"> Push to talk</label>
+            <div id="ptt-key-row" class="hidden">
+              <label>Push-to-talk key</label>
+              <button id="set-ptt-key" class="pill-btn">ControlLeft</button>
+            </div>
+            <label>Output volume <span id="set-vol-label">100%</span></label>
+            <input type="range" id="set-volume" min="0" max="200" value="100">
+          </section>
         </div>
-        <p class="hint" id="bk-size"></p>
 
-        <h2>Restore</h2>
-        <p class="modal-sub">Bringing an account back onto this browser from a backup you saved earlier.</p>
-        <button id="bk-open-restore" class="primary-btn alt">Restore a backup…</button>
-      </section>
+        <div class="set-pane" data-sec="notifs">
+          <section>
+            <h2>Notifications</h2>
+            <p class="modal-sub">What Concord is allowed to interrupt you with. Muting a server or a
+              channel is a right-click on it, and keeps its unread badge either way.</p>
+            <label class="check-row"><input type="checkbox" id="set-sounds" checked> Notification &amp; voice sounds</label>
+            <label class="check-row"><input type="checkbox" id="set-notifs"> Desktop notifications</label>
+            <label class="check-row"><input type="checkbox" id="set-tts"> Read new messages aloud</label>
+            <h2>What other people may do here</h2>
+            <label class="check-row"><input type="checkbox" id="set-gremlin" checked> Allow Gremlin Mode pranks</label>
+            <label class="check-row"><input type="checkbox" id="set-board" checked> Allow soundboard clips</label>
+          </section>
+        </div>
+
+        <div class="set-pane" data-sec="look">
+          <section>
+            <h2>Appearance</h2>
+            <label>Theme</label>
+            <select id="set-theme">
+              <option value="midnight">🌑 Midnight (default)</option>
+              <option value="synthwave">🌆 Synthwave</option>
+              <option value="vapor">🫧 Vaporwave</option>
+              <option value="nord">🧊 Nord</option>
+              <option value="matrix">🖥️ Matrix</option>
+              <option value="gold">🏆 Gold</option>
+              <option value="blossom">🌸 Blossom</option>
+            </select>
+            <label class="check-row"><input type="checkbox" id="set-turbo"> ⚡ TURBO MODE (aurora, glow, animations)</label>
+            <label class="check-row"><input type="checkbox" id="set-embeds" checked> Show image &amp; video previews</label>
+            <label class="check-row"><input type="checkbox" id="set-mascot" checked> Let Gorb wander the app</label>
+            <button id="set-revive" class="pill-btn">Revive Gorb</button>
+            <label>Your progress</label>
+            <div id="level-row">
+              <span class="level-badge" id="level-badge">1</span>
+              <span id="level-text">0 XP</span>
+            </div>
+            <div id="xp-bar"><div id="xp-fill" style="width:0%"></div></div>
+            <button id="set-achievements" class="pill-btn">🏅 Achievements</button>
+          </section>
+          <section id="emoji-section" class="hidden">
+            <h2>Server Emoji</h2>
+            <p class="modal-sub">Everyone on this server can use them by typing <code>:name:</code>. 256 KB each.</p>
+            <div id="emoji-list"></div>
+            <div class="emoji-add-row">
+              <button id="emoji-pick" class="pill-btn">Choose image</button>
+              <span id="emoji-file-name" class="hint">No image picked</span>
+            </div>
+            <div class="tag-row">
+              <span class="tag-at">:</span>
+              <input id="emoji-name" maxlength="20" placeholder="blobcat" autocomplete="off">
+              <button id="emoji-add" class="pill-btn">Add</button>
+            </div>
+            <input id="emoji-picker-file" type="file" accept="image/*" class="hidden">
+          </section>
+        </div>
+
+        <div class="set-pane" data-sec="backup">
+          <!-- There is no email and no password here, so losing this browser's
+               storage is the end of the account. This section is the only way back. -->
+          <section id="backup-section">
+            <h2>Your Account</h2>
+            <p class="modal-sub">Concord has no password and no email. If this browser loses its
+              storage, your account, your friends, your DMs and who you are on every server go with
+              it — permanently. A backup is the only way back.</p>
+            <div id="bk-danger" class="bk-danger"></div>
+
+            <label class="check-row"><input type="checkbox" id="bk-prefs" checked> Include my preferences</label>
+            <label class="check-row"><input type="checkbox" id="bk-extras"> Include extras — saved messages
+              and private notes, which are free text you wrote about other people</label>
+            <div class="bk-actions">
+              <button id="bk-download" class="primary-btn">Download backup</button>
+              <button id="bk-copy" class="pill-btn">Copy to clipboard</button>
+            </div>
+            <p class="hint" id="bk-size"></p>
+
+            <h2>Restore</h2>
+            <p class="modal-sub">Bringing an account back onto this browser from a backup you saved earlier.</p>
+            <button id="bk-open-restore" class="primary-btn alt">Restore a backup…</button>
+          </section>
+        </div>
+      </div>
     </div>
     <button id="set-done" class="primary-btn">Done</button>
     <button class="modal-close" data-close>✕</button>

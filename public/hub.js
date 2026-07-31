@@ -245,6 +245,20 @@ export class HubConnection {
         break;
       }
 
+      // A wake-up, not a ring. All this frame has to do is get the
+      // conversation's own socket open; the ring itself is still derived from
+      // live voice membership over there, which is why it can't get stuck.
+      case "call-ring": {
+        // For a 1:1 frame `uid` is both the caller and the conversation key; for a
+        // group it's the caller and `gdm` is the key. Same namespace split as unread.
+        this.h.onCallRing(m.gdm || m.uid, { from: m.uid, name: m.name, chanId: m.chanId, isGroup: !!m.gdm });
+        break;
+      }
+      case "call-end": {
+        this.h.onCallEnd(m.gdm || m.uid, !!m.gdm);
+        break;
+      }
+
       case "poke-sent": {
         this.h.toast(m.landed ? "👉 Poked." : "They're offline — poke went nowhere.", !m.landed);
         break;
@@ -276,6 +290,13 @@ export class HubConnection {
   }
   poke(uid) {
     this.send({ type: "poke", uid });
+  }
+  // `key` is a friend's uid or a group id, same as everywhere else here.
+  ringCall(key, chanId, isGroup) {
+    this.send(isGroup ? { type: "call-ring", gdm: key, chanId } : { type: "call-ring", uid: key, chanId });
+  }
+  endCall(key, isGroup) {
+    this.send(isGroup ? { type: "call-end", gdm: key } : { type: "call-end", uid: key });
   }
   openDm(uid) {
     this.send({ type: "dm-open", uid });

@@ -63,6 +63,7 @@ try {
 
   // And Settings can bring him back.
   await page.click("#btn-settings");
+  await page.click('#set-nav button:has-text("Appearance")'); // Gorb lives under Appearance
   await page.click("#set-revive");
   await page.waitForTimeout(400);
   if (await page.locator("#gorb.ko").count()) bad("Revive Gorb brings him back");
