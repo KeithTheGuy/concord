@@ -367,24 +367,40 @@ pins and reactions free — a DM call is literally joining a voice channel.
 
 Read this before adding anything that removes a person from something.
 
-### A code is a bearer capability
+### A guild code is a bearer capability. A DM code is not, any more.
 
-Possession of a server code **is** the authority to read and write that
-conversation. There is no per-user access list on a `ConcordServer` — `hello`
-establishes *who you are*, never *whether you're allowed in*. Consequences that
-are easy to miss:
+For a **guild**, possession of the code still *is* the authority to read and
+write. There is no per-user access list — `hello` establishes who you are, never
+whether you're allowed in. Handing someone a guild invite is irreversible by any
+mechanism the app has. That's the clubhouse model and it's deliberate.
 
-* Handing someone a code is irreversible by any mechanism the app currently has.
-* The hub's membership list is **bookkeeping, not enforcement**. It decides who
-  gets *told* a code. It cannot take one back.
-* Therefore any UI that says "left the group" or "removed friend" is describing
-  the hub's records, not the other person's access. If you add a `gdm-kick`, it
-  will not kick anyone until the enforcement gap below is closed.
+For a **DM or group**, that used to be true too, and it was a real hole: leaving
+a group or unfriending removed you from the hub's records while leaving you in
+full possession of the conversation. Both were reproduced — an ex-member read
+messages posted after they left, an ex-friend posted into a DM after being
+unfriended.
 
-Closing that gap means membership has to be checked where the messages are: a
-`ConcordServer` that knows it is a DM should verify with the hub, on `hello`,
-that the connecting account is currently a member — checked live, so revocation
-is immediate and there is no expiry window to reason about.
+So membership is now checked **where the messages are**. A realm with
+`meta.kind === "dm"` asks the hub, on `hello`, whether the connecting account is
+currently a member — read live from the `fr:` and `gdm:` rows, never from a
+cached list. Revocation is therefore immediate with nothing to expire, and
+someone already connected is evicted rather than lingering until they reconnect.
+
+Two consequences worth internalising:
+
+* **The hub's membership list is now enforcement, for DMs and groups.** A
+  `gdm-kick` would genuinely kick. It still is not enforcement for guilds.
+* **Enforcement arms per conversation, not globally.** Refusing every
+  uncredentialed `hello` at once would brick every existing DM until the client
+  update reached every open tab. So a conversation switches on the first time
+  any member proves an updated client (`meta.dmAuth`); before that it is exactly
+  as bearer-only as it was before, and no worse. `DM_AUTH_GRACE` closes the
+  window for everyone once the client has shipped — flip it and delete this
+  paragraph.
+
+Realm `hello` therefore gains optional `hubUid` + `hubToken`, and the realm can
+answer `{type:"dm-denied", error}` followed by close code **4005**. A client that
+sees that must stop reconnecting; the door is not going to open.
 
 ### Entropy
 
@@ -418,3 +434,74 @@ friend graph, and every DM code they hold.** If you need that cap, add the
 belt-and-braces check first: refuse a uid that has no `user:` row but still
 appears anywhere in the graph. An identity the server still remembers must never
 be claimable by someone who can't prove it.
+
+---
+
+## 13. Hub additions — blocking, privacy, and the DM gate
+
+### New ops
+
+| op | payload | effect |
+|---|---|---|
+| `friend-block` | `{uid}` | writes `block:<me>:<them>`; checked in `friend-add`, `dm-nudge`, `poke`, `gdm-add` **and** `gdm-create` |
+| `friend-unblock` | `{uid}` | |
+| `blocks` | `{}` | → `{type:"blocks", list:[uid]}` |
+
+`friend-decline` now writes a block too. Without it a declined requester could
+re-request immediately and forever, which is the harassment path — declining was
+the only tool available and it left no trace.
+
+Blocking is checked in `gdm-create` as well as `gdm-add`, because a check on
+only one of them is theatre.
+
+### Changed frames
+
+* `friend-outgoing` now echoes `{tag}` — the thing the sender already typed —
+  rather than the target's profile. One friend-add from a stranger used to
+  return a full profile *and* live presence before the target had even seen the
+  request. A miss, a block, and a full inbox now all answer identically; only
+  states the sender already knows (already friends, already asked, self-add,
+  malformed) still get a distinct error.
+* `hub-welcome` gains `blocked: [uid]`. Its `you` carries your **real** presence
+  and status; the `friends` array carries the redacted view, because otherwise
+  the settings menu has nothing to render.
+* `friend-presence` may carry `presence: "offline"`. It never carries
+  `"invisible"` — that would announce the thing invisibility is for.
+
+### Invisible is enforced server-side now
+
+`publicUser` returns `online: false` and withholds your custom status while
+you're invisible. It was previously honoured only by the client, so any friend
+with devtools open saw your true state — and your status text, which people
+write "at the dentist" into, was broadcast live regardless.
+
+Switching *into* invisible fires a synthetic `friend-presence {online:false}`,
+and switching out fires your real state. Without that the transition leaks: you
+go invisible and everyone keeps the last value they were told.
+
+### Caps
+
+```js
+INCOMING_CAP        = 60   // pending requests AT a person, enforced against the target
+PROBES_PER_WINDOW   = 12   // friend-add per minute, per uid AND per IP
+ACCOUNTS_PER_IP_HOUR = 30
+```
+
+`FRIEND_CAP` (250) now counts only `state === "friend"` rows. Counting pending
+incoming rows meant 300 throwaway accounts — free, and ~1.7 seconds to create —
+could permanently lock a victim out of adding anyone.
+
+The per-uid probe budget lives in storage rather than memory, because a `Map`
+dies with the Durable Object and an attacker can simply wait for that. The
+per-IP half stays in memory, because one row per distinct IP grows without
+bound. Neither can be tested under `wrangler dev`, which sends no
+`CF-Connecting-IP`.
+
+### New keys
+
+`dmcode:<CODE>`, `block:<a>:<b>`, `probe:<uid>`, `ipacct:<ip>`, and `meta.dmAuth`
+on the realm.
+
+**Nothing deletes a `dmcode:` row** — same class of load-bearing invariant as
+`user:`. A code the hub has never heard of is grandfathered past the DM gate, so
+deleting the row of a dissolved group would quietly re-open it.
