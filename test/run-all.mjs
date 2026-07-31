@@ -21,6 +21,7 @@ const SUITES = [
   // backup is pure logic and needs no server, so it goes first — it costs
   // nothing and a failure here means the restore path is broken.
   ["backup", "protocol"],
+  ["outbox", "protocol"],
   ["smoke", "protocol"],
   ["identity", "protocol"],
   ["uploads", "protocol"],

@@ -25,6 +25,7 @@
     "security": "node test/security.mjs",
     "render": "node test/render.mjs",
     "backup": "node test/backup.mjs",
+    "outbox": "node test/outbox.mjs",
     "test": "node test/run-all.mjs"
   },
   "devDependencies": {
