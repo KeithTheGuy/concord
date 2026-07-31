@@ -4115,3 +4115,1329 @@ body.turbo .mention.me {
   color: var(--text);
   background: rgba(0, 0, 0, 0.15);
 }
+
+
+
+
+
+/* =========================================================================
+   POLISH LAYER
+   Appended deliberately at the end so it wins on source order without any
+   rule above it having to be touched. Three jobs:
+
+     1. A spacing / radius / timing / elevation scale, so the app stops
+        drifting a pixel at a time.
+     2. Kill every literal colour that survived the theme refactor. Seven
+        themes exist; a hardcoded #232428 is right in exactly one of them.
+        Anything needing a shade the palette doesn't name is derived with
+        color-mix() from a property every theme is guaranteed to define.
+     3. Focus, scrollbars, empty states, message-list density.
+
+   TURBO MODE is deliberately left excessive. Nothing here dims it.
+   ========================================================================= */
+
+:root {
+  /* Native widgets — dropdown lists, checkboxes, range tracks, the caret —
+     paint light-on-light without this. Every theme here is dark. */
+  color-scheme: dark;
+
+  /* Spacing. Everything below is a multiple of 4. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+
+  /* Radii. Three steps, not the nine the file had grown. */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* Control heights, for anything sharing a row with something else. */
+  --ctl-sm: 24px;
+  --ctl-md: 32px;
+  --ctl-lg: 40px;
+
+  /* Motion. One fast duration for state, one slower for things that travel. */
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+
+  /* Derived surfaces. */
+  --panel-deep: color-mix(in srgb, var(--bg-rail) 60%, var(--bg-sidebar));
+  --line: color-mix(in srgb, var(--text) 11%, transparent);
+  --line-soft: color-mix(in srgb, var(--text) 6%, transparent);
+  --rule: color-mix(in srgb, var(--text) 20%, transparent);
+  --tint: color-mix(in srgb, var(--text) 6%, transparent);
+  --tint-strong: color-mix(in srgb, var(--text) 10%, transparent);
+  --hover-row: color-mix(in srgb, var(--text) 4%, transparent);
+
+  /* Derived inks. Each was measured against every theme's own background;
+     the raw accent fails WCAG AA on at least one of the seven. */
+  --link-ink: color-mix(in srgb, var(--blurple) 58%, var(--text-header));
+  --danger-ink: color-mix(in srgb, var(--red) 58%, var(--text-header));
+  --ok-ink: color-mix(in srgb, var(--green) 70%, var(--text-header));
+
+  /* Ink that sits ON a saturated accent fill. Midnight's blurple is dark
+     enough that white wins (4.61:1); every other theme's accent is bright,
+     where white collapses to 1.3–3.5:1, so those flip to dark ink below. */
+  --on-accent: #fff;
+  --on-green: var(--bg-rail);
+
+  /* See the muted-text note below. Declared here, on the same element the
+     themes declare --text-muted on, so it picks up whichever theme is live. */
+  --muted: color-mix(in srgb, var(--text-muted) 70%, var(--text));
+
+  --scroll-thumb: color-mix(in srgb, var(--text) 9%, transparent);
+  --scroll-thumb-hi: color-mix(in srgb, var(--text) 24%, transparent);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.36);
+  --shadow-3: 0 14px 36px rgba(0, 0, 0, 0.5);
+}
+
+html[data-theme="synthwave"],
+html[data-theme="nord"],
+html[data-theme="vapor"],
+html[data-theme="matrix"],
+html[data-theme="gold"],
+html[data-theme="blossom"] {
+  --on-accent: var(--bg-rail);
+}
+
+/* -------------------------------------------------------------------------
+   Muted text, lifted.
+   --text-muted fails AA against --bg-input in Midnight (4.05:1) and Nord
+   (3.41:1), and against --bg-chat in Nord (4.24:1). Rather than hardcode a
+   replacement per theme, --muted is derived on :root from whichever
+   --text-muted the live theme set — a 30% pull toward --text — and then
+   handed back to --text-muted one level down, so all ~60 existing
+   `var(--text-muted)` call sites pick it up without being restated. It has to
+   go through --muted: a custom property that references ITSELF is a cycle
+   even when the value would have come from an ancestor, and a cycle makes it
+   guaranteed-invalid, which silently repaints every muted string as body
+   text. Worst case, Nord on --bg-input, goes 3.41 -> 4.55.
+   ------------------------------------------------------------------------- */
+
+#app,
+#modal-backdrop,
+#toasts,
+#profile-pop,
+#ctx-menu,
+#soundboard,
+#splash {
+  --text-muted: var(--muted);
+}
+
+/* -------------------------------------------------------------------------
+   Selection + links
+   ------------------------------------------------------------------------- */
+
+/* White on a bright accent is unreadable in five themes. A translucent wash
+   under the theme's own header ink works in all seven. */
+::selection {
+  background: color-mix(in srgb, var(--blurple) 38%, transparent);
+  color: var(--text-header);
+}
+
+a,
+.msg-content a,
+.att-file-name {
+  color: var(--link-ink);
+}
+
+/* -------------------------------------------------------------------------
+   Focus. A chat app is driven from the keyboard, the browser default ring is
+   invisible on these backgrounds, and three inputs had killed it outright
+   with `outline: none` at a specificity :focus-visible could not reach.
+   ------------------------------------------------------------------------- */
+
+:focus-visible {
+  outline: 2px solid var(--blurple);
+  outline-offset: 2px;
+}
+
+/* Roving-selection widgets carry their own highlight; a ring on top is noise. */
+.switch-row:focus-visible,
+.ac-row:focus-visible {
+  outline-offset: -2px;
+}
+
+/* The composer had no focus affordance at all: #input sets outline:none and
+   an ID beats :focus-visible. Light the whole box instead — that reads as
+   "this is where your typing goes" better than a ring on the textarea. Kept
+   to a hairline: in a chat app this box is focused essentially all the time,
+   and a full-strength ring living permanently at the bottom of the screen is
+   exhausting. */
+#composer:focus-within,
+body.turbo #composer:focus-within {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--blurple) 55%, transparent);
+}
+
+.modal input:focus,
+.modal select:focus,
+.modal textarea:focus,
+.pp-note:focus,
+.msg textarea.edit-box:focus {
+  box-shadow: 0 0 0 1px var(--blurple), 0 0 0 4px color-mix(in srgb, var(--blurple) 20%, transparent);
+}
+
+.add-friend-row:focus-within,
+.tag-row:focus-within {
+  box-shadow: 0 0 0 1px var(--blurple);
+}
+
+.tag-row {
+  border-radius: var(--r-sm);
+}
+
+.pp-note {
+  outline: none;
+  transition: box-shadow var(--dur-1) var(--ease);
+}
+
+/* -------------------------------------------------------------------------
+   Scrollbars. The defaults read as a rendering fault in a dark app.
+   Faint at rest so you can still see where you are, firm on hover.
+   ------------------------------------------------------------------------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--r-pill);
+  transition: background-color var(--dur-2) var(--ease);
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb-hi);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text) 34%, transparent);
+}
+
+/* The message pane is the one place a scrollbar arriving mid-session would
+   shove every line sideways. */
+#messages {
+  scrollbar-gutter: stable;
+}
+
+/* -------------------------------------------------------------------------
+   Surfaces that were literally #232428 — a Discord grey belonging to exactly
+   one of the seven themes, and fighting the other six.
+   ------------------------------------------------------------------------- */
+
+#voice-status,
+#user-panel,
+#profile-pop {
+  background: var(--panel-deep);
+}
+
+.pp-avatar {
+  border-color: var(--panel-deep);
+}
+
+#user-panel {
+  border-top: 1px solid var(--line-soft);
+}
+
+/* -------------------------------------------------------------------------
+   Buttons: one radius, one ink language, theme-derived fills.
+   ------------------------------------------------------------------------- */
+
+.pill-btn {
+  height: var(--ctl-md);
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--text) 15%, var(--bg-input));
+  color: var(--text-header);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.pill-btn:hover {
+  background: color-mix(in srgb, var(--text) 26%, var(--bg-input));
+}
+
+.pill-btn.tiny,
+.primary-btn.tiny {
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
+}
+
+.primary-btn {
+  border-radius: var(--r-sm);
+  color: var(--on-accent);
+  transition: background-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease);
+}
+
+.primary-btn.alt {
+  color: var(--on-green);
+}
+
+.primary-btn.alt:hover {
+  background: color-mix(in srgb, var(--green) 82%, var(--bg-rail));
+}
+
+/* Red cannot carry AA-contrast label text at any of these saturations, so the
+   fill is pulled toward the rail to buy back what it can. */
+.primary-btn.danger {
+  background: color-mix(in srgb, var(--red) 82%, var(--bg-rail));
+  color: #fff;
+}
+
+.primary-btn.danger:hover {
+  background: color-mix(in srgb, var(--red) 66%, var(--bg-rail));
+}
+
+.icon-btn {
+  width: var(--ctl-md);
+  height: var(--ctl-md);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.icon-btn:hover {
+  color: var(--text-header);
+}
+
+.menu {
+  border-radius: var(--r-md);
+  padding: var(--sp-1);
+  box-shadow: var(--shadow-3), 0 0 0 1px var(--line-soft);
+}
+
+.menu button {
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) 10px;
+}
+
+.menu button:hover {
+  background: var(--blurple);
+  color: var(--on-accent);
+}
+
+.menu button.danger {
+  color: var(--danger-ink);
+}
+
+.menu button.danger:hover {
+  background: color-mix(in srgb, var(--red) 82%, var(--bg-rail));
+  color: #fff;
+}
+
+/* -------------------------------------------------------------------------
+   Chat header. Six controls of five different heights sat in this row.
+   ------------------------------------------------------------------------- */
+
+#chat-header {
+  gap: var(--sp-1);
+  box-shadow: var(--shadow-1), 0 0 0 1px var(--line-soft);
+  padding-right: var(--sp-3);
+}
+
+.header-actions {
+  gap: 2px;
+}
+
+.header-actions > button {
+  width: var(--ctl-md);
+  height: var(--ctl-md);
+  border-radius: var(--r-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.header-actions > button:hover {
+  background: var(--tint);
+  color: var(--text-header);
+}
+
+/* #btn-call, #btn-squirt and #btn-gremlin are .pill-btn but their labels are
+   emoji, so they rendered as three filled grey boxes sitting between four
+   bare glyphs. They are icon buttons; only Invite is a button with a word on
+   it, and only it keeps the fill. */
+.header-actions > .pill-btn {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.header-actions > .pill-btn:hover {
+  background: var(--tint);
+  color: var(--text-header);
+}
+
+/* JS toggles .on for the armed squirt gun and for the DM call you're in.
+   Nothing in the sheet had ever drawn either state. */
+.header-actions > button.on {
+  background: color-mix(in srgb, var(--blurple) 22%, transparent);
+  color: var(--link-ink);
+}
+
+.header-actions > button.on:hover {
+  background: color-mix(in srgb, var(--blurple) 32%, transparent);
+}
+
+/* The one worded button in the row keeps its label, its fill and its width. */
+.header-actions > #btn-invite {
+  width: auto;
+  padding: 0 var(--sp-3);
+  margin-left: var(--sp-1);
+  background: color-mix(in srgb, var(--text) 15%, var(--bg-input));
+  color: var(--text-header);
+}
+
+.header-actions > #btn-invite:hover {
+  background: color-mix(in srgb, var(--text) 26%, var(--bg-input));
+}
+
+#member-count {
+  height: 20px;
+  line-height: 20px;
+  border-radius: var(--r-pill);
+  background: var(--tint);
+  margin: 0 2px;
+}
+
+#chan-topic {
+  border-left: 1px solid var(--rule);
+  margin-left: var(--sp-2);
+  padding-left: var(--sp-3);
+}
+
+#chan-crumb,
+#chan-incall {
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-soft);
+}
+
+#chan-incall {
+  color: var(--ok-ink);
+}
+
+/* -------------------------------------------------------------------------
+   Sidebar rhythm. Section heads now share the channel rows' 16px text edge.
+   ------------------------------------------------------------------------- */
+
+.chan-section-head {
+  padding: var(--sp-2) var(--sp-2) var(--sp-1) var(--sp-4);
+  gap: var(--sp-1);
+}
+
+.chan-row {
+  border-radius: var(--r-sm);
+  margin: 1px var(--sp-2);
+}
+
+.chan-add,
+.chan-gear,
+.chan-chat {
+  border-radius: var(--r-sm);
+}
+
+.chan-add:hover,
+.chan-gear:hover,
+.chan-chat:hover {
+  background: var(--tint-strong);
+  color: var(--text-header);
+}
+
+.cat-head {
+  padding-left: var(--sp-3);
+}
+
+.cat-count {
+  background: var(--tint);
+  border-radius: var(--r-pill);
+}
+
+.dm-nav,
+.dm-row,
+.switch-row,
+.ac-row {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+#server-header {
+  box-shadow: var(--shadow-1), 0 0 0 1px var(--line-soft);
+  transition: background-color var(--dur-1) var(--ease);
+}
+
+.rail-divider {
+  background: var(--line);
+}
+
+/* The unread pill and the add-server hover were the last two literals on the
+   rail. TURBO's glow on your own name was a literal amber too — still just as
+   excessive, now in the theme's own yellow. */
+.server-bubble::before {
+  background: var(--text-header);
+}
+
+#add-server-btn:hover {
+  color: var(--on-green);
+}
+
+@keyframes turbo-mention {
+  0%,
+  100% {
+    box-shadow: 0 0 0 color-mix(in srgb, var(--yellow) 0%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 10px color-mix(in srgb, var(--yellow) 70%, transparent);
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Voice + user panel
+   ------------------------------------------------------------------------- */
+
+.vs-title {
+  color: var(--ok-ink);
+}
+
+.vu-icons {
+  color: var(--red);
+}
+
+#voice-status button,
+#user-panel button {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+#btn-hangup:hover,
+#btn-mute.on:hover,
+#btn-deafen.on:hover {
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+  color: var(--danger-ink);
+}
+
+#btn-mute.on,
+#btn-deafen.on {
+  color: var(--danger-ink);
+  opacity: 1;
+}
+
+#btn-share.on,
+#btn-camera.on {
+  color: var(--ok-ink);
+}
+
+.presence-dot.offline {
+  background: color-mix(in srgb, var(--text-muted) 62%, var(--bg-sidebar));
+}
+
+/* -------------------------------------------------------------------------
+   THE MESSAGE LIST
+   The thing you stare at for hours, and where the drift showed most.
+
+   Two structural fixes:
+     * Hovering one message used to tint the whole run, because .msg-group and
+       .msg both carried a hover background and :hover on the group fires for
+       any descendant. Now exactly one message lights up.
+     * That highlight used to stop 72px short of the left edge, because .msg
+       lives inside .mg-body, past the avatar gutter. It is now a full-bleed
+       band drawn behind the text (isolate + z-index:-1), so it covers the
+       avatar column and the name row the way it should.
+   ------------------------------------------------------------------------- */
+
+.msg-group {
+  isolation: isolate;
+  margin-top: var(--sp-4);
+  padding: 2px var(--sp-4);
+}
+
+.msg-group:hover {
+  background: transparent;
+}
+
+.msg,
+.msg:hover {
+  padding: 3px var(--sp-2) 3px 0;
+  background: none;
+}
+
+.msg::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  left: -72px;
+  right: calc(-1 * var(--sp-4));
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  background: transparent;
+  transition: background-color var(--dur-1) var(--ease);
+}
+
+/* The first message in a run reaches up over the name + timestamp row, so a
+   group of one highlights as a single block rather than a headless stripe. */
+.mg-msgs > .msg:first-child::before {
+  top: -24px;
+}
+
+.msg:hover::before {
+  background: var(--hover-row);
+}
+
+/* A message that mentions you keeps a permanent wash and a left rule — also
+   full-bleed now, instead of an inset stripe floating in the text column. */
+.msg.pinged {
+  background: none;
+  box-shadow: none;
+}
+
+.msg.pinged::before {
+  background: color-mix(in srgb, var(--yellow) 8%, transparent);
+  box-shadow: inset 2px 0 0 var(--yellow);
+}
+
+.msg.pinged:hover::before {
+  background: color-mix(in srgb, var(--yellow) 13%, transparent);
+}
+
+/* Jumping to a quoted message flashed a literal blurple. Redeclaring the
+   keyframes here replaces the earlier ones outright. */
+@keyframes msg-flash {
+  0%,
+  40% {
+    background: color-mix(in srgb, var(--blurple) 26%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+.mg-avatar {
+  border-radius: 50%;
+  transition: transform var(--dur-1) var(--ease);
+}
+
+.mg-avatar:hover {
+  transform: scale(1.06);
+}
+
+.mg-head {
+  gap: var(--sp-2);
+  margin-bottom: 1px;
+}
+
+.mg-name {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.mg-time {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+/* 1.375 is Discord's, and it is one notch too tight for a wall of text. */
+.msg-content {
+  line-height: 1.46;
+}
+
+.msg-content strong {
+  color: var(--text-header);
+}
+
+/* Reply quotes read as a quiet aside above the message, not as body copy. */
+.msg-reply {
+  margin-bottom: var(--sp-1);
+  padding-left: 10px;
+  border-left: 2px solid color-mix(in srgb, var(--text-muted) 55%, transparent);
+  border-radius: 1px;
+  font-size: 13px;
+  line-height: 1.35;
+  transition: color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+
+.msg-reply:hover {
+  color: var(--text-header);
+  border-left-color: var(--blurple);
+}
+
+/* Code. Blocks were monospace only by accident of inheritance — and only in
+   the one theme whose --font happens to be a mono stack. */
+.msg-content code,
+.msg-content pre,
+#invite-link {
+  font-family: "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", ui-monospace, monospace;
+  font-variant-ligatures: none;
+}
+
+.msg-content code {
+  background: color-mix(in srgb, var(--bg-rail) 72%, var(--bg-chat));
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+  font-size: 0.875em;
+}
+
+.msg-content pre {
+  background: color-mix(in srgb, var(--bg-rail) 80%, var(--bg-chat));
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  padding: 10px var(--sp-3);
+  margin: var(--sp-2) 0;
+  line-height: 1.5;
+  max-width: 720px;
+  tab-size: 2;
+}
+
+.msg-content pre code {
+  border: none;
+  font-size: 13px;
+}
+
+/* Spoilers were #202225 — a grey block in a pink theme. */
+.spoiler {
+  background: color-mix(in srgb, var(--text) 22%, var(--bg-rail));
+  border-radius: var(--r-sm);
+  padding: 0 var(--sp-1);
+  transition: background-color var(--dur-2) var(--ease);
+}
+
+.spoiler:hover {
+  background: color-mix(in srgb, var(--text) 30%, var(--bg-rail));
+}
+
+.spoiler.revealed {
+  background: var(--tint);
+}
+
+/* Mentions used a literal blurple and a literal amber, so in Matrix your own
+   name lit up in a colour from a different application. */
+.mention {
+  background: color-mix(in srgb, var(--blurple) 24%, transparent);
+  color: color-mix(in srgb, var(--blurple) 40%, var(--text-header));
+  border-radius: var(--r-sm);
+  padding: 0 3px;
+}
+
+.mention.me {
+  background: color-mix(in srgb, var(--yellow) 24%, transparent);
+  color: color-mix(in srgb, var(--yellow) 45%, var(--text-header));
+}
+
+.msg-reactions {
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+
+.reaction {
+  min-height: var(--ctl-sm);
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--text) 7%, var(--bg-chat));
+  border: 1px solid transparent;
+  gap: 5px;
+  line-height: 1;
+}
+
+.reaction:hover {
+  background: color-mix(in srgb, var(--text) 12%, var(--bg-chat));
+  border-color: var(--line);
+}
+
+.reaction.mine {
+  background: color-mix(in srgb, var(--blurple) 18%, transparent);
+  border-color: color-mix(in srgb, var(--blurple) 70%, transparent);
+}
+
+.reaction.mine .reaction-count {
+  color: var(--link-ink);
+}
+
+.thread-chip {
+  border-radius: var(--r-pill);
+  border-color: var(--line-soft);
+  margin-top: var(--sp-2);
+}
+
+.att-list,
+.embed {
+  margin-top: var(--sp-2);
+}
+
+.day-divider {
+  margin: var(--sp-5) var(--sp-4) var(--sp-2);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.day-divider::before,
+.day-divider::after {
+  background: var(--line-soft);
+}
+
+.unread-divider {
+  color: var(--danger-ink);
+}
+
+.unread-divider::before,
+.unread-divider::after {
+  background: var(--red);
+}
+
+/* Hover toolbar: sits a touch higher so it clears the line above, and is
+   opaque enough to actually occlude what it covers. */
+.msg-actions {
+  top: -20px;
+  right: var(--sp-4);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--bg-sidebar) 92%, var(--text));
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-2);
+  transition: opacity var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+.msg-actions button {
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease);
+}
+
+.msg-actions .sep {
+  background: var(--line);
+}
+
+.msg-actions button::after {
+  background: var(--bg-rail);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-2);
+}
+
+.msg textarea.edit-box {
+  border-radius: var(--r-md);
+  line-height: 1.46;
+  transition: box-shadow var(--dur-1) var(--ease);
+}
+
+/* An empty channel used to be an empty rectangle, which reads as a failure
+   rather than as a beginning. */
+#messages:empty::before {
+  content: "Nothing here yet — say the first thing.";
+  margin: auto;
+  padding: var(--sp-5);
+  color: var(--text-muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+/* -------------------------------------------------------------------------
+   Composer
+   ------------------------------------------------------------------------- */
+
+#composer {
+  padding: 9px var(--sp-3);
+  border-radius: var(--r-md);
+  transition: box-shadow var(--dur-1) var(--ease);
+}
+
+#composer-actions {
+  gap: 2px;
+  padding-bottom: 0;
+}
+
+#composer-actions button {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  font-size: 18px;
+}
+
+#composer-actions button:hover {
+  background: var(--tint);
+  color: var(--text-header);
+}
+
+#input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+#reply-bar {
+  margin: 0 var(--sp-4);
+  padding: var(--sp-2) var(--sp-3) 14px;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  gap: var(--sp-2);
+}
+
+#reply-cancel {
+  border-radius: var(--r-sm);
+}
+
+#att-tray {
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  border-bottom-color: var(--line-soft);
+  gap: var(--sp-2);
+}
+
+#typing-bar {
+  padding: 2px var(--sp-4);
+}
+
+#jump-present {
+  left: var(--sp-4);
+  right: var(--sp-4);
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+  color: var(--on-accent);
+}
+
+/* -------------------------------------------------------------------------
+   Member list, friends, pins — shared row rhythm
+   ------------------------------------------------------------------------- */
+
+.member-row,
+.friend-row,
+.pin-row,
+.gdm-pick {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease);
+}
+
+.friend-row,
+.pin-row {
+  border-top-color: var(--line-soft);
+}
+
+#fv-tabs {
+  border-bottom-color: var(--line-soft);
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-4);
+}
+
+#fv-tabs button {
+  height: var(--ctl-md);
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+#fv-tabs button.fv-add {
+  color: var(--on-green);
+}
+
+#fv-tabs button.fv-add:hover,
+#fv-tabs button.fv-add.active {
+  background: color-mix(in srgb, var(--green) 82%, var(--bg-rail));
+  color: var(--on-green);
+}
+
+.fv-empty {
+  padding: 64px var(--sp-4);
+}
+
+.fv-empty-emoji {
+  font-size: 44px;
+  line-height: 1;
+  opacity: 0.9;
+}
+
+.fv-empty-title {
+  margin-top: var(--sp-4);
+}
+
+.fv-empty-sub {
+  margin-top: var(--sp-2);
+  max-width: 34ch;
+  margin-left: auto;
+  margin-right: auto;
+  line-height: 1.5;
+}
+
+/* Lists that can legitimately arrive with nothing in them and have no
+   JS-rendered placeholder behind them. */
+#member-list:empty::before,
+#text-channels:empty::before,
+#voice-channels:empty::before,
+#dm-list:empty::before,
+#gdm-friends:empty::before,
+#search-results:empty::before,
+#switch-results:empty::before {
+  display: block;
+  padding: var(--sp-3) 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+#member-list:empty::before { content: "Nobody's here right now."; }
+#text-channels:empty::before { content: "No text channels yet."; }
+#voice-channels:empty::before { content: "No voice channels yet."; }
+#dm-list:empty::before { content: "No conversations yet."; }
+#gdm-friends:empty::before { content: "Add a friend first — you can't group-chat alone."; }
+#search-results:empty::before { content: "Type something to search this channel."; }
+#switch-results:empty::before { content: "Start typing to jump anywhere."; }
+
+.member-group-head,
+.fv-head,
+.ac-head,
+.chan-section-head {
+  letter-spacing: 0.04em;
+}
+
+/* -------------------------------------------------------------------------
+   Modals
+   ------------------------------------------------------------------------- */
+
+.modal {
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3), 0 0 0 1px var(--line-soft);
+  padding: var(--sp-5);
+}
+
+/* Two columns of settings inside a 480px box gave each section ~200px, which
+   is why every checkbox label wrapped and the avatar grid went three wide. */
+#settings-modal {
+  width: min(760px, 94vw);
+}
+
+.settings-grid {
+  gap: var(--sp-5) 32px;
+  margin-top: var(--sp-3);
+}
+
+.modal h1 {
+  margin-bottom: var(--sp-2);
+  letter-spacing: -0.01em;
+}
+
+.modal label {
+  margin: var(--sp-4) 0 var(--sp-2);
+}
+
+.modal input,
+.modal select,
+.modal textarea {
+  border-radius: var(--r-sm);
+  padding: 10px var(--sp-3);
+  transition: box-shadow var(--dur-1) var(--ease);
+}
+
+/* appearance:none stripped the dropdown caret and never put one back. */
+.modal select {
+  padding-right: 34px;
+  background-color: var(--bg-rail);
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 19px) calc(50% + 1px), calc(100% - 14px) calc(50% + 1px);
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+/* `.modal label` (0,1,1) was beating `.check-row` (0,1,0), so every checkbox
+   row rendered as an 11px uppercase field label — the exact opposite of what
+   the rule directly below it asked for. */
+.modal label.check-row {
+  font-size: 14px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  margin: var(--sp-3) 0;
+  padding: 2px 0;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+}
+
+.modal label.check-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  margin: 0;
+}
+
+/* `.emoji-row` names two unrelated components — the avatar/icon pickers in
+   the modals, and a row in the custom-emoji manager. The second definition
+   was silently restyling the first, hover background and all. */
+#ob-avatars,
+#set-avatars,
+#jm-icons {
+  gap: var(--sp-2);
+  padding: 0;
+  border-radius: 0;
+}
+
+#ob-avatars:hover,
+#set-avatars:hover,
+#jm-icons:hover {
+  background: transparent;
+}
+
+#ob-avatars button,
+#set-avatars button,
+#jm-icons button {
+  width: var(--ctl-lg);
+  height: var(--ctl-lg);
+  border-radius: var(--r-md);
+  transition: background-color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+#ob-avatars button:hover,
+#set-avatars button:hover,
+#jm-icons button:hover {
+  transform: translateY(-1px);
+}
+
+.emoji-row button.selected {
+  background: var(--blurple);
+  outline: 2px solid var(--blurple);
+  outline-offset: 2px;
+}
+
+.color-row button.selected {
+  outline: 2px solid var(--text-header);
+  outline-offset: 2px;
+}
+
+.join-card {
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+}
+
+.modal-close {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+.modal-close:hover {
+  background: var(--tint);
+  color: var(--text-header);
+}
+
+#invite-link {
+  border-radius: var(--r-sm);
+  font-size: 13px;
+}
+
+.confirm-actions {
+  margin-top: var(--sp-5);
+  gap: var(--sp-2);
+}
+
+#modal-backdrop {
+  background: color-mix(in srgb, var(--bg-rail) 78%, transparent);
+  backdrop-filter: blur(3px);
+}
+
+/* -------------------------------------------------------------------------
+   Popovers, toasts, elevation
+   ------------------------------------------------------------------------- */
+
+#emoji-picker,
+#autocomplete,
+#soundboard {
+  border-color: var(--line-soft);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+}
+
+.emoji-btn,
+.ce-picker-btn {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+
+.emoji-btn:hover,
+.ce-picker-btn:hover {
+  transform: scale(1.12);
+}
+
+#profile-pop {
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3), 0 0 0 1px var(--line-soft);
+}
+
+.toast {
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-md);
+  border-color: var(--line);
+  box-shadow: var(--shadow-3);
+}
+
+.toast.error {
+  border-left: 3px solid var(--red);
+}
+
+.sb-btn {
+  border-radius: var(--r-md);
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease);
+}
+
+.sb-btn:hover {
+  color: var(--on-accent);
+}
+
+.att-file,
+.att-card {
+  border-radius: var(--r-md);
+  border-color: var(--line-soft);
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+
+.att-file:hover {
+  border-color: var(--line);
+}
+
+.drop-card {
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+}
+
+.att-spoiler-label {
+  border: 1px solid var(--line);
+}
+
+.lb-close,
+.lb-prev,
+.lb-next {
+  box-shadow: var(--shadow-2);
+  transition: background-color var(--dur-1) var(--ease), opacity var(--dur-1) var(--ease);
+}
+
+.lb-download {
+  border-radius: var(--r-sm);
+  color: var(--on-accent);
+}
+
+.level-badge {
+  color: var(--on-accent);
+}
+
+.poll {
+  border-radius: var(--r-md);
+  border-color: color-mix(in srgb, var(--blurple) 26%, transparent);
+}
+
+.poll-opt {
+  border-radius: var(--r-sm);
+  transition: background-color var(--dur-1) var(--ease);
+}
+
+.splash-bar {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+/* The unlock card ran a raw accent -> --bg-active gradient under white ink,
+   which is 1.3:1 in Vapor and Matrix. Pull the bright end down toward the
+   rail; it still reads as the theme's colour and the ink survives. */
+.achievement {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--blurple) 52%, var(--bg-rail)),
+    var(--bg-active)
+  );
+  border: 1px solid color-mix(in srgb, var(--blurple) 45%, transparent);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+}
+
+#splash {
+  background: radial-gradient(
+    120% 120% at 50% 0%,
+    color-mix(in srgb, var(--blurple) 24%, var(--bg-rail)) 0%,
+    var(--bg-rail) 62%
+  );
+}
+
+.splash-logo {
+  filter: drop-shadow(0 6px 18px color-mix(in srgb, var(--blurple) 60%, transparent));
+}
+
+/* -------------------------------------------------------------------------
+   Reduced motion — everything introduced above that moves, stood down.
+   ------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .msg::before,
+  .mg-avatar,
+  .msg-actions,
+  .msg-actions button,
+  .msg-reply,
+  .spoiler,
+  .reaction,
+  .pill-btn,
+  .primary-btn,
+  .icon-btn,
+  .chan-row,
+  .dm-nav,
+  .dm-row,
+  .switch-row,
+  .ac-row,
+  .member-row,
+  .friend-row,
+  .pin-row,
+  .gdm-pick,
+  .emoji-btn,
+  .ce-picker-btn,
+  .modal input,
+  .modal select,
+  .modal textarea,
+  .modal-close,
+  .poll-opt,
+  .att-file,
+  .att-card,
+  .lb-close,
+  .lb-prev,
+  .lb-next,
+  .sb-btn,
+  .toast,
+  .pp-note,
+  #composer,
+  #server-header,
+  #voice-status button,
+  #user-panel button,
+  #composer-actions button,
+  #fv-tabs button,
+  #ob-avatars button,
+  #set-avatars button,
+  #jm-icons button,
+  ::-webkit-scrollbar-thumb {
+    transition: none;
+  }
+
+  .mg-avatar:hover,
+  .emoji-btn:hover,
+  .ce-picker-btn:hover,
+  #ob-avatars button:hover,
+  #set-avatars button:hover,
+  #jm-icons button:hover {
+    transform: none;
+  }
+}
