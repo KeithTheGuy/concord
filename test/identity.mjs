@@ -19,7 +19,7 @@ const ownsLastMessage = (page) =>
   page.evaluate(() => {
     const msgs = [...document.querySelectorAll("#messages .msg")];
     const last = msgs[msgs.length - 1];
-    return !!last && !!last.querySelector('.msg-actions button[title="Edit"]');
+    return !!last && !!last.querySelector('.msg-actions button[aria-label="Edit"]');
   });
 
 const browser = await chromium.launch();

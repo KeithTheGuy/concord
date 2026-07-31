@@ -822,9 +822,9 @@ try {
       const content = "A".repeat(119) + "\u{1F44D}" + " trailing text that should not matter";
       const r = window.__probe({ contentJson: JSON.stringify(content) });
       const node = document.querySelector('.msg[data-id="' + r.id + '"]');
-      node.querySelector('.msg-actions button[title="Reply"]').click();
+      node.querySelector('.msg-actions button[aria-label="Reply"]').click();
       const reply = state.replyTo ? state.replyTo.content : null;
-      node.querySelector('.msg-actions button[title="Save this message"]').click();
+      node.querySelector('.msg-actions button[aria-label="Save this message"]').click();
       return { reply, saved: (state.settings.saved || [])[0]?.preview ?? null, raw: content };
     });
     check(!unpaired(cut.reply || ""), "reply preview (.slice(0,120)) does not split a surrogate pair", show(cut.reply, 140));

@@ -3142,7 +3142,7 @@ body.turbo .mention.me {
 
 /* Little label above each action. */
 .msg-actions button::after {
-  content: attr(title);
+  content: attr(data-tip);
   position: absolute;
   bottom: calc(100% + 7px);
   left: 50%;
@@ -5466,3 +5466,150 @@ body.turbo #composer:focus-within {
   background: var(--badge-bg);
   color: var(--badge-ink);
 }
+
+/* ======================= DRAFTS, OUTBOX, BACKUP =========================
+   Styling for the three modules wired in this round. */
+
+/* Discord puts the time of a grouped message in the left gutter on hover; the
+   group header carries the only other one. Absolute so it can sit in the avatar
+   column without the text having to make room for something usually invisible. */
+.msg-time {
+  position: absolute;
+  left: -60px;
+  width: 52px;
+  text-align: right;
+  top: 3px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-1, 90ms) var(--ease, ease);
+}
+.msg:hover > .msg-time { opacity: 1; }
+/* The group's first message already shows its time in the header. */
+.mg-msgs > .msg:first-child > .msg-time { display: none; }
+
+/* Queue state on an un-acked bubble. Deliberately quiet while it's merely
+   waiting — most sends resolve in milliseconds and a status line that flashes
+   on every message would be noise. */
+.msg-outbox {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2, 8px);
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.msg-outbox.failed { color: var(--danger-ink, var(--red)); }
+.msg-outbox-text { flex: 0 1 auto; }
+.msg-outbox button {
+  background: none;
+  border: 1px solid var(--line);
+  color: inherit;
+  border-radius: var(--r-1, 4px);
+  padding: 1px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.msg-outbox button:hover { background: var(--bg-hover); }
+
+/* A pencil where the unread badge would go. Muted on purpose: a draft is a
+   reminder, not a notification, and it must never compete with a real ping. */
+.chan-draft,
+.rail-draft {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+.rail-draft {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  background: var(--bg-rail);
+  border-radius: 50%;
+  padding: 2px;
+}
+.server-bubble.has-draft { position: relative; }
+
+.member-more { cursor: pointer; }
+
+/* The emoji manager's rows used to be called .emoji-row, which is also the
+   avatar/icon picker — so each was silently restyling the other. */
+.ce-manage-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  border-radius: var(--r-1, 4px);
+}
+.ce-manage-row:hover { background: var(--bg-hover); }
+
+/* Backup and restore. The warning is the point of the screen, not fine print:
+   a bundle is a password that also unlocks every DM you have. */
+.bk-danger {
+  border: 1px solid color-mix(in srgb, var(--red) 55%, transparent);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  color: var(--text);
+  border-radius: var(--r-2, 6px);
+  padding: 10px 12px;
+  margin: 8px 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.bk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2, 8px);
+  margin: 8px 0;
+}
+/* .modal styles input and select; a textarea gets nothing without this. */
+.bk-paste {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2, 6px);
+  padding: 8px 10px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.bk-paste:focus-visible {
+  outline: 2px solid var(--blurple);
+  outline-offset: 2px;
+}
+.bk-warnings {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.bk-warning,
+.bk-applied,
+.bk-skipped {
+  padding-left: 20px;
+  position: relative;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.bk-warning::before,
+.bk-applied::before,
+.bk-skipped::before {
+  position: absolute;
+  left: 2px;
+  top: 0;
+}
+.bk-warning::before { content: "⚠"; }
+.bk-applied::before { content: "✓"; color: var(--ok-ink, var(--green)); }
+.bk-skipped::before { content: "–"; }
+.bk-applied { color: var(--text); }
+
+#backup-section .modal-sub { margin-bottom: 4px; }

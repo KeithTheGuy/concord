@@ -23,6 +23,7 @@
     "threads": "node test/threads.mjs",
     "archive": "node test/archive.mjs",
     "security": "node test/security.mjs",
+    "hubsec": "node test/hubsec.mjs",
     "render": "node test/render.mjs",
     "backup": "node test/backup.mjs",
     "outbox": "node test/outbox.mjs",

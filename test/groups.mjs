@@ -179,7 +179,7 @@ try {
   });
   if (!toolbar || toolbar.opacity < 0.9) bad("hover toolbar appears", JSON.stringify(toolbar));
   else ok(`hover toolbar appears (${toolbar.buttons} actions)`);
-  if (!(await first.page.locator('.msg-actions button[title="Copy text"]').count())) {
+  if (!(await first.page.locator('.msg-actions button[aria-label="Copy text"]').count())) {
     bad("hover toolbar has copy text");
   } else ok("hover toolbar has copy text");
 

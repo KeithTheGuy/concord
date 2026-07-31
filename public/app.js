@@ -17,6 +17,11 @@ import {
   THEMES, applyTheme, applyTurbo, burst, confetti,
   levelFromXp, ACHIEVEMENTS, ACH_BY_ID, achievementToast,
 } from "./flair.js";
+import {
+  exportBundle, parseBundle, applyBundle, bundleWarnings, bundleSize, toText, toFile,
+} from "./backup.js";
+import { createDrafts } from "./drafts.js";
+import { createOutbox } from "./outbox.js";
 
 /* ============================== constants =============================== */
 
@@ -147,6 +152,22 @@ const SLASH = [
 
 /* =============================== storage ================================ */
 
+// `settings` is one key holding everything — preferences, progression, 200
+// saved-message previews, private notes — and it is rewritten two to four times
+// per message sent. When the origin runs out of quota setItem throws, and an
+// uncaught throw here aborted whatever called it: setCollapsed threw before
+// renderChannels() so categories stopped folding, and the volume slider threw
+// before voice.volumeChanged() so volume froze mid-drag. Nothing above this
+// line should ever have to know that storage can fail.
+//
+// The ladder sheds the two biggest regenerable things in order, because a
+// settings key that can never be written again costs every future preference —
+// which is worse than losing the bookmarks that got it stuck.
+const SHED_ORDER = ["saved", "notes"];
+const SHED_NAMES = { saved: "saved messages", notes: "private notes" };
+let shedWarned = false;
+let quotaWarned = false;
+
 const store = {
   get(key, fallback) {
     try {
@@ -156,8 +177,33 @@ const store = {
       return fallback;
     }
   },
+  // Returns whether it landed. Never throws.
   set(key, value) {
-    localStorage.setItem("concord-" + key, JSON.stringify(value));
+    const name = "concord-" + key;
+    const shed = key === "settings" ? SHED_ORDER : [];
+    let payload = value;
+    for (let step = 0; ; step++) {
+      try {
+        localStorage.setItem(name, JSON.stringify(payload));
+        if (step && !shedWarned) {
+          shedWarned = true;
+          const gone = shed.slice(0, step).map((k) => SHED_NAMES[k] || k);
+          toast(`Storage is full — Concord dropped your ${gone.join(" and ")} so it can still save settings.`, true);
+        }
+        return true;
+      } catch {
+        if (step >= shed.length) break;
+        // A copy, not a mutation: the words are still on screen and the
+        // in-memory settings are what the rest of this session reads.
+        payload = { ...payload };
+        for (let i = 0; i <= step; i++) delete payload[shed[i]];
+      }
+    }
+    if (!quotaWarned) {
+      quotaWarned = true;
+      toast("This browser is out of storage, so nothing can be saved. Export a backup from Settings.", true);
+    }
+    return false;
   },
 };
 
@@ -250,7 +296,8 @@ function makeRealm(code, kind) {
     editingId: null,
     pendingByNonce: new Map(),
     touched: Date.now(), // for evicting stale DM sockets
-    flushing: false, // an upload flush is waiting on this socket for tickets
+    flushing: false, // a composer upload is waiting on this socket for tickets
+    assetFlushing: false, // …and the same for an emoji or soundboard clip
     send(obj) {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify(obj));
@@ -269,6 +316,15 @@ function makeRealm(code, kind) {
     onProgress: () => {
       if (realm.code === state.activeCode) renderTray();
     },
+  });
+  // Custom emoji and soundboard clips go up through the same ticket handshake,
+  // but they are not part of anybody's message. Sharing the composer's uploader
+  // meant adding one emoji called flush() on the whole tray — so three private
+  // files you had staged went up with it, unasked.
+  realm.assetUploader = createUploader({
+    send: (obj) => realm.send(obj),
+    code: () => realm.code,
+    onError: (text) => toast(text, true),
   });
   return realm;
 }
@@ -312,6 +368,27 @@ for (const [key, fallback] of Object.entries(REALM_FIELDS)) {
 Object.defineProperty(state, "currentCode", { get: () => R()?.code || null });
 Object.defineProperty(state, "realmKind", { get: () => R()?.kind || "guild" });
 Object.defineProperty(state, "dmPeer", { get: () => R()?.peer || null });
+
+/* ========================== drafts and outbox =========================== */
+
+// Both get their own storage key rather than another field on `settings`:
+// settings is already the key under quota pressure, and a draft written on
+// every keystroke has no business sharing a JSON.stringify with 200 saved
+// messages.
+const drafts = createDrafts({
+  load: () => store.get("drafts", {}),
+  save: (obj) => store.set("drafts", obj),
+});
+
+const outbox = createOutbox({
+  // Straight at realm.send, which returns true only for an OPEN socket. The
+  // whole queued/sent split rests on that answer being honest — anything that
+  // reported success optimistically would turn a lost message into a duplicate.
+  send: (code, frame) => state.realms.get(code)?.send(frame) === true,
+  load: () => store.get("outbox", []),
+  save: (arr) => store.set("outbox", arr),
+  onChange: (code) => repaintOutbox(code),
+});
 
 /* ============================== dom helpers ============================= */
 
@@ -397,6 +474,21 @@ const dropHalfPairs = (s) =>
 // Previews are cut by code point, not by UTF-16 unit: slicing "…😀" mid-pair
 // leaves a lone surrogate, which every renderer draws as �.
 const clip = (s, n) => (s.length <= n ? s : [...s].slice(0, n).join(""));
+
+// A reply quote is one clipped line of plain text, so the markdown is stripped
+// rather than rendered — a fenced block or an image embed inside a 13px nowrap
+// strip is worse than the asterisks were. Spoilers collapse to the word instead
+// of being unwrapped, because a quote is not consent to reveal one.
+const stripMarkdown = (s) =>
+  String(s || "")
+    .replace(/```[\s\S]*?```/g, " code ")
+    .replace(/\|\|[\s\S]+?\|\|/g, "spoiler")
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\*\*([\s\S]+?)\*\*/g, "$1")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1$2")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
 
 /* ============================ voice engine ============================== */
 
@@ -676,6 +768,9 @@ function connectRealm(realm, intent) {
     const hadWelcome = realm.gotWelcome;
     realm.wsState = "idle";
     stopRealmPing(realm);
+    // Anything written to this socket but never acked is now the ambiguous
+    // case, and the outbox hands those to the user rather than resending.
+    outbox.disconnected(code);
 
     if (!hadWelcome) {
       if (realm.intent?.kind === "join") {
@@ -777,6 +872,11 @@ function handleServerMessage(realm, m) {
       realm.sounds = m.sounds || [];
       emojiReg.setFor(realm.code, m.emoji || []);
       startRealmPing(realm);
+      // The socket is open again, so anything typed while it wasn't can go —
+      // spaced out by the outbox rather than fired as a burst into a server
+      // that cuts you off at 30 frames per 5 seconds.
+      recoverOutbox(realm);
+      outbox.flush(realm.code);
 
       const resume = realm.resume;
       realm.resume = null;
@@ -915,8 +1015,10 @@ function handleServerMessage(realm, m) {
 
     case "upload-tickets": {
       // Arrives on the socket that asked, which is not necessarily the one
-      // you're looking at.
+      // you're looking at. Both uploaders share the socket, so both are offered
+      // it — each ignores a batch whose nonce isn't the one it's waiting on.
       realm.uploader.handleTickets(m);
+      realm.assetUploader.handleTickets(m);
       break;
     }
 
@@ -948,6 +1050,7 @@ function handleServerMessage(realm, m) {
     }
 
     case "msg-ack": {
+      outbox.ack(m.nonce); // it landed; the queue has no further business with it
       const pending = realm.pendingByNonce.get(m.nonce);
       realm.pendingByNonce.delete(m.nonce);
       const list = realm.messages.get(m.msg.chanId) || [];
@@ -1058,6 +1161,10 @@ function handleServerMessage(realm, m) {
       slowUntil.set(`${realm.code}/${m.chanId}`, Date.now() + m.seconds * 1000);
       startSlowTicker();
       const bounced = unsendOptimistic(realm, m.chanId);
+      // The refusal is final and the words go back in the box, so the queue
+      // must let go too — otherwise the outbox retries a message the composer
+      // is about to send again.
+      if (bounced?.nonce) outbox.drop(bounced.nonce);
       if (live) {
         if (m.chanId === realm.activeChan) {
           if (bounced) renderMessages();
@@ -1231,6 +1338,7 @@ function handleServerMessage(realm, m) {
       // A refused upload-ticket comes back as a plain error, and the uploader
       // would otherwise sit on its 15s timeout with the composer locked.
       if (realm.flushing) realm.uploader.handleTickets({ tickets: [] });
+      if (realm.assetFlushing) realm.assetUploader.handleTickets({ tickets: [] });
       if (live) toast(m.error, true);
       break;
     }
@@ -1402,7 +1510,7 @@ function desktopNotify(realm, msg, urgent) {
       : `${msg.author.name} • #${chan?.name || "?"} — ${realm.meta?.name || "Concord"}`;
   try {
     const n = new Notification(urgent ? `🔔 ${where}` : where, {
-      body: clip(msg.content, 140),
+      body: notifyBody(msg),
       icon: "/icon-192.png",
       tag: "concord-" + realm.code + "-" + msg.chanId, // coalesce per channel
       renotify: !!urgent,
@@ -1418,6 +1526,17 @@ function desktopNotify(realm, msg, urgent) {
   } catch {
     // some platforms throw on constructor; nothing to do
   }
+}
+
+// A picture with no caption is the whole message, and describing it as "" told
+// the reader nothing about the one thing that had actually arrived.
+function notifyBody(msg) {
+  const text = clip(msg.content, 140);
+  if (text) return text;
+  const atts = msg.attachments || [];
+  if (!atts.length) return "(no preview)";
+  const word = atts.every((a) => isImage(a.mime)) ? "picture" : "file";
+  return atts.length === 1 ? `sent a ${word}` : `sent ${atts.length} ${word}s`;
 }
 
 function notificationsReady() {
@@ -1525,6 +1644,7 @@ async function sendCurrentMessage() {
   const nonce = "n" + Math.random().toString(36).slice(2);
   const optimistic = {
     id: "pending-" + nonce,
+    nonce, // the outbox entry's id too, so a bubble can find its own queue state
     chanId,
     author: { userId: myUserId(), name: state.profile.name, color: state.profile.color, avatar: state.profile.avatar },
     content,
@@ -1538,14 +1658,19 @@ async function sendCurrentMessage() {
   list.push(optimistic);
   realm.messages.set(chanId, list);
 
-  realm.send({
+  // Through the outbox rather than straight at the socket: realm.send() returns
+  // false on a dead one, and that answer used to be thrown away along with the
+  // message. `meta` is the optimistic bubble itself, so a reload can put it
+  // back on screen instead of leaving a failed send queued out of sight.
+  outbox.enqueue({ code: realm.code, chanId, nonce, frame: {
     type: "msg",
     chanId,
     content,
     nonce,
     replyTo: realm.replyTo?.id,
     attachments: attachments.length ? attachments : undefined,
-  });
+  }, meta: optimistic });
+  if (drafts.clear(realm.code, chanId)) paintDraftMarkers();
   uploader?.clear();
   renderTray();
   // The other half of a DM isn't connected to its Durable Object unless they
@@ -1726,6 +1851,7 @@ function applyView() {
 }
 
 function goHome() {
+  stashDraft(); // the chat pane is going away, and with it the box
   state.view = "home";
   state.fvTab = hub.pendingCount() ? "pending" : "online";
   applyView();
@@ -1740,6 +1866,8 @@ function switchToRealm(code) {
   if (!code) return null;
   const realm = state.realms.get(code);
   if (!realm) return null;
+  stashDraft(); // the composer is about to belong to a different conversation
+  showAllOffline = false;
   state.activeCode = code;
   realm.touched = Date.now();
   state.view = isDirect(realm) ? "dm" : "server";
@@ -2141,6 +2269,7 @@ function renderAddFriend() {
 function renderServerRail() {
   const list = $("server-list");
   list.textContent = "";
+  const draftCodes = new Set(drafts.codesWithDrafts());
   for (const s of state.servers) {
     const active = s.code === state.activeCode && state.view === "server";
     const b = el("div", "server-bubble" + (active ? " active" : ""), s.icon);
@@ -2158,6 +2287,10 @@ function renderServerRail() {
       b.classList.add("has-unread");
     }
     if (state.voiceCode === s.code) b.classList.add("in-call");
+    if (draftCodes.has(s.code)) {
+      b.classList.add("has-draft");
+      b.appendChild(el("span", "rail-draft", "✏️"));
+    }
 
     b.onclick = () => goServer(s.code);
     if (state.settings.muted?.[s.code]) b.classList.add("muted");
@@ -2221,11 +2354,16 @@ function chanNeedsSeeing(c) {
   return c.id === state.activeChan || !!state.unread.get(c.id) || state.voiceChan === c.id;
 }
 
+// Which channels in the realm on screen hold an unsent draft. Read once per
+// paint rather than per row, which is what chansWithDrafts() is for.
+let draftChans = NO_SET;
+
 function renderChannels() {
   const textWrap = $("text-channels");
   const voiceWrap = $("voice-channels");
   textWrap.textContent = "";
   voiceWrap.textContent = "";
+  draftChans = new Set(state.currentCode ? drafts.chansWithDrafts(state.currentCode) : NO_ARR);
 
   const threadsOf = new Map(); // parent chanId -> thread channels
   for (const c of state.channels) {
@@ -2277,6 +2415,7 @@ function appendChanRow(wrap, c, threadsOf, folded) {
     row.appendChild(slow);
   }
   if (c.id === state.activeChan) row.classList.add("active");
+  if (draftChans.has(c.id)) row.appendChild(draftMark());
   const unread = state.unread.get(c.id);
   if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
   // Clicking a voice channel joins its call, because that's what anyone
@@ -2353,6 +2492,12 @@ function appendChanRow(wrap, c, threadsOf, folded) {
   if (users.childNodes.length) wrap.appendChild(users);
 }
 
+function draftMark() {
+  const mark = el("span", "chan-draft", "✏️");
+  mark.title = "You left something unsent here";
+  return mark;
+}
+
 // A thread is a channel, so this row is the ordinary one minus the gear —
 // renaming and deleting a thread is what its parent's menu is for.
 function threadRow(t) {
@@ -2360,6 +2505,7 @@ function threadRow(t) {
   row.appendChild(el("span", "chan-icon", "💬"));
   row.appendChild(el("span", "chan-label", t.name));
   if (t.slow) row.appendChild(el("span", "chan-slow", "🐌"));
+  if (draftChans.has(t.id)) row.appendChild(draftMark());
   const unread = state.unread.get(t.id);
   if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
   row.onclick = () => activateChannel(t.id);
@@ -2552,10 +2698,12 @@ function volumeMenu(e, member) {
   range.min = "0";
   range.max = "200";
   range.value = String(voice.getUserVolume(member.sid));
+  // The number tracks the thumb, but applying it writes the whole settings key
+  // through voice's saveVolume hook — so that waits for you to let go.
   range.oninput = () => {
-    voice.setUserVolume(member.sid, +range.value);
     label.textContent = `${member.name} — volume ${range.value}%`;
   };
+  range.onchange = () => voice.setUserVolume(member.sid, +range.value);
   wrap.appendChild(label);
   wrap.appendChild(range);
   ctxMenu(e.clientX, e.clientY, [{ custom: wrap }]);
@@ -2574,8 +2722,11 @@ function agoText(ts) {
   return new Date(ts).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-// A 200-person roster shouldn't cost 200 nodes every time somebody joins.
+// A 200-person roster shouldn't cost 200 nodes every time somebody joins. The
+// cut is opened by clicking it, and closes again when you leave the server —
+// the reason for the cap is paint cost, not secrecy.
 const OFFLINE_SHOWN = 100;
+let showAllOffline = false;
 
 function renderMembers() {
   const wrap = $("member-list");
@@ -2600,9 +2751,18 @@ function renderMembers() {
 
   if (offline.length) {
     wrap.appendChild(el("div", "member-group-head", `Offline — ${offline.length}`));
-    for (const entry of offline.slice(0, OFFLINE_SHOWN)) wrap.appendChild(memberRow(entry, true));
-    if (offline.length > OFFLINE_SHOWN) {
-      wrap.appendChild(el("div", "member-more", `+ ${offline.length - OFFLINE_SHOWN} more`));
+    const shown = showAllOffline ? offline.length : OFFLINE_SHOWN;
+    for (const entry of offline.slice(0, shown)) wrap.appendChild(memberRow(entry, true));
+    if (offline.length > shown) {
+      const more = el("div", "member-more", `+ ${offline.length - shown} more`);
+      more.title = "Show everyone";
+      more.setAttribute("role", "button");
+      more.tabIndex = 0;
+      more.onclick = () => {
+        showAllOffline = true;
+        renderMembers();
+      };
+      wrap.appendChild(more);
     }
   }
 
@@ -2906,18 +3066,15 @@ function buildMsgGroup(msg, realm = R()) {
 function buildMsgNode(msg, realm = R()) {
   const node = el("div", "msg" + (msg.pending ? " pending" : "") + (mentionsMe(msg, realm) ? " pinged" : ""));
   node.dataset.id = msg.id;
+  if (msg.nonce) node.dataset.nonce = msg.nonce;
   if (msg.pinned) node.classList.add("is-pinned");
+  // Only the first message in a run gets the group header's clock, so the rest
+  // of a conversation had no time on it at all.
+  node.appendChild(el("span", "msg-time", fmtTime(msg.ts)));
 
   if (msg.replyTo) {
-    const r = el("div", "msg-reply", dropHalfPairs(`↩ ${msg.replyTo.name}: ${msg.replyTo.content}`));
-    r.onclick = () => {
-      const target = document.querySelector(`.msg[data-id="${msg.replyTo.id}"]`);
-      if (target) {
-        target.scrollIntoView({ behavior: "smooth", block: "center" });
-        target.style.background = "rgba(88,101,242,.2)";
-        setTimeout(() => (target.style.background = ""), 1200);
-      }
-    };
+    const r = el("div", "msg-reply", dropHalfPairs(`↩ ${msg.replyTo.name}: ${stripMarkdown(msg.replyTo.content)}`));
+    r.onclick = () => jumpToMessage(msg.replyTo.id);
     node.appendChild(r);
   }
 
@@ -2998,75 +3155,86 @@ function buildMsgNode(msg, realm = R()) {
     node.appendChild(row);
   }
 
-  if (!msg.pending) node.appendChild(msgActions(msg, realm));
+  finishMsgNode(node, msg, realm);
   return node;
 }
 
+// An un-acked message has no server id, so none of the actions would work on
+// it. It gets its queue state in the same slot instead.
+function finishMsgNode(node, msg, realm) {
+  if (!msg.pending) {
+    node.appendChild(msgActions(msg, realm));
+    return;
+  }
+  if (!realm || !msg.nonce) return;
+  const row = buildOutboxRow(realm, msg.nonce, outboxEntries(realm.code).get(msg.nonce));
+  if (row) node.appendChild(row);
+}
+
 // The hover toolbar on a message.
+//
+// `data-tip` rather than `title`, because the stylesheet draws a tooltip of its
+// own from these buttons — and with a `title` there too you got the styled one
+// immediately and the browser's native one a second later, overlapping. The
+// accessible name moves to aria-label so nothing is lost with it.
+function msgAction(icon, label, onClick) {
+  const b = el("button", "", icon);
+  b.setAttribute("aria-label", label);
+  b.dataset.tip = label;
+  b.onclick = onClick;
+  return b;
+}
+
 function msgActions(msg, realm = R()) {
-  {
-    const actions = el("div", "msg-actions");
-    for (const q of QUICK_REACTS.slice(0, 3)) {
-      const b = el("button", "", q);
-      b.title = "React " + q;
-      b.onclick = () => wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji: q });
-      actions.appendChild(b);
-    }
-    const more = el("button", "", "➕");
-    more.title = "More reactions";
-    more.onclick = (e) => {
+  const actions = el("div", "msg-actions");
+  for (const q of QUICK_REACTS.slice(0, 3)) {
+    actions.appendChild(
+      msgAction(q, "React " + q, () => wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji: q }))
+    );
+  }
+  actions.appendChild(
+    msgAction("➕", "More reactions", (e) => {
       e.stopPropagation();
       openEmojiPicker({ mode: "react", msg });
-    };
-    actions.appendChild(more);
-    const reply = el("button", "", "↩");
-    reply.title = "Reply";
-    reply.onclick = () => setReply(msg);
-    actions.appendChild(reply);
-    // Threads only hang off real channels, and the message needs a real id for
-    // the server to find it.
-    if (chanTypeOf(msg.chanId) !== "thread") {
-      const thread = el("button", "", "💬");
-      thread.title = msg.threadId ? "Open this thread" : "Start a thread";
-      thread.onclick = () => {
+    })
+  );
+  actions.appendChild(msgAction("↩", "Reply", () => setReply(msg)));
+  // Threads only hang off real channels, and the message needs a real id for
+  // the server to find it.
+  if (chanTypeOf(msg.chanId) !== "thread") {
+    actions.appendChild(
+      msgAction("💬", msg.threadId ? "Open this thread" : "Start a thread", () => {
         if (msg.threadId) return activateChannel(msg.threadId);
         promptModal("Name this thread", clip(msg.content, 40), (v) =>
           wsSend({ type: "create-thread", chanId: msg.chanId, msgId: msg.id, name: v })
         );
-      };
-      actions.appendChild(thread);
-    }
-    const save = el("button", "", "🔖");
-    save.title = "Save this message";
-    save.onclick = () => saveMessage(msg);
-    actions.appendChild(save);
-    const pin = el("button", "", "📌");
-    pin.title = msg.pinned ? "Unpin" : "Pin";
-    pin.onclick = () => wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id });
-    actions.appendChild(pin);
-    const copy = el("button", "", "📋");
-    copy.title = "Copy text";
-    copy.onclick = () => copyText(msg.content, "Message copied");
-    actions.appendChild(copy);
-    if (msg.author.userId === realmUserId(realm)) {
-      actions.appendChild(el("span", "sep"));
-      const edit = el("button", "", "✏");
-      edit.title = "Edit";
-      edit.onclick = () => {
+      })
+    );
+  }
+  actions.appendChild(msgAction("🔖", "Save this message", () => saveMessage(msg)));
+  actions.appendChild(
+    msgAction("📌", msg.pinned ? "Unpin" : "Pin", () =>
+      wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id })
+    )
+  );
+  actions.appendChild(msgAction("📋", "Copy text", () => copyText(msg.content, "Message copied")));
+  if (msg.author.userId === realmUserId(realm)) {
+    actions.appendChild(el("span", "sep"));
+    actions.appendChild(
+      msgAction("✏", "Edit", () => {
         state.editingId = msg.id;
         renderMessages();
-      };
-      actions.appendChild(edit);
-      const del = el("button", "", "🗑");
-      del.title = "Delete";
-      del.onclick = () =>
+      })
+    );
+    actions.appendChild(
+      msgAction("🗑", "Delete", () =>
         confirmModal("Delete message?", "It'll be gone for everyone. Forever. Wow.", () =>
           wsSend({ type: "delete", chanId: msg.chanId, msgId: msg.id })
-        );
-      actions.appendChild(del);
-    }
-    return actions;
+        )
+      )
+    );
   }
+  return actions;
 }
 
 /* -------------------------------- embeds --------------------------------- */
@@ -3176,11 +3344,21 @@ function requestHistoryIn(realm, chanId, before) {
 function activateChannel(chanId) {
   const realm = R();
   if (!realm) return;
+  // A deleted thread's chip still points at it. Navigating there gave a blank
+  // header, an empty pane and — because syncComposer only asked whether an
+  // activeChan existed — a composer that stayed enabled and swallowed whatever
+  // you typed into it.
+  if (!realm.channels.some((c) => c.id === chanId)) {
+    toast("That channel isn't here any more.", true);
+    return;
+  }
+  // Unconditionally, because this is also reached by re-activating the channel
+  // you are already in — a notification click, a jump, a reconnect — and
+  // restoreDraft is about to overwrite the box either way.
+  if (realm.activeChan) stashDraft();
   // The "new messages" line survives while you're reading the channel, and
   // clears once you leave it — otherwise it vanishes before you can see it.
-  if (realm.activeChan && realm.activeChan !== chanId) {
-    realm.firstUnread.delete(realm.activeChan);
-  }
+  if (realm.activeChan && realm.activeChan !== chanId) realm.firstUnread.delete(realm.activeChan);
   realm.activeChan = chanId;
   realm.unread.delete(chanId);
   if (!realm.unread.size) realm.mentions = 0;
@@ -3189,6 +3367,7 @@ function activateChannel(chanId) {
   if (realm.kind === "group" && realm.group) hub.markDmRead(realm.group.id);
   updateTitle();
   clearReply();
+  restoreDraft(realm, chanId);
   state.editingId = null;
   renderChannels();
   renderChatHeader();
@@ -3201,8 +3380,12 @@ function activateChannel(chanId) {
 
 /* ------------------------------ reply state ------------------------------ */
 
+// The id is stringified because the worker mints numeric ones and a draft has
+// to survive a round trip through JSON storage that only keeps string ids. The
+// wire is unaffected — the worker does Number() on the way back in, and a DOM
+// lookup by data-id was always comparing strings anyway.
 function setReply(msg) {
-  state.replyTo = { id: msg.id, name: msg.author.name, content: clip(msg.content, 120) };
+  state.replyTo = { id: String(msg.id), name: msg.author.name, content: clip(msg.content, 120) };
   $("reply-label").textContent = `Replying to ${msg.author.name}`;
   $("reply-bar").classList.remove("hidden");
   $("input").focus();
@@ -3210,6 +3393,132 @@ function setReply(msg) {
 function clearReply() {
   state.replyTo = null;
   $("reply-bar").classList.add("hidden");
+}
+
+/* ------------------------------- drafts ---------------------------------- */
+// Half a sentence is worth exactly as much as a whole one to whoever typed it,
+// so leaving a channel writes it down instead of dropping it. The module owns
+// the debounce and the caps; everything here is about when to hand it the box
+// and when to take it back.
+
+function paintDraftMarkers() {
+  renderChannels();
+  renderServerRail();
+}
+
+// Whatever is in the composer belongs to the realm and channel that were on
+// screen a moment ago — call this BEFORE either of those changes.
+function stashDraft() {
+  const realm = R();
+  if (!realm?.activeChan) return;
+  drafts.set(realm.code, realm.activeChan, $("input").value, realm.replyTo);
+}
+
+function restoreDraft(realm, chanId) {
+  const box = $("input");
+  const draft = drafts.get(realm.code, chanId);
+  box.value = draft?.text || "";
+  autoGrow(box);
+  updateCharCount();
+  // The reply target comes back with the text: a draft that has forgotten what
+  // it was answering is worse than no draft, because you can't tell from the
+  // words alone and you'll send it at the wrong person.
+  if (draft?.replyTo) {
+    setReply({ id: draft.replyTo.id, author: { name: draft.replyTo.name }, content: draft.replyTo.content });
+  }
+}
+
+/* ------------------------------- outbox ---------------------------------- */
+// The three states the queue can be in, drawn on the message they belong to.
+// See public/outbox.js for why the ambiguous one waits for a human.
+
+const OUTBOX_LABEL = { queued: "waiting…", sent: "sending…" };
+
+function outboxEntries(code) {
+  return new Map(outbox.pending(code).map((e) => [e.nonce, e]));
+}
+
+function buildOutboxRow(realm, nonce, entry) {
+  if (!entry) return null;
+  if (entry.state !== "failed") return el("div", "msg-outbox", OUTBOX_LABEL[entry.state] || "waiting…");
+
+  const row = el("div", "msg-outbox failed");
+  row.appendChild(el("span", "msg-outbox-text", "Didn't send."));
+  if (entry.retryable) {
+    const again = el("button", "pill-btn tiny", "Retry");
+    again.onclick = () => {
+      const res = outbox.retry(nonce);
+      if (!res.ok) toast("That one can't be retried any more.", true);
+    };
+    row.appendChild(again);
+  } else {
+    // Attachment keys are single-use and swept after half an hour, so a retry
+    // would post this message with its pictures quietly missing. Offering the
+    // words back is the only honest thing left.
+    const back = el("button", "pill-btn tiny", "Put the text back");
+    back.title = "Its attachments can't be re-sent, so only the words come back.";
+    back.onclick = () => {
+      const box = $("input");
+      const text = entry.meta?.content || "";
+      box.value = box.value.trim() ? `${box.value}\n${text}` : text;
+      autoGrow(box);
+      updateCharCount();
+      dismissOutbox(realm, nonce);
+      box.focus();
+    };
+    row.appendChild(back);
+  }
+  const drop = el("button", "pill-btn tiny", "Dismiss");
+  drop.onclick = () => dismissOutbox(realm, nonce);
+  row.appendChild(drop);
+  return row;
+}
+
+// Dropping the entry has to take the bubble with it, or the message sits there
+// greyed out forever waiting on an ack that is never coming.
+function dismissOutbox(realm, nonce) {
+  outbox.drop(nonce);
+  const msg = realm.pendingByNonce.get(nonce);
+  realm.pendingByNonce.delete(nonce);
+  if (msg) {
+    const list = realm.messages.get(msg.chanId) || [];
+    const i = list.indexOf(msg);
+    if (i >= 0) list.splice(i, 1);
+  }
+  renderMessages(false, realm);
+}
+
+// Only the pending bubbles carry a queue row, and a state change can't alter
+// anything else — repainting the whole pane on every ack would undo the reason
+// appendMessage exists.
+function repaintOutbox(code) {
+  const realm = R();
+  if (!realm || (code !== undefined && code !== realm.code)) return;
+  const entries = outboxEntries(realm.code);
+  for (const node of $("messages").querySelectorAll(".msg.pending[data-nonce]")) {
+    const nonce = node.dataset.nonce;
+    const old = node.querySelector(":scope > .msg-outbox");
+    const row = buildOutboxRow(realm, nonce, entries.get(nonce));
+    if (old && row) old.replaceWith(row);
+    else if (old) old.remove();
+    else if (row) node.appendChild(row);
+  }
+}
+
+// A reload keeps the queue but takes every optimistic bubble with it, so a
+// failed send would come back invisible with a Retry nobody can reach. The meta
+// stored alongside the frame is that bubble.
+function recoverOutbox(realm) {
+  for (const entry of outbox.pending(realm.code)) {
+    if (!entry.chanId || realm.pendingByNonce.has(entry.nonce)) continue;
+    const meta = entry.meta;
+    if (!meta?.author?.name) continue;
+    const msg = { ...meta, id: "pending-" + entry.nonce, nonce: entry.nonce, chanId: entry.chanId, pending: true };
+    realm.pendingByNonce.set(entry.nonce, msg);
+    const list = realm.messages.get(entry.chanId) || [];
+    list.push(msg);
+    realm.messages.set(entry.chanId, list);
+  }
 }
 
 /* =============================== voice ui =============================== */
@@ -3363,10 +3672,24 @@ function closeModals() {
   $("modal-backdrop").classList.add("hidden");
   document.querySelectorAll(".modal").forEach((m) => m.classList.add("hidden"));
 }
+// A modal you can't dismiss is normally a bug; these three are the exceptions,
+// because dismissing them leaves you looking at a hidden app with no way back.
+function modalIsBlocking() {
+  if (!$("onboard-modal").classList.contains("hidden")) return true; // profile is required
+  if (!$("join-modal").classList.contains("hidden") && !state.servers.length) return true;
+  // Mid-restore with nothing to go back to: this browser has no profile yet, so
+  // closing the dialog would strand it behind the splash.
+  if (!state.profile) {
+    for (const id of ["restore-input-modal", "restore-modal"]) {
+      if (!$(id).classList.contains("hidden")) return true;
+    }
+  }
+  return false;
+}
+
 $("modal-backdrop").addEventListener("click", (e) => {
   if (e.target !== $("modal-backdrop")) return;
-  if (!$("onboard-modal").classList.contains("hidden")) return; // profile is required
-  if (!$("join-modal").classList.contains("hidden") && !state.servers.length) return;
+  if (modalIsBlocking()) return;
   closeModals();
 });
 document.querySelectorAll("[data-close]").forEach((b) => (b.onclick = closeModals));
@@ -3502,11 +3825,57 @@ $("jm-code").addEventListener("keydown", (e) => {
 
 $("add-server-btn").onclick = openJoinModal;
 
+// Leaving is the only moment we can be sure a server's rows are dead weight,
+// and `settings` is one key that everything else has to fit inside. `collapsed`
+// is the worst of them — it is keyed by free-text category name, so a rename
+// leaves the old key behind with nothing that will ever look at it again.
+function pruneServerData(code, realm) {
+  for (const chanId of drafts.chansWithDrafts(code)) drafts.clear(code, chanId);
+
+  const muted = { ...(state.settings.muted || {}) };
+  delete muted[code];
+  state.settings.muted = muted;
+
+  const collapsed = {};
+  const prefix = code + "/";
+  for (const [key, on] of Object.entries(state.settings.collapsed || {})) {
+    if (!key.startsWith(prefix)) collapsed[key] = on;
+  }
+  state.settings.collapsed = collapsed;
+
+  // Notes and volumes are keyed by person, not by server, so only the people
+  // this was the last shared room with are gone. Friends are kept regardless:
+  // you can still DM them.
+  const leaving = new Set();
+  for (const entry of realm?.roster.values() || NO_ARR) leaving.add(entry.userId);
+  for (const member of realm?.members.values() || NO_ARR) leaving.add(member.userId);
+  for (const other of state.realms.values()) {
+    if (other.code === code) continue;
+    for (const entry of other.roster.values()) leaving.delete(entry.userId);
+    for (const member of other.members.values()) leaving.delete(member.userId);
+  }
+  for (const f of hub.friends.values()) leaving.delete(f.uid);
+  leaving.delete(realmUserId(realm));
+  if (!leaving.size) return;
+
+  const notes = { ...(state.settings.notes || {}) };
+  const volumes = { ...(state.settings.userVolumes || {}) };
+  for (const userId of leaving) {
+    delete notes[userId];
+    delete volumes[userId];
+  }
+  state.settings.notes = notes;
+  state.settings.userVolumes = volumes;
+}
+
 function confirmLeaveServer(s) {
   confirmModal(`Leave ${s.name}?`, "You can rejoin any time with the invite code.", () => {
     // Say so before the socket goes, or you linger in everyone else's list as
     // a permanently offline ghost.
-    state.realms.get(s.code)?.send({ type: "leave-server" });
+    const realm = state.realms.get(s.code);
+    realm?.send({ type: "leave-server" });
+    pruneServerData(s.code, realm); // while the roster is still in hand
+    store.set("settings", state.settings);
     state.servers = state.servers.filter((x) => x.code !== s.code);
     store.set("servers", state.servers);
     const wasActive = state.activeCode === s.code;
@@ -3622,7 +3991,181 @@ function openSettings() {
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
   renderEmojiSettings();
+  refreshBackupPanel();
   populateMics();
+}
+
+/* --------------------------- backup / restore ---------------------------- */
+// Nothing in Concord can be re-derived from a server if this browser loses its
+// storage: there is no login to repeat. public/backup.js does the thinking;
+// this is the screen it needed.
+
+// Built from identityFor(), not from the raw `concord-identities` key — that
+// resolves the pre-per-server `concord-tokens` path too, so an old install
+// exports something restorable instead of an empty object.
+function backupSources() {
+  const identities = {};
+  for (const s of state.servers) {
+    const id = identityFor(s.code);
+    if (id?.userId && id?.token) identities[s.code] = { userId: id.userId, token: id.token };
+  }
+  return {
+    account: state.account,
+    identities,
+    servers: state.servers,
+    profile: state.profile,
+    settings: state.settings,
+  };
+}
+
+const backupStore = { get: (k, fallback) => store.get(k, fallback), set: (k, v) => store.set(k, v) };
+
+function currentBundle() {
+  return exportBundle(backupSources(), {
+    extras: $("bk-extras").checked,
+    prefs: $("bk-prefs").checked,
+  });
+}
+
+// The first warning is not a caveat at all — a bundle IS a password — so it
+// gets its own line at the top of both screens rather than seventh in a list.
+const dangerLine = (notes) => notes.find((n) => /like a password/i.test(n)) || notes[0] || "";
+
+function refreshBackupPanel() {
+  const bundle = currentBundle();
+  $("bk-danger").textContent = dangerLine(bundleWarnings(bundle));
+  const s = bundle.summary;
+  $("bk-size").textContent =
+    `About ${bundleSize(bundle).label} — ${s.servers} server${s.servers === 1 ? "" : "s"}, ` +
+    `${s.identities} server login${s.identities === 1 ? "" : "s"}.`;
+}
+
+// The rest of the caveats live beside the Restore button, because that is the
+// button they're about. Before anything is pasted they describe the bundle this
+// browser would produce; once one parses they describe that one instead.
+function renderRestoreNotes(bundle) {
+  const notes = bundleWarnings(bundle);
+  const danger = dangerLine(notes);
+  $("ri-danger").textContent = danger;
+  const list = $("bk-warnings");
+  list.textContent = "";
+  for (const note of notes) {
+    if (note !== danger) list.appendChild(el("li", "bk-warning", note));
+  }
+}
+
+function openRestoreInput() {
+  showModal("restore-input-modal");
+  renderRestoreNotes(currentBundle());
+  setTimeout(() => $("bk-paste").focus(), 0);
+}
+
+// Cancelling has to put people back where they were, and for anyone who has
+// actually lost their storage that is the onboarding screen, not Settings.
+function backFromRestore() {
+  closeModals();
+  if (state.profile) openSettings();
+  else openOnboard();
+}
+
+$("bk-prefs").onchange = refreshBackupPanel;
+$("bk-extras").onchange = refreshBackupPanel;
+$("bk-open-restore").onclick = openRestoreInput;
+$("ob-restore").onclick = openRestoreInput;
+$("bk-cancel").onclick = backFromRestore;
+
+$("bk-download").onclick = () => {
+  const file = toFile(currentBundle());
+  if (!file.blob) {
+    toast("This browser can't build the file — use Copy to clipboard instead.", true);
+    return;
+  }
+  const url = URL.createObjectURL(file.blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = file.filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  toast(`Saved ${file.filename}. Keep it like a password.`);
+};
+
+// The pasted copy is the one people actually keep — in a note, a password
+// manager, a message to themselves — so it is offered next to the file.
+$("bk-copy").onclick = () => copyText(toText(currentBundle()), "Backup copied. Anyone holding it is you.");
+
+$("bk-file").onclick = () => $("bk-file-picker").click();
+$("bk-file-picker").onchange = async (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = "";
+  if (!file) return;
+  try {
+    $("bk-paste").value = await file.text();
+  } catch {
+    toast("Couldn't read that file.", true);
+    return;
+  }
+  previewRestore();
+};
+
+$("bk-restore").onclick = () => previewRestore();
+
+function previewRestore() {
+  const parsed = parseBundle($("bk-paste").value);
+  if (!parsed.ok) {
+    toast(parsed.error, true);
+    return;
+  }
+  const mode = $("bk-replace").checked ? "replace" : "merge";
+  // Dry run first, always. What it reports is what the confirmation says, so
+  // the dialog can't describe one restore and perform another.
+  const dry = applyBundle(parsed.bundle, { mode, ...backupStore, dryRun: true });
+  renderRestoreNotes(parsed.bundle);
+  openRestorePreview(parsed.bundle, mode, dry);
+}
+
+function openRestorePreview(bundle, mode, dry) {
+  const s = bundle.summary;
+  showModal("restore-modal");
+  $("restore-sub").textContent =
+    `${s.tag ? "@" + s.tag : s.name || "An unnamed account"} · ${s.date || "undated"} · ` +
+    `${s.servers} server${s.servers === 1 ? "" : "s"} · ${mode === "replace" ? "Replace" : "Merge"} mode.`;
+
+  const body = $("restore-body");
+  body.textContent = "";
+  const group = (title, lines, cls) => {
+    if (!lines.length) return;
+    body.appendChild(el("div", "fv-head", title));
+    const list = el("ul", "bk-warnings");
+    for (const line of lines) list.appendChild(el("li", cls, line));
+    body.appendChild(list);
+  };
+  group("Will happen", dry.applied, "bk-applied");
+  // Merge refuses to overwrite a per-server identity on purpose: doing it would
+  // make you a second person on that server and orphan everything the first one
+  // ever said. The skipped list names them, which is the only place the choice
+  // between Merge and Replace can be made honestly.
+  group("Left alone", dry.skipped, "bk-skipped");
+  group("Read this", dry.warnings.filter((w) => !/^Preview only/.test(w)), "bk-warning");
+  if (!dry.applied.length) {
+    body.appendChild(el("p", "modal-sub", "Nothing here would change. This browser already has everything in the backup."));
+  }
+
+  // Back to the paste box, not out of the flow — Cancel here usually means
+  // "not in Merge mode", and the answer is one checkbox away.
+  $("restore-no").onclick = () => showModal("restore-input-modal");
+  $("restore-yes").onclick = () => {
+    const done = applyBundle(bundle, { mode, ...backupStore });
+    closeModals();
+    if (!done.ok) {
+      toast(done.warnings[0] || "That backup couldn't be restored.", true);
+      return;
+    }
+    // `state` was read out of storage once, at boot, and every realm is holding
+    // a socket opened with the old identity. A reload is the only way the new
+    // one becomes who you are.
+    toast("Restored. Reloading…");
+    setTimeout(() => location.reload(), 700);
+  };
 }
 
 /* ----------------------------- server emoji ------------------------------ */
@@ -3642,7 +4185,9 @@ function renderEmojiSettings() {
     return;
   }
   for (const e of mine) {
-    const row = el("div", "emoji-row");
+    // Not ".emoji-row": that name already belongs to the avatar and icon
+    // pickers, and the two definitions were quietly restyling each other.
+    const row = el("div", "ce-manage-row");
     const img = el("img", "emoji-row-img");
     img.src = e.url;
     img.alt = `:${e.name}:`;
@@ -3844,13 +4389,15 @@ const fmtSemis = (n) => (n > 0 ? `+${n}` : String(n));
 
 // Applies live — mid-sentence, even. The rack is rebuilt behind the same
 // outgoing track, so nothing renegotiates and nobody hears a gap.
-function applyVoiceFx(id, pitch) {
+// `persist` is false while a slider is mid-drag: the rack still rebuilds on
+// every step, but the settings key is written once, on release.
+function applyVoiceFx(id, pitch, persist = true) {
   const preset = FX_BY_ID.get(id);
   const spec = preset ? preset.spec : {};
   const semis = typeof pitch === "number" ? pitch : spec.semis || 0;
   state.settings.fx = id;
   state.settings.fxPitch = semis;
-  store.set("settings", state.settings);
+  if (persist) store.set("settings", state.settings);
   voice.setVoice(spec, semis);
   const changed = id !== "off" || semis !== 0;
   if (changed) unlock("voice-crack");
@@ -3859,7 +4406,7 @@ function applyVoiceFx(id, pitch) {
     const tried = new Set(state.settings.triedVoices || []);
     tried.add(id);
     state.settings.triedVoices = [...tried];
-    store.set("settings", state.settings);
+    if (persist) store.set("settings", state.settings);
     if (tried.size >= VOICE_FX.length) unlock("full-rack");
   }
   $("btn-fx").classList.toggle("on", changed);
@@ -3875,12 +4422,14 @@ $("set-fx").onchange = (e) => {
   $("set-fx-pitch").value = semis;
   $("set-fx-label").textContent = fmtSemis(semis);
 };
-// The slider nudges pitch while keeping the preset's character.
+// The slider nudges pitch while keeping the preset's character. Same rule as
+// the volume one: heard immediately, saved on release.
 $("set-fx-pitch").oninput = (e) => {
   const pitch = +e.target.value;
-  applyVoiceFx(state.settings.fx || "off", pitch);
+  applyVoiceFx(state.settings.fx || "off", pitch, false);
   $("set-fx-label").textContent = fmtSemis(pitch);
 };
+$("set-fx-pitch").onchange = () => store.set("settings", state.settings);
 
 // Quick cycle from the voice panel, for mid-call bits.
 $("btn-fx").onclick = () => {
@@ -3926,12 +4475,14 @@ $("set-notifs").onchange = async (e) => {
   state.settings.notifs = false;
   store.set("settings", state.settings);
 };
+// Live while you drag, written once when you let go — a full JSON.stringify of
+// settings per pixel of travel is a hundred writes for one decision.
 $("set-volume").oninput = (e) => {
   state.settings.volume = +e.target.value;
   $("set-vol-label").textContent = state.settings.volume + "%";
-  store.set("settings", state.settings);
   voice.volumeChanged();
 };
+$("set-volume").onchange = () => store.set("settings", state.settings);
 $("set-ptt-key").onclick = () => {
   $("set-ptt-key").textContent = "Press a key…";
   const capture = (e) => {
@@ -3982,6 +4533,17 @@ function autoGrow(node) {
   node.style.height = Math.min(node.scrollHeight, 200) + "px";
 }
 
+// The module debounces the write, so this runs on every keystroke and costs a
+// Map.set. The repaint doesn't: the sidebar marker only moves on the two
+// transitions, so it's asked for only then.
+function saveDraft() {
+  const realm = R();
+  if (!realm?.activeChan) return;
+  const had = drafts.has(realm.code, realm.activeChan);
+  const has = drafts.set(realm.code, realm.activeChan, input.value, realm.replyTo);
+  if (had !== has) paintDraftMarkers();
+}
+
 // Only appears when you're actually near the 4000-character wall.
 function updateCharCount() {
   const left = 4000 - input.value.length;
@@ -3994,6 +4556,7 @@ input.addEventListener("input", () => {
   autoGrow(input);
   updateAutocomplete();
   updateCharCount();
+  saveDraft();
   const now = Date.now();
   if (input.value && now - state.lastTypingSent > 4000 && state.activeChan) {
     state.lastTypingSent = now;
@@ -4063,26 +4626,24 @@ function addFiles(files) {
 }
 
 // Emoji and soundboard clips go up through the same ticket handshake as an
-// attachment, so they borrow the realm's uploader — it's the thing listening on
-// the socket the tickets come back on. The item is taken back out of the tray
-// afterwards, because it was never going to be part of a message.
+// attachment, so they need a socket-backed uploader — but not the composer's.
+// flush() uploads everything staged, so adding one emoji while three private
+// files sat in the tray sent all four.
 async function uploadAsset(file) {
   const realm = R();
   if (!realm) return null;
-  const [item] = realm.uploader.add([file]);
+  const [item] = realm.assetUploader.add([file]);
   if (!item) return null;
-  realm.flushing = true;
-  renderTray();
+  realm.assetFlushing = true;
   let key = null;
   try {
-    const done = await realm.uploader.flush();
+    const done = await realm.assetUploader.flush();
     key = done.find((d) => d.name === item.name && d.size === item.size)?.key || null;
   } catch {
     // the uploader has already said what went wrong
   }
-  realm.flushing = false;
-  realm.uploader.remove(item.id);
-  renderTray();
+  realm.assetFlushing = false;
+  realm.assetUploader.remove(item.id);
   if (!key) toast("That upload didn't land. Give it another go.", true);
   return key;
 }
@@ -4408,12 +4969,7 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === "Escape") {
     hideProfile();
     $("soundboard").classList.add("hidden");
-    if (!$("modal-backdrop").classList.contains("hidden")) {
-      const blocking =
-        !$("onboard-modal").classList.contains("hidden") ||
-        (!$("join-modal").classList.contains("hidden") && !state.servers.length);
-      if (!blocking) closeModals();
-    }
+    if (!$("modal-backdrop").classList.contains("hidden") && !modalIsBlocking()) closeModals();
   }
 });
 
@@ -5225,6 +5781,14 @@ window.addEventListener("focus", () => {
     renderChannels();
     renderServerRail();
   }
+});
+// pagehide, not beforeunload: it's the one a phone actually fires when the tab
+// goes into the background and never comes back, which is exactly the case a
+// 600ms debounce loses.
+window.addEventListener("pagehide", () => {
+  stashDraft();
+  drafts.flush();
+  outbox.persist();
 });
 window.addEventListener("beforeunload", () => {
   for (const realm of state.realms.values()) {

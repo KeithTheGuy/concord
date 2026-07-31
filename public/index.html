@@ -186,7 +186,9 @@
       <div id="att-tray" class="hidden"></div>
 
       <div id="composer">
-        <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
+        <!-- The placeholder changes per channel and disappears once you type,
+             so it can't be the accessible name. -->
+        <textarea id="input" rows="1" aria-label="Message" placeholder="Message #general" maxlength="4000"></textarea>
         <!-- Buttons live to the RIGHT of the box. dapmon was very clear. -->
         <div id="composer-actions">
           <span id="char-count" class="hidden"></span>
@@ -221,6 +223,9 @@
     <label>Color</label>
     <div id="ob-colors" class="color-row"></div>
     <button id="ob-done" class="primary-btn">Continue</button>
+    <!-- A wiped browser lands here, and this is the only screen between it and
+         starting over as a stranger. Restore has to be reachable from it. -->
+    <p class="modal-sub">Been here before? <button id="ob-restore" class="pill-btn">Restore a backup</button></p>
   </div>
 
   <!-- add / join server -->
@@ -343,6 +348,29 @@
         </div>
         <input id="emoji-picker-file" type="file" accept="image/*" class="hidden">
       </section>
+
+      <!-- There is no email and no password here, so losing this browser's
+           storage is the end of the account. This section is the only way back. -->
+      <section id="backup-section">
+        <h2>Your Account</h2>
+        <p class="modal-sub">Concord has no password and no email. If this browser loses its
+          storage, your account, your friends, your DMs and who you are on every server go with
+          it — permanently. A backup is the only way back.</p>
+        <div id="bk-danger" class="bk-danger"></div>
+
+        <label class="check-row"><input type="checkbox" id="bk-prefs" checked> Include my preferences</label>
+        <label class="check-row"><input type="checkbox" id="bk-extras"> Include extras — saved messages
+          and private notes, which are free text you wrote about other people</label>
+        <div class="bk-actions">
+          <button id="bk-download" class="primary-btn">Download backup</button>
+          <button id="bk-copy" class="pill-btn">Copy to clipboard</button>
+        </div>
+        <p class="hint" id="bk-size"></p>
+
+        <h2>Restore</h2>
+        <p class="modal-sub">Bringing an account back onto this browser from a backup you saved earlier.</p>
+        <button id="bk-open-restore" class="primary-btn alt">Restore a backup…</button>
+      </section>
     </div>
     <button id="set-done" class="primary-btn">Done</button>
     <button class="modal-close" data-close>✕</button>
@@ -418,6 +446,36 @@
     <h1>⚡ Quick Switcher</h1>
     <input id="switch-input" placeholder="Jump to a channel, server, or friend…" autocomplete="off">
     <div id="switch-results"></div>
+  </div>
+
+  <!-- restore input: its own modal so the onboarding screen can reach it too,
+       which is where anyone who has actually lost their storage will be -->
+  <div class="modal hidden" id="restore-input-modal">
+    <h1>Restore a backup</h1>
+    <p class="modal-sub">Paste the backup, or open the file you saved. Nothing is written until
+      you've seen exactly what it would change.</p>
+    <div id="ri-danger" class="bk-danger"></div>
+    <textarea id="bk-paste" class="bk-paste" rows="4" placeholder="Paste a backup here…"></textarea>
+    <label class="check-row"><input type="checkbox" id="bk-replace"> Replace mode — let the backup
+      win wherever this browser disagrees with it</label>
+    <ul id="bk-warnings" class="bk-warnings"></ul>
+    <div class="confirm-actions">
+      <button id="bk-cancel" class="pill-btn">Cancel</button>
+      <button id="bk-file" class="pill-btn">Open a file…</button>
+      <button id="bk-restore" class="primary-btn">Preview…</button>
+    </div>
+    <input id="bk-file-picker" type="file" accept="application/json,.json,.txt" class="hidden">
+  </div>
+
+  <!-- restore preview: what applyBundle says it would do, before it does it -->
+  <div class="modal hidden" id="restore-modal">
+    <h1>Restore this backup?</h1>
+    <p class="modal-sub" id="restore-sub"></p>
+    <div id="restore-body"></div>
+    <div class="confirm-actions">
+      <button id="restore-no" class="pill-btn">Cancel</button>
+      <button id="restore-yes" class="primary-btn">Restore and reload</button>
+    </div>
   </div>
 
   <!-- generic confirm -->
