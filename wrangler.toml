@@ -18,9 +18,22 @@ class_name = "ConcordServer"
 
 # Attachments, custom emoji and soundboard clips. Keys are a/<CODE>/<uuid>/<name>,
 # so an object is only findable by someone who already has the invite code.
-[[r2_buckets]]
-binding = "FILES"
-bucket_name = "concord-files"
+#
+# DELIBERATELY COMMENTED OUT IN PRODUCTION. /api/new-code is public, so anyone
+# who finds the site can create a server, and the upload budget is per identity
+# while identities are free to mint — which works out to roughly 750 MB per ten
+# minutes per script, against a 10 GB free tier. The bill is the smaller half of
+# the problem; the larger half is hosting arbitrary files on this account.
+#
+# Without the binding the app degrades cleanly: `upload-ticket` is refused up
+# front with "Uploads aren't switched on here." and nothing else notices. Local
+# dev still gets a simulated bucket, so uncomment it to work on uploads.
+#
+# To switch it on for real, first: a per-IP upload limit (the per-identity one
+# is bypassable by construction) and a total-bytes ceiling per server.
+# [[r2_buckets]]
+# binding = "FILES"
+# bucket_name = "concord-files"
 
 # One ConcordHub for the whole app: accounts, friend tags, the friend graph,
 # and the secret code behind each DM. Never sees message content.
