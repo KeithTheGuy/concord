@@ -2556,9 +2556,12 @@ html[data-theme="nord"] {
   --bg-chat: #2e3440;
   --bg-sidebar: #2b303b;
   --bg-rail: #242933;
+  /* nord1/2/3. These were input and hover both on nord1, which made a hovered
+     channel row and the composer the same surface and flattened the elevation
+     model in this theme alone. */
   --bg-input: #3b4252;
-  --bg-hover: #3b4252;
-  --bg-active: #434c5e;
+  --bg-hover: #434c5e;
+  --bg-active: #4c566a;
   --blurple: #88c0d0;
   --blurple-hover: #6fa8ba;
   --green: #a3be8c;
@@ -2620,7 +2623,6 @@ html[data-theme="gold"] {
   --red: #d9614c;
   --yellow: #ffd479;
   --text: #f0e4cd;
-  --text-muted: #a3917059;
   --text-muted: #a39170;
   --text-header: #fff6e4;
   --glow: 0 0 12px rgba(232, 182, 76, 0.45);
@@ -5440,4 +5442,27 @@ body.turbo #composer:focus-within {
   #jm-icons button:hover {
     transform: none;
   }
+}
+
+/* ============================ BADGE LEGIBILITY ============================
+   Unread badges are white-on-red, which measured between 2.32:1 (Vapor) and
+   4.09:1 (Nord) — the two pastel palettes were the worst, and no theme passed.
+   Dark ink beats white on six of the seven reds, so the ink flips; the fill is
+   then lifted toward white until the worst theme clears AA, which lands at 80%
+   (Nord, 4.90:1). Anything less and Nord fails; much more and the badge stops
+   reading as an alarm, which is the whole job of a red dot.
+
+   --red itself is untouched, because it also draws mention stripes and danger
+   buttons where the saturated colour is doing the signalling, not the text. */
+:root {
+  --badge-bg: color-mix(in srgb, var(--red) 80%, #fff);
+  --badge-ink: var(--bg-rail);
+}
+
+.chan-badge,
+.rail-badge,
+.server-bubble .badge,
+.server-bubble .badge.mention-badge {
+  background: var(--badge-bg);
+  color: var(--badge-ink);
 }
