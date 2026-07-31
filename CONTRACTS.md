@@ -37,6 +37,7 @@ client ────────────────────────�
 ```jsonc
 {
   "type": "upload-ticket",
+  "nonce": "u3f9k2",                                                       // correlates the reply
   "files": [ { "name": "cat.png", "size": 81234, "mime": "image/png" } ]   // 1..10
 }
 ```
@@ -44,9 +45,25 @@ client ────────────────────────�
 Server replies with one of:
 
 ```jsonc
-{ "type": "upload-tickets", "tickets": [ { "id": "…", "key": "a/CODE/uuid/cat.png", "max": 26214400 } ] }
-{ "type": "error", "error": "Files cap out at 25 MB." }
+{ "type": "upload-tickets", "nonce": "u3f9k2", "tickets": [ { "id": "…", "key": "a/CODE/uuid/cat.png", "max": 81234 } ] }
+{ "type": "error", "error": "Files cap out at 25 MB.", "for": "upload-ticket", "nonce": "u3f9k2" }
 ```
+
+Two fields here exist purely to stop one upload's reply landing on another's
+request. **`nonce`** is echoed on both the success and the error: tickets are
+minted for a specific list of files in a specific order, so a misrouted reply
+hands a PNG the ticket cut for a video. The client ignores a *mismatched* nonce
+but accepts a reply with none, so an older Worker still works.
+
+**`for`** exists because the client otherwise cannot tell "your files were
+refused" from "you hit the pin cap" — and the catch-all in `dispatch` turns any
+thrown exception into a bare `error` frame. Without the tag, an unrelated error
+mid-upload aborted the whole batch and stranded its tickets for their full TTL,
+during which every retry was refused as over the pending-ticket cap.
+
+`max` is the **declared size of that specific file**, clamped to the global
+ceiling — not the ceiling itself. A ticket that reports the ceiling makes the
+declared size decorative, and the size check at PUT time meaningless.
 
 Server-side checks, all of which reject the whole batch:
 
