@@ -44,6 +44,21 @@ to the server, so only share it with people you want in.
   call carries on untouched. The rail shows a green ring on whichever server holds it,
   unread badges on the rest, and the voice panel clicks through to jump back
 - **Servers** with invite codes; join as many as you want (left rail)
+- **Files, images and video** — drag them in, paste a screenshot, or hit 📎. Images
+  render inline in a grid that reserves its space so the chat never reflows under
+  you as they load; video and audio get real players; anything else becomes a
+  download card. Mark one as a spoiler and it stays blurred until clicked. 25 MB
+  a file, ten files a message
+- **People stick around** — the member list keeps everyone who has ever joined,
+  split into Online and Offline with a last-seen line, instead of forgetting you
+  the moment you close the tab. The first person in a server owns it and can kick
+  or ban; everything else is a flat clubhouse
+- **Threads** — 💬 on any message starts one. A thread is a channel underneath the
+  hood, which is why history, reactions, pins and unread badges all just work in it
+- **Channel categories** with collapsible headers, and **slowmode** per channel
+  (the owner is exempt, as it should be)
+- **Custom server emoji** — upload a picture, name it, `:name:` works in messages
+  and as a reaction, and a message that's nothing but emoji renders them big
 - **Text channels** — history, edit/delete, replies, emoji reactions, typing indicators,
   markdown (`**bold**`, `*italic*`, `~~strike~~`, `` `code` ``, ``` ```blocks``` ```,
   `||spoilers||`), links, unread badges + notification pings, emoji picker
@@ -73,6 +88,13 @@ to the server, so only share it with people you want in.
 - **Voice channels** — real-time group voice (WebRTC mesh), speaking indicators,
   mute / deafen, push-to-talk with a bindable key, per-user volume (right-click someone
   in voice), input-device picker, join/leave sounds
+- **Audio settings that earn their name** — an adjustable noise gate with a live
+  meter that draws the threshold on the same axis, so you can watch your own
+  voice cross the line instead of guessing at a number. Echo cancellation, noise
+  suppression and auto-gain toggles, an output device picker with a test tone,
+  screen-share quality (720p30 / 1080p30 / 1080p60), **share system audio**, a
+  stereo + 128kbps mode, and a live call-quality readout with real ping, packet
+  loss and bitrate
 - **Voice changer** — a full FX rack on your mic before it reaches the call, not
   just a pitch knob. **FredsVoice (ASMR)** is the headline: pitched down slightly,
   presence-lifted around 8kHz, heavily compressed so breaths come up to meet the
@@ -98,10 +120,17 @@ to the server, so only share it with people you want in.
 public/    static client (vanilla JS, no build step) — also an installable PWA
 worker/    Cloudflare Worker + ConcordServer and ConcordHub Durable Objects
 electron/  Windows desktop shell (loads the live site, like real Discord)
+CONTRACTS.md        the wire protocol — read this before touching either half
 public/voicefx.js   the voice FX rack — presets are plain descriptions of a
                     signal chain, and buildFxGraph turns them into WebAudio
+public/voicelab.js  noise gate, level meter, device routing, call statistics
+public/voiceui.js   the audio half of Settings; builds its own markup
+public/uploads.js   the upload handshake and attachment rendering
+public/customemoji.js  the :name: registry and its render pass
 public/flair.js     themes, turbo effects, XP curve, achievements
-test/      smoke.mjs (protocol) · e2e.mjs (two-browser incl. live WebRTC audio)
+test/      run-all.mjs (every suite, one verdict) · smoke.mjs (protocol)
+           uploads.mjs · roster.mjs · threads.mjs (the 2026-07-30 round)
+           e2e.mjs (two-browser incl. live WebRTC audio)
            social.mjs (friends + DMs) · groups.mjs (group chats across three
            browsers) · multirealm.mjs (a call surviving you wandering off)
            flair.mjs (offline-renders every voice preset to prove it changes
@@ -132,12 +161,19 @@ never sees message content.
 ```bash
 npm install
 npm run dev       # wrangler dev on http://localhost:4189
-npm run smoke     # protocol test against the dev server
+npm test          # every suite, one verdict (starts a server if none is up)
+npm test protocol # just the fast ones — seconds, not minutes
 npm run e2e       # two-browser Playwright test (chat + voice + notifications)
-npm run social    # two-browser test of friends, requests, DMs and DM unreads
 npm run app       # run the desktop app from source
 npm run dist      # build Windows installer + portable exe into dist/
 npm run deploy    # ship the web app
+```
+
+Uploads need an R2 bucket. It's simulated locally, so `npm run dev` works with no
+setup, but the first real deploy needs it to exist:
+
+```bash
+npx wrangler r2 bucket create concord-files
 ```
 
 Note: this machine pins `wrangler` 3.x (Node 20). If you upgrade Node to 22+, wrangler 4 works too.
