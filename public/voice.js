@@ -9,6 +9,7 @@ import {
   micConstraints,
   displayConstraints,
   applySenderParams,
+  applyVideoSenderParams,
   applySink,
   summariseStats,
 } from "./voicelab.js";
@@ -32,6 +33,27 @@ const ELEMENT_SINK =
 // Screen-share audio sits under the voice rather than over it — the point is
 // to hear the game, not to be drowned out by it.
 const SHARE_AUDIO_GAIN = 0.8;
+
+// This is a full mesh: a screen share isn't one upload, it's one independent
+// encode PER PEER, all leaving this machine at once. A flat per-peer cap
+// doesn't protect anyone once the room is big enough — 8 peers at an
+// uncapped 1080p60 (~2-3Mbps each) is 17-22Mbps of uplink from one person,
+// which reliably collapses everyone's call. So the cap is a shared budget:
+// SHARE_VIDEO_BUDGET_KBPS is the total we're willing to spend on the share
+// across every peer combined, divided evenly as the room grows.
+// SHARE_VIDEO_MAX_KBPS keeps a 1:1 or small call from being throttled below
+// what a single 720p30 stream actually wants. SHARE_VIDEO_MIN_KBPS is the
+// floor below which screen text stops being legible, so a big room degrades
+// instead of collapsing to nothing.
+//   peers=1  -> 6000/1 = 6000, capped to 2000
+//   peers=2  -> 6000/2 = 3000, capped to 2000
+//   peers=3  -> 6000/3 = 2000  (budget and ceiling meet)
+//   peers=6  -> 6000/6 = 1000
+//   peers=8  -> 6000/8 =  750   (total uplink for the share: 6Mbps, not 17-22)
+//   peers=24 -> 6000/24=  250  (floor)
+const SHARE_VIDEO_BUDGET_KBPS = 6000;
+const SHARE_VIDEO_MAX_KBPS = 2000;
+const SHARE_VIDEO_MIN_KBPS = 250;
 
 // Compares two FX specs ignoring pitch, so moving the pitch slider doesn't
 // tear down and rebuild the whole rack on every input event.
@@ -418,10 +440,13 @@ export class VoiceEngine {
     try {
       peer.pc.onnegotiationneeded = null;
       peer.pc.onicecandidate = null;
+      peer.pc.oniceconnectionstatechange = null; // else a closed pc can still restartIce() on itself
       peer.pc.ontrack = null;
       peer.pc.onconnectionstatechange = null;
       peer.pc.close();
     } catch {}
+    // One fewer peer means everyone still sharing gets a bigger slice.
+    this._rebalanceShareBitrate();
     if (peer.audioEl) {
       peer.audioEl.srcObject = null;
       peer.audioEl.remove();
@@ -832,6 +857,31 @@ export class VoiceEngine {
     const track = this.shareStream.getVideoTracks()[0];
     if (!track || peer.videoSender) return;
     peer.videoSender = peer.pc.addTrack(track, this.shareStream);
+    // Adding a sender changes the room's peer count, so rebalance everyone's
+    // slice of the budget rather than just capping this one.
+    this._rebalanceShareBitrate();
+  }
+
+  // peers.size is exactly the fan-out of the share: one independent encode
+  // per connected peer. Floors at 1 so a cap still applies before any peer
+  // has connected (harmless — _attachShare only runs once one has).
+  _shareVideoKbps() {
+    const perPeer = SHARE_VIDEO_BUDGET_KBPS / Math.max(1, this.peers.size);
+    return Math.max(SHARE_VIDEO_MIN_KBPS, Math.min(SHARE_VIDEO_MAX_KBPS, perPeer));
+  }
+
+  /**
+   * Re-applies the current bitrate budget to every live screen-share sender.
+   * Called whenever the peer count could have moved — join, leave, or a
+   * fresh reconnect — so the cap always reflects the room as it is now, not
+   * as it was when the share started.
+   */
+  _rebalanceShareBitrate() {
+    if (!this.shareStream) return;
+    const kbps = this._shareVideoKbps();
+    for (const peer of this.peers.values()) {
+      if (peer.videoSender) applyVideoSenderParams(peer.videoSender, kbps).catch(() => {});
+    }
   }
 
   stopShare() {

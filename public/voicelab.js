@@ -177,10 +177,16 @@ export const SHARE_QUALITY = [
   { id: "1080p60", label: "1080p60", width: 1920, height: 1080, fps: 60 },
 ];
 const SHARE_QUALITY_BY_ID = new Map(SHARE_QUALITY.map((q) => [q.id, q]));
+// 720p30 is what a first-time sharer gets with zero opinions of their own —
+// 1080p60 is a ~4x bigger encode (pixels x 2, framerate x 2) and stays one
+// dropdown away for whoever actually wants it. Named explicitly rather than
+// relying on array order so this can't silently change if SHARE_QUALITY is
+// reordered later.
+const DEFAULT_SHARE_QUALITY = SHARE_QUALITY_BY_ID.get("720p30");
 
 /** getDisplayMedia constraints from the chosen quality + shareAudio toggle. */
 export function displayConstraints(settings = {}) {
-  const q = SHARE_QUALITY_BY_ID.get(settings.shareQuality) || SHARE_QUALITY[0];
+  const q = SHARE_QUALITY_BY_ID.get(settings.shareQuality) || DEFAULT_SHARE_QUALITY;
   return {
     video: {
       width: { ideal: q.width },
@@ -218,6 +224,40 @@ export async function applySenderParams(sender, settings = {}) {
     await sender.setParameters(params);
   } catch {
     // e.g. no prior setLocalDescription, or the field isn't supported here.
+  }
+}
+
+/**
+ * Caps a screen/camera video sender's bitrate. Kept separate from
+ * applySenderParams rather than merged into it: audio derives its bitrate
+ * from settings (stereo or not), video is handed a number computed from the
+ * room size — see VoiceEngine's share bitrate budget in voice.js for why a
+ * flat per-peer cap isn't enough on a mesh. Same Firefox-safety contract as
+ * applySenderParams: missing getParameters/setParameters/encodings is a
+ * silent no-op, never a throw.
+ */
+export async function applyVideoSenderParams(sender, maxBitrateKbps) {
+  if (!sender || typeof sender.getParameters !== "function") return;
+  const params = sender.getParameters();
+  if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+  for (const enc of params.encodings) enc.maxBitrate = Math.round(maxBitrateKbps * 1000);
+  // Screen share is mostly static text/UI: losing frames under pressure
+  // still reads, losing resolution turns it to mush. Bias the encoder to
+  // hold resolution and let framerate be the thing that gives.
+  //
+  // Chromium doesn't include `degradationPreference` as an own key on the
+  // object getParameters() returns unless it's already been set — an
+  // `"degradationPreference" in params` guard is therefore always false and
+  // silently drops this. Assign it unconditionally instead: WebIDL
+  // dictionaries ignore members they don't recognise rather than throwing,
+  // so on a stack without support (e.g. Firefox) this is a no-op, not a
+  // failure — same contract as the rest of this function.
+  params.degradationPreference = "maintain-resolution";
+  if (typeof sender.setParameters !== "function") return;
+  try {
+    await sender.setParameters(params);
+  } catch {
+    // Same story as applySenderParams above.
   }
 }
 
