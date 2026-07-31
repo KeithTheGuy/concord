@@ -37,6 +37,7 @@ const SUITES = [
   ["uploads", "protocol"],
   ["security", "protocol"],
   ["hubsec", "protocol"],
+  ["callring", "protocol"],
   ["archive", "protocol"],
   ["roster", "protocol"],
   ["threads", "protocol"],

@@ -1970,11 +1970,19 @@ const PROBES_PER_WINDOW = 12;
 const ACCOUNTS_PER_IP_HOUR = 30;
 const IP_WINDOW_MS = 60 * 60 * 1000;
 const IP_SWEEP_EVERY = 50;
+// A ring arrives unsolicited and aimed at one person, so the shared 30-per-5s
+// ceiling below is the wrong tool on its own: that one is a flood guard, and
+// ringing someone over and over is the harassment shape the block system exists
+// for. Six a minute is already redialling every ten seconds. Keyed on the
+// account rather than the socket, for the reason `probeBudget` spells out — a
+// socket costs an attacker nothing to replace.
+const RING_WINDOW_MS = 60_000;
+const RINGS_PER_WINDOW = 6;
 const HUB_RATE_LIMITED = new Set([
   "hello", "friend-add", "friend-accept", "friend-decline", "friend-remove",
   "presence", "set-tag", "dm-open", "dm-nudge", "dm-read", "poke",
   "gdm-create", "gdm-open", "gdm-leave", "gdm-add", "gdm-rename",
-  "friend-block", "friend-unblock", "blocks",
+  "friend-block", "friend-unblock", "blocks", "call-ring", "call-end",
 ]);
 
 const frKey = (a, b) => `fr:${a}:${b}`;
@@ -2010,6 +2018,11 @@ export class ConcordHub {
     // object deliberately has no sweep over anything identity-shaped (see
     // `hello`). Losing it to hibernation costs an attacker a wait, not nothing.
     this.probes = new Map(); // ip -> [timestamps]
+    // The call-ring budget, in memory for the same reason and with the same
+    // caveat. Deliberately not a storage row: `call-ring` is the one op here
+    // that writes nothing at all, and giving it a counter would be the first
+    // step back towards the durable state it exists to avoid.
+    this.rings = new Map(); // uid -> [timestamps]
     this.newAccounts = 0;
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
@@ -2219,6 +2232,19 @@ export class ConcordHub {
     if (mine.length >= PROBES_PER_WINDOW) return false;
     mine.push(now);
     await this.state.storage.put(key, mine);
+    return true;
+  }
+
+  // Only `call-ring` spends from this. `call-end` deliberately doesn't: rate
+  // limiting the retraction is exactly how you end up with a ring nobody can
+  // take back down, and a frame whose whole job is to remove a notification
+  // isn't worth defending against.
+  ringBudget(uid) {
+    const now = Date.now();
+    const hits = (this.rings.get(uid) || []).filter((t) => now - t < RING_WINDOW_MS);
+    this.rings.set(uid, hits);
+    if (hits.length >= RINGS_PER_WINDOW) return false;
+    hits.push(now);
     return true;
   }
 
@@ -2947,6 +2973,66 @@ export class ConcordHub {
         const acct = await this.account(s.uid);
         const landed = this.sendToUser(other, { type: "poked", uid: s.uid, name: acct?.name || "Someone" });
         ws.send(JSON.stringify({ type: "poke-sent", landed }));
+        break;
+      }
+
+      // Ringing someone who doesn't have that conversation open. A ring is
+      // otherwise derived from the DM's own socket, and a DM you haven't opened
+      // this session has no socket — which is every DM you own, immediately
+      // after a reload. So nobody could call you until you happened to open the
+      // conversation first, which is backwards.
+      //
+      // This relays and forgets. No unread key, no counter, nothing durable —
+      // the same shape as `poke`, and for the same reason: it is a live
+      // notification, and a phone that was switched off does not ring later for
+      // a call that ended an hour ago. What it actually announces is "there is a
+      // call in this conversation, go and look"; the realm's own voice
+      // membership stays the only thing that decides whether you are being rung.
+      // That is what makes it unstickable, and it is why a caller whose socket
+      // simply dies needs nothing here: by then the recipient is connected to
+      // the realm, which drops them from voice on its own.
+      //
+      // `call-end` is therefore a courtesy — it stops the recipient holding a
+      // socket open for a call that has already ended — rather than the thing
+      // correctness rests on.
+      case "call-ring":
+      case "call-end": {
+        if (!s.uid) return;
+        const ringing = m.type === "call-ring";
+        if (ringing && !this.ringBudget(s.uid)) return;
+        const chanId = cleanText(m.chanId, 20);
+        const acct = ringing ? await this.account(s.uid) : null;
+
+        // Group flavour: everyone else in it, one at a time rather than through
+        // `tellGroup`, because each member's block has to be checked.
+        if (m.gdm) {
+          const group = await this.loadGroup(cleanText(m.gdm, 40));
+          if (!group || !group.members.includes(s.uid)) return;
+          for (const uid of group.members) {
+            if (uid === s.uid) continue;
+            if (await this.isBlocked(uid, s.uid)) continue;
+            this.sendToUser(
+              uid,
+              ringing
+                ? { type: "call-ring", gdm: group.id, uid: s.uid, name: acct?.name || "Someone", chanId }
+                : { type: "call-end", gdm: group.id }
+            );
+          }
+          break;
+        }
+
+        const other = cleanText(m.uid, 40);
+        const row = await storage.get(frKey(s.uid, other));
+        if (row?.state !== "friend") return;
+        // Silent, like a blocked poke: a ring that goes nowhere and a ring
+        // nobody was there to hear have to look identical from the caller's end.
+        if (await this.isBlocked(other, s.uid)) return;
+        this.sendToUser(
+          other,
+          ringing
+            ? { type: "call-ring", uid: s.uid, name: acct?.name || "Someone", chanId }
+            : { type: "call-end", uid: s.uid }
+        );
         break;
       }
     }
