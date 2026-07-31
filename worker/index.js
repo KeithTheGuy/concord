@@ -366,9 +366,14 @@ export class ConcordServer {
     }
 
     // What GET /api/invite/<CODE> is allowed to know: the name and icon, and
-    // the inviter's name if `meta.owner` already has a roster row for it —
-    // both already sitting in storage, so nothing new gets written or kept
-    // for this. Read-only end to end: a probe, hit or miss, leaves no trace.
+    // the OWNER's name if `meta.owner` already has a roster row for it — both
+    // already sitting in storage, so nothing new gets written or kept for this.
+    // Read-only end to end: a probe, hit or miss, leaves no trace.
+    //
+    // Deliberately `owner`, not `inviter`. We have no idea who sent you the
+    // link — anyone with the code can — so calling it the inviter would be a
+    // guess presented as a fact, and wrong every time somebody shares a server
+    // they don't own.
     // A conversation is not a joinable server, so `kind: "dm"` answers exactly
     // like an unknown code — a DM/group code is never distinguishable from a
     // 404 through this door. `meta.kind` is settled once, at creation, by
@@ -380,7 +385,7 @@ export class ConcordServer {
       const out = { name: meta.name, icon: meta.icon };
       if (meta.owner) {
         const owner = await this.state.storage.get(`roster:${meta.owner}`);
-        if (owner?.name) out.inviter = owner.name;
+        if (owner?.name) out.owner = owner.name;
       }
       return Response.json(out);
     }

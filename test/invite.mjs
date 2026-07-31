@@ -8,7 +8,7 @@
 // a 404-vs-101 oracle is already accepted. This endpoint makes the same
 // question reachable over a bare GET with no upgrade to complete, so every
 // check here is a boundary it has to hold on its own: name a real server,
-// 404 an unknown one, never name a DM, leak nothing past name/icon/inviter,
+// 404 an unknown one, never name a DM, leak nothing past name/icon/owner,
 // leave no storage behind either way, and not fall over when the rate
 // limiter has no CF-Connecting-IP to key on — exactly the case under
 // `wrangler dev`, which is what this suite runs against.
@@ -136,15 +136,15 @@ console.log(`Concord invite-peek test → ${base}`);
   }
   ok(`invite: a real server answers with its name and icon (${JSON.stringify(data)})`);
 
-  const allowed = new Set(["name", "icon", "inviter"]);
+  const allowed = new Set(["name", "icon", "owner"]);
   const extra = Object.keys(data).filter((k) => !allowed.has(k));
   if (extra.length) fail("no extra fields leak", JSON.stringify(data));
-  ok("invite: the response carries nothing beyond name, icon and (optionally) inviter — no roster, no member count");
+  ok("invite: the response carries nothing beyond name, icon and (optionally) owner — no roster, no member count");
 
   // Keith's `hello` above wrote his roster row before the welcome was even
-  // sent, so the inviter's name is exactly the "cheaply available" case.
-  if (data.inviter !== "Keith") fail("the inviter's name rides along when it's cheap", JSON.stringify(data));
-  ok("invite: the inviter's name is included because it cost nothing beyond a roster read");
+  // sent, so the owner's name is exactly the "cheaply available" case.
+  if (data.owner !== "Keith") fail("the owner's name rides along when it's cheap", JSON.stringify(data));
+  ok("invite: the owner's name is included because it cost nothing beyond a roster read");
 
   if (!/max-age=\d+/.test(hit.headers.get("cache-control") || "")) {
     fail("the response is cacheable", hit.headers.get("cache-control"));

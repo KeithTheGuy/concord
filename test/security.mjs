@@ -36,7 +36,12 @@ function fail(label, detail) {
   process.exit(1);
 }
 
-const watchdog = setTimeout(() => fail("security suite", "whole suite timed out"), 180_000);
+// Generous on purpose. Proving the identity takeover needs ~440 sockets to
+// force an eviction sweep, which takes about 8s on an idle machine and several
+// times that when anything else is competing for the CPU. A watchdog that fires
+// under load reports a security regression that isn't there, which is the worst
+// possible false alarm to train yourself to ignore.
+const watchdog = setTimeout(() => fail("security suite", "whole suite timed out"), 600_000);
 watchdog.unref?.();
 
 function connect(server, params = "") {
