@@ -76,8 +76,12 @@
    Call quality readout (#vs-quality in the voice panel)
    ------------------------------------------------------------------------- */
 
+/* The readout carries the failing number inline, which can be long enough to
+   wrap the panel. Let it — two short lines beat an ellipsis eating the only
+   part that matters. */
 #vs-quality {
-  cursor: default; /* it has a tooltip worth hovering for */
+  cursor: default;
+  white-space: normal;
   transition: color 0.2s ease;
 }
 
@@ -99,9 +103,72 @@
   color: var(--red);
 }
 
+/* Alone in the channel, or still shaking hands. Deliberately the dimmest
+   state in the panel: it isn't good news, it isn't bad news, it's nothing
+   happening yet — and the default green would read as "working". */
+#vs-quality.q-wait {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------------------
+   Peer trouble banner (injected under the button row by voiceui.js)
+   ------------------------------------------------------------------------- */
+
+/* This is the app admitting something is broken, so it gets the red rule and
+   the space to say a whole sentence. It only ever appears when there is
+   genuinely nothing else to try, which is what keeps it from being wallpaper. */
+.vs-trouble {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--red);
+  border-radius: 0 4px 4px 0;
+  background: rgba(242, 63, 67, 0.1);
+}
+
+.vs-trouble p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.vs-trouble p + p {
+  margin-top: 6px;
+}
+
+/* -------------------------------------------------------------------------
+   Settings spotlight — where the voice panel's ⚙ lands you
+   ------------------------------------------------------------------------- */
+
+/* The Voice section is a long way down a long modal, and arriving there
+   silently looks identical to the modal just having opened. One pulse is
+   enough to say "this bit, here". */
+.vs-spotlight {
+  border-radius: 8px;
+  animation: vs-spot 1.6s ease-out;
+}
+
+@keyframes vs-spot {
+  0%,
+  40% {
+    box-shadow: 0 0 0 2px var(--blurple);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .vmeter-fill,
   #vs-quality {
     transition: none;
+  }
+
+  /* Still mark the section — just hold it still instead of pulsing. The
+     JS removes the class on its own timer either way. */
+  .vs-spotlight {
+    animation: none;
+    box-shadow: 0 0 0 2px var(--blurple);
   }
 }

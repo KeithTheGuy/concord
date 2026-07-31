@@ -353,3 +353,38 @@ export function qualityLabel({ rtt, loss } = {}) {
   if (r < 400 && l < 8) return { label: "Ok", cls: "q-ok" };
   return { label: "Poor", cls: "q-poor" };
 }
+
+// The point at which a number stops being trivia and starts being the reason
+// the call sounds wrong. Deliberately the same 200ms / 3% the table above
+// uses for "Ok", so the word and the number can never contradict each other.
+//   loss    3%  — under this Opus's own concealment papers over the gaps;
+//                 over it you hear syllables go missing
+//   rtt   200ms — round trip. Past this two people start talking over each
+//                 other because neither hears the other start
+//   jitter 30ms — more spread than the receiver's buffer smooths out, which
+//                 is the warbly, underwater sound. Not in the table above,
+//                 so it can be the only thing wrong with an otherwise fine
+//                 connection — which is exactly why it's listed here.
+const ISSUE_LOSS_PCT = 3;
+const ISSUE_RTT_MS = 200;
+const ISSUE_JITTER_MS = 30;
+
+// 8.2 -> "8.2", 8 -> "8". A trailing ".0" reads like false precision on a
+// number this shaky.
+const trim = (n) => String(Math.round(n * 10) / 10);
+
+/**
+ * The one number worth putting in front of someone, or null when nothing is.
+ * One, not all four: a readout that lists everything is a readout nobody
+ * reads. Ranked by how far past its own threshold each metric is, so the
+ * thing that's actually broken wins rather than the thing listed first.
+ */
+export function qualityIssue({ rtt, loss, jitter } = {}) {
+  const over = [];
+  if (loss != null && loss >= ISSUE_LOSS_PCT) over.push([loss / ISSUE_LOSS_PCT, `${trim(loss)}% loss`]);
+  if (rtt != null && rtt >= ISSUE_RTT_MS) over.push([rtt / ISSUE_RTT_MS, `${Math.round(rtt)}ms ping`]);
+  if (jitter != null && jitter >= ISSUE_JITTER_MS) over.push([jitter / ISSUE_JITTER_MS, `${Math.round(jitter)}ms jitter`]);
+  if (!over.length) return null;
+  over.sort((a, b) => b[0] - a[0]);
+  return over[0][1];
+}

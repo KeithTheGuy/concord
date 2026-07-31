@@ -5,7 +5,7 @@
 // Everything it touches from the app arrives through the hooks object, and
 // everything it knows about audio comes from voicelab.js.
 
-import { createMeter, micConstraints, listDevices, SHARE_QUALITY, qualityLabel } from "./voicelab.js";
+import { createMeter, micConstraints, listDevices, SHARE_QUALITY, qualityLabel, qualityIssue } from "./voicelab.js";
 
 // Mirrors voicelab's private threshold curve. Duplicated on purpose: it lets
 // the meter and the slider share one axis, so the bar and the marker are
@@ -51,6 +51,9 @@ const CONTROLS = `
  *   onSettingsOpen(fn): void,    // called with a fn to run whenever settings opens
  *   panelEl(): HTMLElement,      // the settings modal
  *   qualityEl(): HTMLElement,    // #vs-quality in the voice panel
+ *   openSettings?(): void,       // app.js owns the modal; without this the
+ *                                // voice panel's ⚙ isn't drawn at all,
+ *                                // rather than drawn dead
  * }
  */
 export function installVoiceUI(hooks) {
@@ -306,7 +309,38 @@ export function installVoiceUI(hooks) {
     hooks.save();
   };
 
+  /* ---------------------------------------------------------- panel ⚙ */
+
+  // Everything above lives ~1600px down a settings modal, which is a long way
+  // to travel on a hunch. Someone who has just been told their keyboard is
+  // deafening needs one button, in the panel they're already looking at, that
+  // lands them on the noise gate. Built here rather than in index.html for
+  // the same reason the rest of this file is: it isn't ours to edit.
+  function installGear() {
+    if (!hooks.openSettings) return;
+    const row = hooks.qualityEl?.()?.closest(".vs-row");
+    if (!row || row.querySelector("#vs-settings")) return;
+    const btn = document.createElement("button");
+    btn.id = "vs-settings";
+    btn.type = "button";
+    btn.title = "Audio settings — noise gate, devices, output";
+    btn.textContent = "⚙";
+    row.insertBefore(btn, row.querySelector("#btn-hangup"));
+    btn.onclick = () => {
+      hooks.openSettings();
+      // One frame, because the modal is only unhidden as openSettings returns
+      // and an element with no layout has nothing to scroll to. Not a loop.
+      requestAnimationFrame(() => {
+        const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        host.scrollIntoView({ block: "start", behavior: still ? "auto" : "smooth" });
+        host.classList.add("vs-spotlight");
+        setTimeout(() => host.classList.remove("vs-spotlight"), 1600);
+      });
+    };
+  }
+
   refresh();
+  installGear();
   hooks.onSettingsOpen(() => {
     refresh();
     populateOutputs();
@@ -316,7 +350,13 @@ export function installVoiceUI(hooks) {
 
 /* ------------------------------------------------------- quality readout */
 
-const Q_CLASSES = ["q-excellent", "q-good", "q-ok", "q-poor"];
+// The readout's whole job is to be ignorable. A good call says "Voice
+// Connected" and nothing else — no ping, no bitrate, no invitation to worry
+// about a number that's fine. The moment something is genuinely wrong, the
+// number that's wrong goes on the line, in the danger colour, where you'll
+// see it without hovering anything. Silence when healthy, specifics when not.
+
+const Q_CLASSES = ["q-excellent", "q-good", "q-ok", "q-poor", "q-wait"];
 let qTimer = null;
 let qNode = null;
 
@@ -326,13 +366,64 @@ function arrowOf(node) {
   return node.textContent.includes("↗") ? " ↗" : "";
 }
 
-function resetQuality(node) {
-  node.textContent = "Voice Connected" + arrowOf(node);
+function paint(node, text, cls, title) {
+  node.textContent = text + arrowOf(node);
   node.classList.remove(...Q_CLASSES);
-  node.removeAttribute("title");
+  if (cls) node.classList.add(cls);
+  if (title) node.title = title;
+  else node.removeAttribute("title");
+}
+
+function resetQuality(node) {
+  paint(node, "Voice Connected", null, null);
 }
 
 const ms = (n) => (n == null ? "—" : Math.round(n) + "ms");
+
+// Still worth keeping every number somewhere, just not as the only copy of
+// them: this is for the person who wants to read out their ping, not the
+// person who needs to know something's wrong.
+function detail(s) {
+  return (
+    `${ms(s.rtt)} ping · ${s.loss.toFixed(1)}% loss · ${s.kbps.toFixed(0)} kbps · ${ms(s.jitter)} jitter` +
+    (s.peers > 1 ? ` · worst of ${s.peers} peers` : "")
+  );
+}
+
+function render(node, s) {
+  // Sitting in a voice channel alone is not a working call, and saying
+  // "Voice Connected" at someone who is talking to nobody is how you end up
+  // testing your microphone for ten minutes. But a peer we've given up on
+  // has had its connection closed, so it isn't in `peers` any more — and
+  // "waiting for someone else" would be a lie with a red banner underneath
+  // naming the person we just lost.
+  if (!s || !s.peers) {
+    const lost = !!(s && s.troubled);
+    paint(node, lost ? "Voice Nobody connected" : "Waiting for someone else…", lost ? "q-poor" : "q-wait", null);
+    return;
+  }
+  if (!s.samples) {
+    // Peers exist but no audio has arrived from any of them. Either the
+    // handshake is still going, or it already lost — voice.js knows which.
+    const stuck = s.troubled >= s.peers;
+    paint(node, stuck ? "Voice Nobody connected" : "Voice Connecting…", stuck ? "q-poor" : "q-wait", null);
+    return;
+  }
+  const issue = qualityIssue(s);
+  if (!issue) {
+    paint(node, "Voice Connected", null, detail(s));
+    return;
+  }
+  let { label, cls } = qualityLabel(s);
+  // Jitter isn't in qualityLabel's table, so it can be the only thing wrong
+  // with a connection the table still calls Excellent. "Voice Excellent ·
+  // 48ms jitter" is a readout arguing with itself.
+  if (cls === "q-excellent" || cls === "q-good") {
+    label = "Ok";
+    cls = "q-ok";
+  }
+  paint(node, `Voice ${label} · ${issue}`, cls, detail(s));
+}
 
 export function startQualityMeter(hooks) {
   stopQualityMeter();
@@ -348,19 +439,7 @@ export function startQualityMeter(hooks) {
     try {
       s = await hooks.voice.stats();
     } catch {}
-    // No inbound RTP yet (alone in the channel, or still connecting) is not
-    // the same as a bad connection — say nothing rather than guess.
-    if (!s || !s.samples) {
-      resetQuality(node);
-      return;
-    }
-    const label = qualityLabel(s);
-    node.textContent = `Voice ${label.label}${arrowOf(node)}`;
-    node.classList.remove(...Q_CLASSES);
-    node.classList.add(label.cls);
-    node.title =
-      `${ms(s.rtt)} ping · ${s.loss.toFixed(1)}% loss · ${s.kbps.toFixed(0)} kbps · ${ms(s.jitter)} jitter` +
-      (s.peers > 1 ? ` · worst of ${s.peers} peers` : "");
+    render(node, s);
   };
   tick();
   qTimer = setInterval(tick, 2000);
@@ -371,8 +450,95 @@ export function stopQualityMeter() {
     clearInterval(qTimer);
     qTimer = null;
   }
+  clearTrouble(); // before qNode goes, since that's how the banner is found
   if (qNode) {
     resetQuality(qNode);
     qNode = null;
+  }
+}
+
+/* --------------------------------------------------------- peer trouble */
+
+// With no TURN server, a specific pair of people can fail to connect while
+// everyone else in the call is fine (README: 5–15% of pairs). Left unsaid,
+// that reads as "my mic is broken" or "they're ignoring me" — both wrong,
+// and both send someone off fixing the wrong thing. So: name the person, name
+// the cause, and say who it doesn't affect.
+
+const troubled = new Map(); // sid -> {name, kind}
+let troubleNode = null;
+
+/**
+ * The engine's onPeerTrouble hook, with a name attached — voice.js deals in
+ * sids and has no idea who anyone is.
+ *   kind "unreachable" — never connected. Almost always NAT: no TURN, no route.
+ *   kind "dropped"     — was connected, then wasn't. Almost always someone's wifi.
+ *   kind "recovered"   — take it back; they're here, or they've left.
+ */
+export function peerTrouble(sid, kind, name) {
+  if (kind === "recovered") troubled.delete(sid);
+  else troubled.set(sid, { name: name || "someone", kind });
+  renderTrouble();
+}
+
+export function clearTrouble() {
+  troubled.clear();
+  renderTrouble();
+}
+
+const listNames = (rows) => {
+  const names = rows.map((r) => r.name);
+  if (names.length < 3) return names.join(" and ");
+  return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+};
+
+function troubleLines() {
+  const rows = [...troubled.values()];
+  const unreachable = rows.filter((r) => r.kind === "unreachable");
+  const dropped = rows.filter((r) => r.kind === "dropped");
+  const lines = [];
+  // One person you can't reach is the NAT story and it's nobody's fault.
+  // Everybody at once is a different story — that one's your end — and
+  // telling you four times that it isn't would be actively misleading.
+  if (unreachable.length > 1) {
+    lines.push(
+      `Can't reach ${listNames(unreachable)}. When it's everyone at once it's usually your side — a VPN, or a network that blocks peer-to-peer. Try it off, then rejoin.`
+    );
+  } else if (unreachable.length === 1) {
+    lines.push(
+      `Couldn't connect to ${unreachable[0].name} — your two routers won't talk to each other directly. Nothing either of you did, and it doesn't affect anyone else in the call.`
+    );
+  }
+  for (const r of dropped) {
+    lines.push(`Lost ${r.name} mid-call — that's usually someone's Wi-Fi, not the app. Either of you rejoining the channel should sort it.`);
+  }
+  return lines;
+}
+
+// Lives under the button row inside #voice-status, which means no line of
+// index.html — same deal as the settings controls above.
+function troubleHost() {
+  if (troubleNode?.isConnected) return troubleNode;
+  const panel = qNode?.closest("#voice-status");
+  if (!panel) return null;
+  troubleNode = panel.querySelector(".vs-trouble");
+  if (!troubleNode) {
+    troubleNode = document.createElement("div");
+    troubleNode.className = "vs-trouble";
+    panel.appendChild(troubleNode);
+  }
+  return troubleNode;
+}
+
+function renderTrouble() {
+  const host = troubleHost();
+  if (!host) return;
+  const lines = troubleLines();
+  host.textContent = "";
+  host.classList.toggle("hidden", !lines.length);
+  for (const line of lines) {
+    const p = document.createElement("p");
+    p.textContent = line;
+    host.appendChild(p);
   }
 }

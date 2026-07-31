@@ -55,6 +55,18 @@ const SHARE_VIDEO_BUDGET_KBPS = 6000;
 const SHARE_VIDEO_MAX_KBPS = 2000;
 const SHARE_VIDEO_MIN_KBPS = 250;
 
+// With no TURN server, some pairs of people simply cannot reach each other —
+// see the README. The browser's own verdict on that takes ~30s to arrive as
+// connectionState "failed", which is thirty seconds of a name that never
+// shows up and no explanation. 12s is comfortably past a normal STUN
+// handshake (a second or two, worst case a handful) and short enough that
+// the message lands while you're still wondering.
+const PEER_CONNECT_TIMEOUT_MS = 12000;
+// Redials cost a full ICE failure each, so this is roughly a minute of
+// trying before we stop and say so. Retrying forever isn't persistence, it's
+// just a quieter way of never telling anyone.
+const PEER_MAX_REDIALS = 2;
+
 // Compares two FX specs ignoring pitch, so moving the pitch slider doesn't
 // tear down and rebuild the whole rack on every input event.
 const stripSemis = ({ semis, ...rest }) => rest;
@@ -69,12 +81,21 @@ export class VoiceEngine {
    *   onShareEnd(sid): void,
    *   onLocalShareEnd(): void,              // our own share stopped (any reason)
    *   onError(text): void,
+   *   onPeerTrouble(sid, kind): void,       // "unreachable" | "dropped" | "recovered"
+   *                                         // no names in here — the engine
+   *                                         // doesn't know any; the UI does.
    *   settings(): {micId, ptt, pttKey, sounds, volume}  // volume 0..200
    * }
    */
   constructor(hooks) {
     this.h = hooks;
     this.peers = new Map(); // sid -> peer record
+    // Per-sid connection history, deliberately NOT on the peer record: a
+    // redial throws that record away and builds a new one, and "have we ever
+    // actually heard this person?" is the one thing a redial must not forget.
+    // It's the difference between "your routers can't see each other" and
+    // "someone's wifi blinked", which are different sentences.
+    this.links = new Map(); // sid -> {connected, redials, trouble}
     this.localStream = null;
     this.shareStream = null;
     this.chanId = null;
@@ -144,6 +165,7 @@ export class VoiceEngine {
   async leave({ silent } = {}) {
     for (const sid of [...this.peers.keys()]) this._closePeer(sid);
     this.peers.clear();
+    this.links.clear(); // watchdogs died with the peers; the verdicts go too
     if (this.shareStream) this._stopShareTracks();
     if (this.fxSource) {
       try {
@@ -190,8 +212,20 @@ export class VoiceEngine {
       userVolume: this._savedScalar(sid),
       videoSender: null,
       shareVisible: false,
+      iceRestarted: false,
+      watchdog: 0,
     };
     this.peers.set(sid, peer);
+    const link = this._link(sid);
+
+    // Nothing else notices a peer that never arrives: no error fires, no
+    // track appears, the browser just keeps trying quietly for ~30s. This is
+    // the only thing that turns that silence into a sentence.
+    peer.watchdog = setTimeout(() => {
+      peer.watchdog = 0;
+      if (this.peers.get(sid) !== peer || this._peerUp(pc)) return;
+      this._trouble(sid, link.connected ? "dropped" : "unreachable");
+    }, PEER_CONNECT_TIMEOUT_MS);
 
     pc.onnegotiationneeded = async () => {
       try {
@@ -210,23 +244,44 @@ export class VoiceEngine {
     };
 
     pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === "failed") pc.restartIce();
+      // One restart per connection attempt. A fresh redial gets its own,
+      // which is what bounds this — otherwise a pair that can't route to
+      // each other restarts ICE at each other until the tab closes.
+      if (pc.iceConnectionState === "failed" && !peer.iceRestarted) {
+        peer.iceRestarted = true;
+        pc.restartIce();
+      }
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "closed") {
-        this._closePeer(sid);
-      } else if (pc.connectionState === "failed") {
-        this._closePeer(sid);
-        // Transient ICE failure: the impolite side re-dials if the peer is
-        // still in our channel. Each retry requires a full ICE failure
-        // (tens of seconds), so this cannot spin.
-        if (this.connected && !peer.polite && this.h.inMyChannel?.(sid)) {
-          const fresh = this._ensurePeer(sid);
-          this._attachLocalAudio(fresh);
-          if (this.shareStream) this._attachShare(fresh);
-        }
+      const state = pc.connectionState;
+      if (state === "connected") {
+        this._clearWatchdog(peer);
+        link.connected = true;
+        link.redials = 0; // this peer earned a fresh budget for next time
+        this._trouble(sid, "recovered"); // a no-op unless we'd complained
+        return;
       }
+      if (state === "closed") {
+        this._closePeer(sid);
+        return;
+      }
+      if (state !== "failed") return;
+      this._closePeer(sid);
+      // The impolite side re-dials if the peer is still in our channel. Each
+      // retry costs a full ICE failure (tens of seconds), so this cannot
+      // spin — but it can go on forever, which is how a permanently
+      // unroutable pair ends up looking like nothing is happening. Give up
+      // after PEER_MAX_REDIALS, out loud.
+      const retryable = this.connected && !peer.polite && this.h.inMyChannel?.(sid);
+      if (retryable && link.redials < PEER_MAX_REDIALS) {
+        link.redials++;
+        const fresh = this._ensurePeer(sid);
+        this._attachLocalAudio(fresh);
+        if (this.shareStream) this._attachShare(fresh);
+        return;
+      }
+      this._trouble(sid, link.connected ? "dropped" : "unreachable");
     };
 
     pc.ontrack = ({ track, streams }) => {
@@ -253,6 +308,50 @@ export class VoiceEngine {
     };
 
     return peer;
+  }
+
+  _link(sid) {
+    let link = this.links.get(sid);
+    if (!link) {
+      link = { connected: false, redials: 0, trouble: null };
+      this.links.set(sid, link);
+    }
+    return link;
+  }
+
+  // connectionState "connected" is the honest answer, but Firefox lags it
+  // behind ICE by a beat and audio is already flowing by then — so an ICE
+  // pair that's up counts as up.
+  _peerUp(pc) {
+    return (
+      pc.connectionState === "connected" ||
+      pc.iceConnectionState === "connected" ||
+      pc.iceConnectionState === "completed"
+    );
+  }
+
+  _clearWatchdog(peer) {
+    if (peer.watchdog) {
+      clearTimeout(peer.watchdog);
+      peer.watchdog = 0;
+    }
+  }
+
+  /**
+   * Reports a peer's connection going wrong, or coming right again, exactly
+   * once per transition — a watchdog and a "failed" event routinely describe
+   * the same problem, and the UI shouldn't hear about it twice.
+   */
+  _trouble(sid, kind) {
+    const link = this._link(sid);
+    if (kind === "recovered") {
+      if (!link.trouble) return; // nothing to take back
+      link.trouble = null;
+    } else {
+      if (link.trouble === kind) return;
+      link.trouble = kind;
+    }
+    this.h.onPeerTrouble?.(sid, kind);
   }
 
   _attachLocalAudio(peer) {
@@ -283,16 +382,21 @@ export class VoiceEngine {
    */
   async stats() {
     const peers = this.peers.size;
+    // How many of them we've given up on, so the readout can tell "still
+    // dialing" from "dialed, nobody home" without a second round trip.
+    let troubled = 0;
+    for (const link of this.links.values()) if (link.trouble) troubled++;
     const samples = (
       await Promise.all([...this.peers.values()].map((p) => summariseStats(p.pc).catch(() => null)))
     ).filter(Boolean);
-    if (!samples.length) return { peers, samples: 0 };
+    if (!samples.length) return { peers, troubled, samples: 0 };
     const worst = (key) => {
       const vals = samples.map((s) => s[key]).filter((v) => v != null);
       return vals.length ? Math.max(...vals) : null;
     };
     return {
       peers,
+      troubled,
       samples: samples.length,
       rtt: worst("rtt"),
       loss: worst("loss") ?? 0,
@@ -429,6 +533,10 @@ export class VoiceEngine {
   }
 
   peerLeft(sid) {
+    // Someone walking out is not a connection problem, and any complaint we
+    // made about them should go with them.
+    this._trouble(sid, "recovered");
+    this.links.delete(sid);
     this._closePeer(sid);
   }
 
@@ -436,6 +544,7 @@ export class VoiceEngine {
     const peer = this.peers.get(sid);
     if (!peer) return;
     this.peers.delete(sid);
+    this._clearWatchdog(peer); // a timer that outlives its pc has nothing true to say
     if (peer.shareVisible) this.h.onShareEnd(sid);
     try {
       peer.pc.onnegotiationneeded = null;
