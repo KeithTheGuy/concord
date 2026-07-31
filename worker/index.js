@@ -1467,6 +1467,15 @@ export class ConcordServer {
           ws.send(JSON.stringify({ type: "error", error: `${CHANNEL_CAP} channels is the ceiling. Delete something.` }));
           return;
         }
+        // Two #random rows in one sidebar are indistinguishable from a bug, and
+        // the name is how people refer to a channel out loud. Threads are exempt
+        // — they're named after a moment rather than a topic, and two people
+        // starting an "about that" on different messages is entirely reasonable.
+        if (channels.some((c) => c.type === type && c.name === name)) {
+          const label = type === "voice" ? `a voice channel called ${name}` : `a #${name}`;
+          ws.send(JSON.stringify({ type: "error", error: `There's already ${label} here.` }));
+          return;
+        }
         const nextChanId = ((await storage.get("nextChanId")) || 100) + 1;
         const chan = { id: `c${nextChanId}`, type, name };
         if (type === "text") chan.topic = cleanText(m.topic, 100);

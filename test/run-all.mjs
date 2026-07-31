@@ -15,6 +15,13 @@ import { setTimeout as sleep } from "node:timers/promises";
 // A private port is worth having: wrangler hot-reloads on every save, and a
 // reload kills in-flight sockets mid-suite. Sharing the dev server you're also
 // editing against produces failures that look like bugs and aren't.
+//
+// A private PORT is not sufficient on its own, though — wrangler watches
+// ./public as well as the worker, so editing the client restarts the server
+// this is talking to no matter which port it's on. If you're running the suite
+// while anything else is writing to the repo, copy the tree somewhere and run
+// from there. Every "timed out waiting for message" failure seen during this
+// project's history has been that, and not a real bug.
 const PORT = Number(process.env.CONCORD_PORT) || 4189;
 const BASE = `http://127.0.0.1:${PORT}`;
 
