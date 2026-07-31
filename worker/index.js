@@ -118,6 +118,10 @@ export default {
       return Response.json({ code: newServerCode() });
     }
 
+    if (url.pathname.startsWith("/api/invite/")) {
+      return handleInvitePeek(request, env, url);
+    }
+
     if (url.pathname.startsWith("/api/upload/")) {
       return handleUpload(request, env, url);
     }
@@ -243,6 +247,56 @@ async function serveFile(request, env, url) {
   });
 }
 
+// Module scope, not a Durable Object: this is one cheap GET with no socket
+// and no per-server home to hang a counter on, so a plain per-isolate Map is
+// enough to blunt a script working through the alphabet from one address. It
+// resets whenever the isolate does and has no sweep, same trade ConcordHub's
+// own in-memory `probes` Map makes for the same reason — a friend group does
+// not produce enough distinct IPs to make that a leak worth guarding.
+const INVITE_PEEK_WINDOW_MS = 60_000;
+const INVITE_PEEKS_PER_WINDOW = 20; // same order as the hub's tag-probe budget
+const invitePeeks = new Map(); // ip -> [timestamps]
+
+function overInvitePeekRate(ip) {
+  if (!ip) return false; // no CF-Connecting-IP under `wrangler dev` — no limit beats a crash
+  const now = Date.now();
+  const hits = (invitePeeks.get(ip) || []).filter((t) => now - t < INVITE_PEEK_WINDOW_MS);
+  if (hits.length >= INVITE_PEEKS_PER_WINDOW) return true;
+  hits.push(now);
+  invitePeeks.set(ip, hits);
+  return false;
+}
+
+// GET /api/invite/<CODE> — what an invite link is worth before you've spent a
+// name and an avatar on it. /ws?server=CODE already answers this exact
+// question via 404 vs 101, so this doesn't hand a guesser anything new; it
+// does turn the question into a bare GET with no WebSocket upgrade to
+// complete, which is why it gets its own tighter budget and a short cache
+// instead of riding on the socket path's limits.
+async function handleInvitePeek(request, env, url) {
+  const code = url.pathname.slice("/api/invite/".length).toUpperCase();
+  if (!CODE_RE.test(code)) return new Response("not found", { status: 404 });
+
+  const ip = cleanText(request.headers.get("CF-Connecting-IP"), 64);
+  if (overInvitePeekRate(ip)) return new Response("slow down", { status: 429 });
+
+  // idFromName is free; the fetch below is what actually wakes the object, so
+  // a miss here costs exactly what a miss on /ws?server=CODE already costs —
+  // one DO invocation reading an empty `meta`, nothing written.
+  const stub = env.SERVERS.get(env.SERVERS.idFromName(code));
+  let res;
+  try {
+    res = await stub.fetch("https://do/internal/invite-peek");
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+  if (!res.ok) return new Response("not found", { status: 404 });
+
+  return new Response(await res.text(), {
+    headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=120" },
+  });
+}
+
 // Unambiguous alphabet: no 0/O/1/I/L.
 function newServerCode() {
   const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -309,6 +363,26 @@ export class ConcordServer {
       const key = url.searchParams.get("key") || "";
       if (ATT_KEY_RE.test(key)) await this.state.storage.delete(`att:${key}`);
       return Response.json({ ok: true });
+    }
+
+    // What GET /api/invite/<CODE> is allowed to know: the name and icon, and
+    // the inviter's name if `meta.owner` already has a roster row for it —
+    // both already sitting in storage, so nothing new gets written or kept
+    // for this. Read-only end to end: a probe, hit or miss, leaves no trace.
+    // A conversation is not a joinable server, so `kind: "dm"` answers exactly
+    // like an unknown code — a DM/group code is never distinguishable from a
+    // 404 through this door. `meta.kind` is settled once, at creation, by
+    // asking the hub (see hubOwnsCode below), so this needs no second hub
+    // round trip to enforce the same thing again.
+    if (url.pathname === "/internal/invite-peek") {
+      const meta = await this.state.storage.get("meta");
+      if (!meta || meta.kind === "dm") return new Response("not found", { status: 404 });
+      const out = { name: meta.name, icon: meta.icon };
+      if (meta.owner) {
+        const owner = await this.state.storage.get(`roster:${meta.owner}`);
+        if (owner?.name) out.inviter = owner.name;
+      }
+      return Response.json(out);
     }
 
     // The hub telling us somebody just stopped being a member. Checking

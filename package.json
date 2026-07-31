@@ -24,6 +24,7 @@
     "archive": "node test/archive.mjs",
     "security": "node test/security.mjs",
     "hubsec": "node test/hubsec.mjs",
+    "invite": "node test/invite.mjs",
     "render": "node test/render.mjs",
     "backup": "node test/backup.mjs",
     "outbox": "node test/outbox.mjs",
