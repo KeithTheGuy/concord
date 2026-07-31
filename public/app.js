@@ -1,5 +1,6 @@
 // Concord client — state, WebSocket protocol, and all UI.
 import { VoiceEngine } from "./voice.js";
+import { installVoiceUI, startQualityMeter, stopQualityMeter } from "./voiceui.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
 import { HubConnection, groupTitle } from "./hub.js";
@@ -8,6 +9,10 @@ import { VOICE_FX, FX_BY_ID } from "./voicefx.js";
 import {
   createUploader, renderAttachments, openLightbox, humanSize, fileIcon, isImage,
 } from "./uploads.js";
+import {
+  EmojiRegistry, renderCustomEmoji, reactionLabel, emojiCandidates,
+  pickerRow as emojiPickerRow, isOnlyEmoji, nameOk,
+} from "./customemoji.js";
 import {
   THEMES, applyTheme, applyTurbo, burst, confetti,
   levelFromXp, ACHIEVEMENTS, ACH_BY_ID, achievementToast,
@@ -28,6 +33,23 @@ const EMOJIS = (
   "🚀 🛸 🌙 ☀️ 🌊 🍀 🌵 ⛺ 🗿 💎 🔑 🛠️ 📌 ✅ ❌ ❓ ‼️ 💤"
 ).split(" ").filter(Boolean);
 const QUICK_REACTS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
+
+// Every server mints its own :names:, so one registry keyed by server code is
+// the only shape that can tell two different :blobcat: apart.
+const emojiReg = new EmojiRegistry();
+
+const SLOWMODE_CHOICES = [
+  { label: "Off", seconds: 0 },
+  { label: "5 seconds", seconds: 5 },
+  { label: "10 seconds", seconds: 10 },
+  { label: "30 seconds", seconds: 30 },
+  { label: "1 minute", seconds: 60 },
+  { label: "5 minutes", seconds: 300 },
+];
+
+const EMOJI_MAX_BYTES = 256 * 1024;
+const SOUND_MAX_BYTES = 512 * 1024;
+const SAVED_CAP = 200;
 
 const PRESENCE_META = {
   online: { dot: "online", label: "Online", emoji: "🟢" },
@@ -156,6 +178,9 @@ const state = {
       // Local-only progression. Never sent anywhere, so it can't be farmed,
       // compared, or used to judge anyone.
       xp: 0, stats: {}, achievements: [], seenThemes: [], triedVoices: [],
+      // Bookmarks, private notes and folded categories. All three are about
+      // how *you* read this place, so none of them are ever transmitted.
+      saved: [], notes: {}, collapsed: {},
     },
     store.get("settings", {})
   ),
@@ -208,6 +233,7 @@ function makeRealm(code, kind) {
     // typing all address people by sid and two tabs are two sids.
     roster: new Map(), // userId -> {userId, name, color, avatar, tag, status, at, joinedAt}
     owner: null,
+    sounds: [], // custom soundboard clips [{id, name, url}]
     messages: new Map(), // chanId -> msg[]
     historyLoaded: new Set(),
     historyPending: new Set(),
@@ -396,6 +422,22 @@ const voice = new VoiceEngine({
     store.set("settings", state.settings);
   },
 });
+
+// The audio settings (gate, meter, devices, share quality) build their own DOM
+// inside the Voice section of the settings modal, so they need telling when
+// that modal opens rather than owning the open path themselves.
+const settingsOpenHooks = [];
+
+const voiceUiHooks = {
+  voice,
+  settings: () => state.settings,
+  save: () => store.set("settings", state.settings),
+  toast,
+  onSettingsOpen: (fn) => settingsOpenHooks.push(fn),
+  panelEl: () => $("settings-modal"),
+  qualityEl: () => $("vs-quality"),
+};
+installVoiceUI(voiceUiHooks);
 
 /* ================================= hub ================================== */
 
@@ -709,6 +751,8 @@ function handleServerMessage(realm, m) {
       realm.members = new Map(m.members.map((mm) => [mm.sid, mm]));
       realm.roster = new Map((m.roster || []).map((e) => [e.userId, e]));
       realm.owner = m.owner || null;
+      realm.sounds = m.sounds || [];
+      emojiReg.setFor(realm.code, m.emoji || []);
       startRealmPing(realm);
 
       const resume = realm.resume;
@@ -939,8 +983,52 @@ function handleServerMessage(realm, m) {
       realm.channels.push(m.channel);
       if (live) {
         renderChannels();
-        toast(`Channel ${m.channel.type === "text" ? "#" : "🔊 "}${m.channel.name} created`);
+        if (m.channel.type === "thread") toast(`💬 Thread "${m.channel.name}" started`);
+        else toast(`Channel ${m.channel.type === "text" ? "#" : "🔊 "}${m.channel.name} created`);
       }
+      break;
+    }
+
+    // The thread already exists as a channel by now — this is only the source
+    // message learning that it has one, so it can show its chip.
+    case "msg-thread": {
+      const list = realm.messages.get(m.chanId) || [];
+      const msg = list.find((x) => x.id === m.msgId);
+      if (msg) {
+        msg.threadId = m.threadId;
+        msg.threadName = m.name;
+        if (live && m.chanId === realm.activeChan) renderMessages();
+      }
+      break;
+    }
+
+    // The message never left the composer, so the text is still in the box —
+    // all that's needed is to stop you sending it again until the clock runs out.
+    case "slowmode": {
+      slowUntil.set(`${realm.code}/${m.chanId}`, Date.now() + m.seconds * 1000);
+      startSlowTicker();
+      if (live) {
+        syncComposer();
+        toast(`🐌 Slowmode — ${m.seconds}s before you can post again.`, true);
+      }
+      break;
+    }
+
+    case "emoji": {
+      emojiReg.setFor(realm.code, m.list || []);
+      if (live) renderMessages();
+      if (live && !$("settings-modal").classList.contains("hidden")) renderEmojiSettings();
+      break;
+    }
+
+    case "sounds": {
+      realm.sounds = m.list || [];
+      if (live && !$("soundboard").classList.contains("hidden")) renderSoundboard();
+      break;
+    }
+
+    case "bans": {
+      if (live) renderBans(m.list || []);
       break;
     }
 
@@ -1013,6 +1101,14 @@ function handleServerMessage(realm, m) {
       // Soundboard is a voice-channel thing: only the call's realm plays it.
       if (!inCall || !state.settings.board) break;
       if (m.sid === realm.me?.sid) break; // we already played it locally
+      // A custom clip is a file, so it arrives with a url and there is nothing
+      // to synthesize.
+      if (m.url) {
+        playClip(m.url);
+        const custom = realm.sounds.find((s) => s.id === m.sound);
+        toast(`📼 ${m.name} played ${custom?.name || "a clip"}`);
+        break;
+      }
       playSound(m.sound, (state.settings.volume || 100) / 100);
       const clip = SOUNDBOARD.find((s) => s.id === m.sound);
       if (clip) toast(`${clip.emoji} ${m.name} played ${clip.label}`);
@@ -1364,7 +1460,10 @@ async function sendCurrentMessage() {
 
 /* ============================ markdown-lite ============================= */
 
-function renderMarkdown(text) {
+// `code` says which server's :names: are in scope. Passed in rather than read
+// off the active realm, because a pin or a search hit is rendered for the realm
+// it came from, not the one the eye happens to be on.
+function renderMarkdown(text, code) {
   const codeBlocks = [];
   // U+0000 can never appear in user content (the server strips control
   // chars), so it's a collision-free sentinel for protected fragments.
@@ -1390,6 +1489,9 @@ function renderMarkdown(text) {
   t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   t = t.replace(/\|\|([\s\S]+?)\|\|/g, '<span class="spoiler" title="Click to reveal">$1</span>');
   t = highlightMentions(t);
+  // After code and links are behind sentinels, before those come back: a
+  // ":shrug:" typed inside a fenced block has to stay literal both ways round.
+  t = renderCustomEmoji(t, code, emojiReg);
   t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => codeBlocks[+i]);
   return t;
 }
@@ -1951,75 +2053,179 @@ function markRealmRead(code) {
   updateTitle();
 }
 
+const catKey = (code, cat) => `${code}/${cat}`;
+const isCollapsed = (cat) => !!state.settings.collapsed?.[catKey(state.currentCode, cat)];
+
+function setCollapsed(cat, on) {
+  const all = { ...(state.settings.collapsed || {}) };
+  const key = catKey(state.currentCode, cat);
+  if (on) all[key] = true;
+  else delete all[key];
+  state.settings.collapsed = all;
+  store.set("settings", state.settings);
+  renderChannels();
+}
+
+// A folded category still has to show anything that wants you: hiding a
+// channel that's pinging you is how you miss things.
+function chanNeedsSeeing(c) {
+  return c.id === state.activeChan || !!state.unread.get(c.id) || state.voiceChan === c.id;
+}
+
 function renderChannels() {
   const textWrap = $("text-channels");
   const voiceWrap = $("voice-channels");
   textWrap.textContent = "";
   voiceWrap.textContent = "";
 
+  const threadsOf = new Map(); // parent chanId -> thread channels
   for (const c of state.channels) {
-    const row = el("div", "chan-row" + (c.type === "voice" ? " voice" : ""));
-    row.appendChild(el("span", "chan-icon", c.type === "text" ? "#" : "🔊"));
-    row.appendChild(el("span", "chan-label", c.name));
+    if (c.type !== "thread") continue;
+    const list = threadsOf.get(c.parent) || [];
+    list.push(c);
+    threadsOf.set(c.parent, list);
+  }
 
-    if (c.type === "text") {
-      if (c.id === state.activeChan) row.classList.add("active");
-      const unread = state.unread.get(c.id);
-      if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
-      row.onclick = () => activateChannel(c.id);
-    } else {
-      row.onclick = () => joinVoice(c.id);
-    }
+  const wants = (c) => chanNeedsSeeing(c) || (threadsOf.get(c.id) || []).some(chanNeedsSeeing);
 
-    const gear = el("button", "chan-gear", "⚙");
-    gear.title = "Channel settings";
-    gear.onclick = (e) => {
-      e.stopPropagation();
-      channelMenu(e, c);
-    };
-    row.appendChild(gear);
-
-    if (c.type === "text") {
-      textWrap.appendChild(row);
-    } else {
-      voiceWrap.appendChild(row);
-      const users = el("div", "voice-users");
-      for (const member of state.members.values()) {
-        if (member.voice?.chanId !== c.id) continue;
-        const u = el("div", "voice-user");
-        const av = el("span", "vu-avatar", member.avatar);
-        av.style.background = member.color;
-        av.dataset.vsid = member.sid;
-        if (voice.isSpeaking(member.sid === state.me?.sid ? "me" : member.sid)) av.classList.add("speaking");
-        u.appendChild(av);
-        u.appendChild(el("span", "vu-name", member.name));
-        const icons = el("span", "vu-icons");
-        if (member.voice.muted) icons.append("🔇");
-        if (member.voice.deafened) icons.append("🎧");
-        if (member.voice.sharing) icons.append(member.voice.shareKind === "camera" ? "📹" : "🖥");
-        u.appendChild(icons);
-        // Volume controls only make sense for people you can actually hear,
-        // i.e. when the call is in the realm you're looking at.
-        if (
-          member.sid !== state.me?.sid &&
-          state.voiceCode === state.activeCode &&
-          member.voice.chanId === state.voiceChan
-        ) {
-          u.oncontextmenu = (e) => {
-            e.preventDefault();
-            volumeMenu(e, member);
-          };
-          u.onclick = (e) => {
-            e.stopPropagation();
-            volumeMenu(e, member);
-          };
-        }
-        users.appendChild(u);
+  // Uncategorised first, then one collapsible group per category, in the order
+  // the categories first appear in the channel list.
+  function paint(wrap, channels) {
+    const loose = channels.filter((c) => !c.cat);
+    for (const c of loose) appendChanRow(wrap, c, threadsOf, false);
+    const cats = [];
+    for (const c of channels) if (c.cat && !cats.includes(c.cat)) cats.push(c.cat);
+    for (const cat of cats) {
+      const mine = channels.filter((c) => c.cat === cat);
+      const folded = isCollapsed(cat);
+      const head = el("div", "cat-head" + (folded ? " folded" : ""));
+      head.appendChild(el("span", "cat-caret", folded ? "▸" : "▾"));
+      head.appendChild(el("span", "cat-name", cat));
+      head.appendChild(el("span", "cat-count", String(mine.length)));
+      head.onclick = () => setCollapsed(cat, !folded);
+      wrap.appendChild(head);
+      for (const c of mine) {
+        if (folded && !wants(c)) continue;
+        appendChanRow(wrap, c, threadsOf, folded);
       }
-      if (users.childNodes.length) voiceWrap.appendChild(users);
     }
   }
+
+  paint(textWrap, state.channels.filter((c) => c.type === "text"));
+  paint(voiceWrap, state.channels.filter((c) => c.type === "voice"));
 }
+
+// `folded` means the parent category is collapsed, so only threads that want
+// attention come along for the ride.
+function appendChanRow(wrap, c, threadsOf, folded) {
+  const voiceChan = c.type === "voice";
+  const row = el("div", "chan-row" + (voiceChan ? " voice" : ""));
+  row.appendChild(el("span", "chan-icon", voiceChan ? "🔊" : "#"));
+  row.appendChild(el("span", "chan-label", c.name));
+  if (c.slow) {
+    const slow = el("span", "chan-slow", "🐌");
+    slow.title = `Slowmode — ${slowLabel(c.slow)}`;
+    row.appendChild(slow);
+  }
+  if (c.id === state.activeChan) row.classList.add("active");
+  const unread = state.unread.get(c.id);
+  if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
+  // Clicking a voice channel joins its call, because that's what anyone
+  // clicking it means. Once you're in, the same click opens the chat that
+  // channel has always had; the 💬 gets you that chat without joining, since a
+  // voice channel takes messages whether or not you're listening to it.
+  const inThisCall = voiceChan && state.voiceCode === state.currentCode && state.voiceChan === c.id;
+  row.title = voiceChan ? (inThisCall ? "Open this channel's chat" : "Join the call") : "";
+  row.onclick = () => {
+    if (!voiceChan || inThisCall) activateChannel(c.id);
+    else joinVoice(c.id);
+  };
+
+  if (voiceChan) {
+    const chat = el("button", "chan-chat", "💬");
+    chat.title = "Open this channel's chat";
+    chat.onclick = (e) => {
+      e.stopPropagation();
+      activateChannel(c.id);
+    };
+    row.appendChild(chat);
+  }
+
+  const gear = el("button", "chan-gear", "⚙");
+  gear.title = "Channel settings";
+  gear.onclick = (e) => {
+    e.stopPropagation();
+    channelMenu(e, c);
+  };
+  row.appendChild(gear);
+  wrap.appendChild(row);
+
+  for (const t of threadsOf.get(c.id) || []) {
+    if (folded && !chanNeedsSeeing(t)) continue;
+    wrap.appendChild(threadRow(t));
+  }
+
+  if (!voiceChan) return;
+  const users = el("div", "voice-users");
+  for (const member of state.members.values()) {
+    if (member.voice?.chanId !== c.id) continue;
+    const u = el("div", "voice-user");
+    const av = el("span", "vu-avatar", member.avatar);
+    av.style.background = member.color;
+    av.dataset.vsid = member.sid;
+    if (voice.isSpeaking(member.sid === state.me?.sid ? "me" : member.sid)) av.classList.add("speaking");
+    u.appendChild(av);
+    u.appendChild(el("span", "vu-name", member.name));
+    const icons = el("span", "vu-icons");
+    if (member.voice.muted) icons.append("🔇");
+    if (member.voice.deafened) icons.append("🎧");
+    if (member.voice.sharing) icons.append(member.voice.shareKind === "camera" ? "📹" : "🖥");
+    u.appendChild(icons);
+    // Volume controls only make sense for people you can actually hear,
+    // i.e. when the call is in the realm you're looking at.
+    if (
+      member.sid !== state.me?.sid &&
+      state.voiceCode === state.activeCode &&
+      member.voice.chanId === state.voiceChan
+    ) {
+      u.oncontextmenu = (e) => {
+        e.preventDefault();
+        volumeMenu(e, member);
+      };
+      u.onclick = (e) => {
+        e.stopPropagation();
+        volumeMenu(e, member);
+      };
+    }
+    users.appendChild(u);
+  }
+  if (users.childNodes.length) wrap.appendChild(users);
+}
+
+// A thread is a channel, so this row is the ordinary one minus the gear —
+// renaming and deleting a thread is what its parent's menu is for.
+function threadRow(t) {
+  const row = el("div", "chan-row thread-row" + (t.id === state.activeChan ? " active" : ""));
+  row.appendChild(el("span", "chan-icon", "💬"));
+  row.appendChild(el("span", "chan-label", t.name));
+  if (t.slow) row.appendChild(el("span", "chan-slow", "🐌"));
+  const unread = state.unread.get(t.id);
+  if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
+  row.onclick = () => activateChannel(t.id);
+  const gear = el("button", "chan-gear", "⚙");
+  gear.title = "Thread settings";
+  gear.onclick = (e) => {
+    e.stopPropagation();
+    channelMenu(e, t);
+  };
+  row.appendChild(gear);
+  return row;
+}
+
+const slowLabel = (seconds) =>
+  SLOWMODE_CHOICES.find((s) => s.seconds === seconds)?.label || `${seconds} seconds`;
+
+const chanTypeOf = (chanId) => state.channels.find((c) => c.id === chanId)?.type || "text";
 
 function channelMenu(e, c) {
   const items = [
@@ -2040,6 +2246,25 @@ function channelMenu(e, c) {
         ),
     });
   }
+  if (c.type !== "thread") {
+    items.push({
+      label: "Move to Category…",
+      onClick: () =>
+        promptModal(
+          `Category for ${c.name}`,
+          c.cat || "",
+          (v) => wsSend({ type: "update-channel", chanId: c.id, cat: v }),
+          { allowEmpty: true } // clearing the box is how you take it back out
+        ),
+    });
+  }
+  items.push({
+    label: "Set Slowmode…",
+    // A tick later, because the click that picked this item is still on its way
+    // to the document handler that closes menus — which would shut the second
+    // one the moment it opened.
+    onClick: () => setTimeout(() => openSlowmodePicker(e.clientX, e.clientY, c), 0),
+  });
   items.push({
     label: "Delete Channel",
     danger: true,
@@ -2049,6 +2274,42 @@ function channelMenu(e, c) {
       ),
   });
   ctxMenu(e.clientX, e.clientY, items);
+}
+
+function openSlowmodePicker(x, y, c) {
+  ctxMenu(
+    x,
+    y,
+    SLOWMODE_CHOICES.map((choice) => ({
+      label: (c.slow || 0) === choice.seconds ? `✓ ${choice.label}` : choice.label,
+      onClick: () => wsSend({ type: "update-channel", chanId: c.id, slow: choice.seconds }),
+    }))
+  );
+}
+
+/* ------------------------------- slowmode -------------------------------- */
+// The server bounced a message and told us how long to wait. The text is still
+// sitting in the composer, so all this does is hold the send until the clock
+// runs out — syncComposer owns the box, this only feeds it a number.
+
+const slowUntil = new Map(); // `${code}/${chanId}` -> when you may post again
+let slowTicker = null;
+
+function slowLeft(code, chanId) {
+  const until = slowUntil.get(`${code}/${chanId}`) || 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
+function startSlowTicker() {
+  if (slowTicker) return;
+  slowTicker = setInterval(() => {
+    for (const [key, until] of slowUntil) if (until <= Date.now()) slowUntil.delete(key);
+    syncComposer();
+    if (!slowUntil.size) {
+      clearInterval(slowTicker);
+      slowTicker = null;
+    }
+  }, 250);
 }
 
 // Right-clicking anyone in a server: message them, add them, prank them, or
@@ -2077,12 +2338,57 @@ function memberMenu(e, member) {
     items.push({ label: "No friend tag — ask them for it", onClick: () => {} });
   }
   if (member.sid) items.push({ label: "🃏 Prank", onClick: () => openGremlinModal(member.sid) });
+  // The server checks ownership itself; this is only about not offering
+  // buttons that would bounce.
+  if (iAmOwner() && member.userId) {
+    items.push({
+      label: "👢 Kick",
+      danger: true,
+      onClick: () =>
+        confirmModal(`Kick ${member.name}?`, "They can walk straight back in with the invite code.", () =>
+          wsSend({ type: "kick", userId: member.userId })
+        ),
+    });
+    items.push({
+      label: "🔨 Ban",
+      danger: true,
+      onClick: () =>
+        confirmModal(`Ban ${member.name}?`, "They stay out until you unban them from Banned People.", () =>
+          wsSend({ type: "ban", userId: member.userId })
+        ),
+    });
+  }
   const inCallTogether =
     member.sid && state.voiceCode === state.activeCode && member.voice && member.voice.chanId === state.voiceChan;
   if (inCallTogether) {
     items.push({ label: "🔊 Volume…", onClick: () => volumeMenu(e, member) });
   }
   ctxMenu(e.clientX, e.clientY, items);
+}
+
+const isOwnerOf = (realm, userId) => !!realm?.owner && !!userId && realm.owner === userId;
+const iAmOwner = () => isOwnerOf(R(), realmUserId(R()));
+
+function renderBans(list) {
+  showModal("bans-modal");
+  const out = $("bans-list");
+  out.textContent = "";
+  if (!list.length) {
+    out.appendChild(emptyState("🕊️", "Nobody's banned", "A clean record. Long may it last."));
+    return;
+  }
+  for (const row of list) {
+    const line = el("div", "pin-row");
+    line.appendChild(el("div", "avatar small", "🔨"));
+    const col = el("div", "m-col");
+    col.appendChild(el("div", "m-name", row.name || "(no name on file)"));
+    col.appendChild(el("div", "m-status", `Banned ${agoText(row.at)}`));
+    line.appendChild(col);
+    const unban = el("button", "pill-btn tiny", "Unban");
+    unban.onclick = () => wsSend({ type: "unban", userId: row.userId });
+    line.appendChild(unban);
+    out.appendChild(line);
+  }
 }
 
 function volumeMenu(e, member) {
@@ -2171,6 +2477,11 @@ function memberRow(person, offline = false) {
   const col = el("div", "m-col");
   const name = el("div", "m-name", person.name);
   name.style.color = person.color;
+  if (isOwnerOf(R(), person.userId)) {
+    const crown = el("span", "owner-crown", "👑");
+    crown.title = "Server owner";
+    name.appendChild(crown);
+  }
   col.appendChild(name);
   const sub = offline
     ? agoText(person.at)
@@ -2215,17 +2526,22 @@ let composerHint = ""; // what renderChatHeader last decided the box should say
 // upload in flight locks it for the same reason.
 function syncComposer() {
   const busy = !!R()?.uploader?.busy();
-  const ready = !!state.activeChan && state.view !== "home" && !busy;
+  const waitFor = state.activeChan ? slowLeft(state.currentCode, state.activeChan) : 0;
+  const ready = !!state.activeChan && state.view !== "home" && !busy && !waitFor;
   const box = $("input");
   box.disabled = !ready;
   box.classList.toggle("waiting", !ready);
   if (busy) box.placeholder = "Uploading…";
+  else if (waitFor) box.placeholder = `🐌 Slowmode — ${waitFor}s`;
   else if (ready) box.placeholder = composerHint;
   else if (state.view !== "home") box.placeholder = "Connecting…";
 }
 
 function renderChatHeader() {
   const realm = R();
+  // Both of these belong to a server channel; a DM can never want either.
+  $("chan-crumb").classList.add("hidden");
+  $("chan-incall").classList.add("hidden");
   if (state.view === "dm" && realm?.kind === "group" && realm.group) {
     const group = hub.groups.get(realm.group.id) || realm.group;
     $("chan-hash").textContent = group.icon || "👥";
@@ -2247,11 +2563,29 @@ function renderChatHeader() {
     syncComposer();
     return;
   }
-  $("chan-hash").textContent = "#";
   const c = state.channels.find((x) => x.id === state.activeChan);
+  $("chan-hash").textContent = c?.type === "thread" ? "💬" : c?.type === "voice" ? "🔊" : "#";
   $("chan-name").textContent = c ? c.name : "";
-  $("chan-topic").textContent = c?.topic || "";
-  composerHint = c ? `Message #${c.name}` : "Pick a channel";
+
+  // The breadcrumb is the only way back out of a thread that doesn't involve
+  // hunting for the parent in the sidebar.
+  const crumb = $("chan-crumb");
+  const parent = c?.type === "thread" ? state.channels.find((x) => x.id === c.parent) : null;
+  crumb.classList.toggle("hidden", !parent);
+  if (parent) {
+    crumb.textContent = `from #${parent.name}`;
+    crumb.title = `Back to #${parent.name}`;
+    crumb.onclick = () => activateChannel(parent.id);
+  }
+
+  const inThisCall = c?.type === "voice" && state.voiceCode === state.currentCode && state.voiceChan === c.id;
+  $("chan-incall").classList.toggle("hidden", !inThisCall);
+
+  const notes = [];
+  if (c?.topic) notes.push(c.topic);
+  if (c?.slow) notes.push(`🐌 Slowmode: ${slowLabel(c.slow)}`);
+  $("chan-topic").textContent = notes.join(" · ");
+  composerHint = c ? `Message ${c.type === "text" ? "#" : ""}${c.name}` : "Pick a channel";
   syncComposer();
 }
 
@@ -2384,8 +2718,9 @@ function buildMsgNode(msg) {
     return node;
   }
 
-  const content = el("div", "msg-content");
-  content.innerHTML = renderMarkdown(msg.content);
+  const code = state.currentCode;
+  const content = el("div", "msg-content" + (isOnlyEmoji(msg.content, code, emojiReg) ? " ce-big" : ""));
+  content.innerHTML = renderMarkdown(msg.content, code);
   content.querySelectorAll(".spoiler").forEach((s) => {
     s.onclick = () => s.classList.add("revealed");
   });
@@ -2404,11 +2739,24 @@ function buildMsgNode(msg) {
   });
   if (atts) node.appendChild(atts);
 
+  // A thread hangs off the message that started it, which is the only place
+  // you'd think to look for it.
+  if (msg.threadId) {
+    const thread = state.channels.find((c) => c.id === msg.threadId);
+    const chip = el("button", "thread-chip", `💬 ${thread?.name || msg.threadName || "Thread"}`);
+    chip.title = "Open this thread";
+    chip.onclick = () => activateChannel(msg.threadId);
+    node.appendChild(chip);
+  }
+
   if (msg.reactions) {
     const row = el("div", "msg-reactions");
     for (const [emoji, users] of Object.entries(msg.reactions)) {
       const btn = el("button", "reaction" + (users.includes(myUserId()) ? " mine" : ""));
-      btn.textContent = `${emoji} ${users.length}`;
+      const face = reactionLabel(emoji, code, emojiReg);
+      const span = el("span", "reaction-face");
+      span.innerHTML = face.html;
+      btn.append(span, el("span", "reaction-count", String(users.length)));
       btn.title = users.length + " reaction" + (users.length > 1 ? "s" : "");
       btn.onclick = () => wsSend({ type: "react", chanId: msg.chanId, msgId: msg.id, emoji });
       row.appendChild(btn);
@@ -2441,6 +2789,23 @@ function msgActions(msg) {
     reply.title = "Reply";
     reply.onclick = () => setReply(msg);
     actions.appendChild(reply);
+    // Threads only hang off real channels, and the message needs a real id for
+    // the server to find it.
+    if (chanTypeOf(msg.chanId) !== "thread") {
+      const thread = el("button", "", "💬");
+      thread.title = msg.threadId ? "Open this thread" : "Start a thread";
+      thread.onclick = () => {
+        if (msg.threadId) return activateChannel(msg.threadId);
+        promptModal("Name this thread", msg.content.slice(0, 40), (v) =>
+          wsSend({ type: "create-thread", chanId: msg.chanId, msgId: msg.id, name: v })
+        );
+      };
+      actions.appendChild(thread);
+    }
+    const save = el("button", "", "🔖");
+    save.title = "Save this message";
+    save.onclick = () => saveMessage(msg);
+    actions.appendChild(save);
     const pin = el("button", "", "📌");
     pin.title = msg.pinned ? "Unpin" : "Pin";
     pin.onclick = () => wsSend({ type: msg.pinned ? "unpin" : "pin", chanId: msg.chanId, msgId: msg.id });
@@ -2634,10 +2999,13 @@ async function joinVoiceIn(realm, chanId) {
   realm.send({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
   renderVoicePanel();
   renderChannels();
+  renderChatHeader();
   renderServerRail();
+  startQualityMeter(voiceUiHooks);
 }
 
 function leaveVoice({ silent } = {}) {
+  stopQualityMeter();
   if (!state.voiceCode) return;
   const realm = voiceRealm();
   state.voiceCode = null;
@@ -2651,6 +3019,7 @@ function leaveVoice({ silent } = {}) {
   clearShareStage();
   renderChannels();
   renderMembers();
+  renderChatHeader();
   renderServerRail();
 }
 
@@ -2779,7 +3148,9 @@ function confirmModal(title, text, onYes) {
   $("confirm-no").onclick = closeModals;
 }
 
-function promptModal(title, value, onSave) {
+// Empty normally means "changed your mind", so it's swallowed. `allowEmpty` is
+// for the fields where clearing the box is itself the edit.
+function promptModal(title, value, onSave, { allowEmpty } = {}) {
   $("prompt-title").textContent = title;
   const input = $("prompt-input");
   input.value = value;
@@ -2788,7 +3159,7 @@ function promptModal(title, value, onSave) {
   const save = () => {
     const v = input.value.trim();
     closeModals();
-    if (v) onSave(v);
+    if (v || allowEmpty) onSave(v);
   };
   $("prompt-yes").onclick = save;
   input.onkeydown = (e) => {
@@ -3001,6 +3372,7 @@ function openSettings() {
   renderLevel();
   $("set-tag").value = hub.me?.tag || state.account?.tag || "";
   $("set-presence").value = state.settings.presence || "online";
+  for (const fn of settingsOpenHooks) fn();
 
   const fxSelect = $("set-fx");
   fxSelect.textContent = "";
@@ -3015,8 +3387,73 @@ function openSettings() {
   $("set-fx-label").textContent = fmtSemis(state.settings.fxPitch);
   $("set-volume").value = state.settings.volume;
   $("set-vol-label").textContent = state.settings.volume + "%";
+  renderEmojiSettings();
   populateMics();
 }
+
+/* ----------------------------- server emoji ------------------------------ */
+
+let emojiFile = null; // the picked image, held until it has a name to go with it
+
+function renderEmojiSettings() {
+  const section = $("emoji-section");
+  const inServer = state.view === "server" && !!state.currentCode;
+  section.classList.toggle("hidden", !inServer);
+  if (!inServer) return;
+  const list = $("emoji-list");
+  list.textContent = "";
+  const mine = emojiReg.forCode(state.currentCode);
+  if (!mine.length) {
+    list.appendChild(el("div", "emoji-empty", "No emoji here yet. Add one — 256 KB, a–z 0–9 _ for the name."));
+    return;
+  }
+  for (const e of mine) {
+    const row = el("div", "emoji-row");
+    const img = el("img", "emoji-row-img");
+    img.src = e.url;
+    img.alt = `:${e.name}:`;
+    img.loading = "lazy";
+    row.appendChild(img);
+    row.appendChild(el("span", "emoji-row-name", `:${e.name}:`));
+    const drop = el("button", "icon-btn", "✕");
+    drop.title = "Remove";
+    drop.onclick = () =>
+      confirmModal(`Remove :${e.name}:?`, "Messages that used it go back to showing the plain text.", () =>
+        wsSend({ type: "emoji-remove", name: e.name })
+      );
+    row.appendChild(drop);
+    list.appendChild(row);
+  }
+}
+
+$("emoji-pick").onclick = () => $("emoji-picker-file").click();
+$("emoji-picker-file").onchange = (e) => {
+  emojiFile = e.target.files?.[0] || null;
+  e.target.value = "";
+  if (emojiFile && emojiFile.size > EMOJI_MAX_BYTES) {
+    toast("Emoji cap out at 256 KB. Shrink it first.", true);
+    emojiFile = null;
+  }
+  $("emoji-file-name").textContent = emojiFile ? emojiFile.name : "No image picked";
+};
+$("emoji-add").onclick = async () => {
+  const name = $("emoji-name").value.trim().toLowerCase();
+  if (!emojiFile) {
+    toast("Pick an image first.", true);
+    return;
+  }
+  // Checked here as well as on the server, so a typo costs nothing.
+  if (!nameOk(name)) {
+    toast("Emoji names are 2–20 characters of a–z, 0–9 and _.", true);
+    return;
+  }
+  const key = await uploadAsset(emojiFile);
+  if (!key) return;
+  wsSend({ type: "emoji-add", name, key });
+  emojiFile = null;
+  $("emoji-name").value = "";
+  $("emoji-file-name").textContent = "No image picked";
+};
 
 async function populateMics() {
   const sel = $("set-mic");
@@ -3275,12 +3712,17 @@ $("set-ptt-key").onclick = () => {
 
 /* ------------------------- server header / menu -------------------------- */
 
-$("server-header").onclick = () => $("server-menu").classList.toggle("hidden");
+$("server-header").onclick = () => {
+  $("server-bans").classList.toggle("hidden", !iAmOwner());
+  $("server-menu").classList.toggle("hidden");
+};
 $("server-menu").querySelectorAll("button").forEach((b) => {
   b.onclick = () => {
     $("server-menu").classList.add("hidden");
     const act = b.dataset.act;
     if (act === "invite") openInviteModal();
+    if (act === "bans") wsSend({ type: "bans" }); // the reply opens the modal
+
     if (act === "leave") {
       const s = state.servers.find((x) => x.code === state.currentCode);
       if (s) confirmLeaveServer(s);
@@ -3384,6 +3826,31 @@ function addFiles(files) {
   }
   realm.uploader.add(files);
   renderTray();
+}
+
+// Emoji and soundboard clips go up through the same ticket handshake as an
+// attachment, so they borrow the realm's uploader — it's the thing listening on
+// the socket the tickets come back on. The item is taken back out of the tray
+// afterwards, because it was never going to be part of a message.
+async function uploadAsset(file) {
+  const realm = R();
+  if (!realm) return null;
+  const [item] = realm.uploader.add([file]);
+  if (!item) return null;
+  realm.flushing = true;
+  renderTray();
+  let key = null;
+  try {
+    const done = await realm.uploader.flush();
+    key = done.find((d) => d.name === item.name && d.size === item.size)?.key || null;
+  } catch {
+    // the uploader has already said what went wrong
+  }
+  realm.flushing = false;
+  realm.uploader.remove(item.id);
+  renderTray();
+  if (!key) toast("That upload didn't land. Give it another go.", true);
+  return key;
 }
 
 function renderTray() {
@@ -3500,23 +3967,34 @@ const revealedAtts = new Set();
 /* ----------------------------- emoji picker ------------------------------ */
 
 let emojiMode = { mode: "input" };
+
+function pickEmoji(value, picker) {
+  if (emojiMode.mode === "react") {
+    wsSend({ type: "react", chanId: emojiMode.msg.chanId, msgId: emojiMode.msg.id, emoji: value });
+    picker.classList.add("hidden");
+  } else {
+    insertAtCursor(input, value);
+    input.focus();
+  }
+}
+
 function openEmojiPicker(mode) {
   emojiMode = mode || { mode: "input" };
   const picker = $("emoji-picker");
-  if (!picker.childNodes.length) {
+  if (!picker.querySelector(".emoji-btn")) {
     for (const emoji of EMOJIS) {
       const b = el("button", "emoji-btn", emoji);
-      b.onclick = () => {
-        if (emojiMode.mode === "react") {
-          wsSend({ type: "react", chanId: emojiMode.msg.chanId, msgId: emojiMode.msg.id, emoji });
-          picker.classList.add("hidden");
-        } else {
-          insertAtCursor(input, emoji);
-          input.focus();
-        }
-      };
+      b.onclick = () => pickEmoji(emoji, picker);
       picker.appendChild(b);
     }
+  }
+  // The unicode buttons are the same forever; the server's own emoji are not,
+  // so that row is rebuilt every time the picker opens.
+  picker.querySelectorAll(".ce-picker, .ce-picker-head").forEach((n) => n.remove());
+  const row = emojiPickerRow(emojiReg.forCode(state.currentCode), (e) => pickEmoji(`:${e.name}:`, picker));
+  if (row) {
+    picker.prepend(row);
+    picker.prepend(el("div", "ce-picker-head", "This server"));
   }
   picker.classList.toggle("hidden");
 }
@@ -3614,6 +4092,7 @@ $("btn-call").onclick = () => {
 
 $("home-btn").onclick = goHome;
 $("dm-friends-btn").onclick = goHome;
+$("dm-saved-btn").onclick = openSaved;
 $("dm-add-btn").onclick = () => {
   goHome();
   state.fvTab = "add";
@@ -3731,7 +4210,7 @@ function renderPins(messages) {
     head.append(name, el("span", "mg-time", fmtTime(msg.ts)));
     col.appendChild(head);
     const body = el("div", "msg-content");
-    body.innerHTML = renderMarkdown(msg.content);
+    body.innerHTML = renderMarkdown(msg.content, state.currentCode);
     body.querySelectorAll(".spoiler").forEach((s) => (s.onclick = () => s.classList.add("revealed")));
     col.appendChild(body);
     row.appendChild(col);
@@ -3751,6 +4230,87 @@ function renderPins(messages) {
     row.appendChild(acts);
     list.appendChild(row);
   }
+}
+
+/* ============================ saved messages ============================== */
+// Bookmarks live in localStorage and nowhere else — the server has no idea any
+// of this exists, which is the point.
+
+function saveMessage(msg) {
+  const code = state.currentCode;
+  if (!code) return;
+  const kept = (state.settings.saved || []).filter(
+    (s) => !(s.code === code && s.chanId === msg.chanId && s.msgId === msg.id)
+  );
+  kept.unshift({
+    code,
+    chanId: msg.chanId,
+    msgId: msg.id,
+    preview: `${msg.author.name}: ${msg.content}`.slice(0, 120),
+    ts: Date.now(),
+  });
+  state.settings.saved = kept.slice(0, SAVED_CAP);
+  store.set("settings", state.settings);
+  toast("🔖 Saved. Find it under 🔖 Saved in your DM list.");
+}
+
+function openSaved() {
+  showModal("saved-modal");
+  const list = $("saved-list");
+  list.textContent = "";
+  const saved = state.settings.saved || [];
+  $("saved-sub").textContent = saved.length
+    ? `${saved.length} kept, newest first. Stored on this device only.`
+    : "Nothing kept yet.";
+  if (!saved.length) {
+    list.appendChild(emptyState("🔖", "No saved messages", "Hover any message and hit 🔖 to keep it here."));
+    return;
+  }
+  for (const item of saved) {
+    const row = el("div", "pin-row");
+    row.appendChild(el("div", "avatar small", "🔖"));
+    const col = el("div", "m-col");
+    const where = state.servers.find((s) => s.code === item.code)?.name || item.code;
+    col.appendChild(el("div", "pin-head", `${where} · ${agoText(item.ts)}`));
+    col.appendChild(el("div", "m-status", item.preview));
+    row.appendChild(col);
+    const acts = el("div", "friend-actions");
+    const jump = el("button", "pill-btn tiny", "Jump");
+    jump.onclick = () => {
+      closeModals();
+      jumpToSaved(item);
+    };
+    const drop = el("button", "icon-btn", "✕");
+    drop.title = "Forget this one";
+    drop.onclick = () => {
+      state.settings.saved = (state.settings.saved || []).filter((s) => s !== item);
+      store.set("settings", state.settings);
+      openSaved();
+    };
+    acts.append(jump, drop);
+    row.appendChild(acts);
+    list.appendChild(row);
+  }
+}
+
+// The server only keeps the last 300 messages per channel, so a bookmark can
+// outlive the thing it points at. Say so rather than scrolling nowhere.
+function jumpToSaved(item) {
+  const realm = state.realms.get(item.code);
+  if (!realm) {
+    toast("You're not in that server any more.", true);
+    return;
+  }
+  switchToRealm(item.code);
+  if (!realm.channels.some((c) => c.id === item.chanId)) {
+    toast("That channel is gone.", true);
+    return;
+  }
+  activateChannel(item.chanId);
+  setTimeout(() => {
+    if (document.querySelector(`.msg[data-id="${item.msgId}"]`)) jumpToMessage(item.msgId);
+    else toast("That one has aged out of the server's 300-message memory. Only the preview is left.", true);
+  }, 400);
 }
 
 function jumpToMessage(id) {
@@ -3814,7 +4374,7 @@ function renderSearchResults(m) {
     head.append(name, el("span", "mg-time", `#${msg.chanName} · ${fmtTime(msg.ts)}`));
     col.appendChild(head);
     const body = el("div", "msg-content");
-    body.innerHTML = renderMarkdown(msg.content);
+    body.innerHTML = renderMarkdown(msg.content, state.currentCode);
     col.appendChild(body);
     row.appendChild(col);
     const jump = el("button", "pill-btn tiny", "Jump");
@@ -3960,6 +4520,11 @@ function openProfile(x, y, person) {
   const body = el("div", "pp-body");
   const name = el("div", "pp-name", person.name);
   name.style.color = person.color;
+  if (isOwnerOf(R(), person.userId)) {
+    const crown = el("span", "owner-crown", "👑");
+    crown.title = "Server owner";
+    name.appendChild(crown);
+  }
   body.appendChild(name);
   if (person.tag) body.appendChild(el("div", "pp-tag", "@" + person.tag));
   if (person.status) body.appendChild(el("div", "pp-status", person.status));
@@ -4014,6 +4579,27 @@ function openProfile(x, y, person) {
     acts.appendChild(edit);
   }
   body.appendChild(acts);
+
+  // A note about someone is for you. It is stored on this machine and there is
+  // no wire format for it at all.
+  const noteKey = person.userId || uid;
+  if (noteKey && !isMe) {
+    body.appendChild(el("div", "pp-note-label", "Private note — stays on this device"));
+    const note = document.createElement("textarea");
+    note.className = "pp-note";
+    note.rows = 2;
+    note.maxLength = 280;
+    note.placeholder = "Who is this again?";
+    note.value = state.settings.notes?.[noteKey] || "";
+    note.onchange = () => {
+      const notes = { ...(state.settings.notes || {}) };
+      if (note.value.trim()) notes[noteKey] = note.value.trim();
+      else delete notes[noteKey];
+      state.settings.notes = notes;
+      store.set("settings", state.settings);
+    };
+    body.appendChild(note);
+  }
   pop.appendChild(body);
 
   pop.classList.remove("hidden");
@@ -4028,9 +4614,24 @@ function hideProfile() {
 
 /* ============================== soundboard ================================ */
 
+// A clip that someone uploaded is a file, so there's nothing to synthesize —
+// it just gets played.
+function playClip(url) {
+  try {
+    const audio = new Audio(url);
+    audio.volume = Math.min(1, (state.settings.volume || 100) / 100);
+    audio.play().catch(() => {});
+  } catch {}
+}
+
+// Custom clips belong to a server, and the sound goes wherever the call is.
+const customSound = (id) => (voiceRealm() || R())?.sounds?.find((s) => s.id === id) || null;
+
 function fireSound(id) {
-  if (!SOUNDBOARD.some((s) => s.id === id)) return;
-  playSound(id, (state.settings.volume || 100) / 100);
+  const custom = customSound(id);
+  if (!custom && !SOUNDBOARD.some((s) => s.id === id)) return;
+  if (custom) playClip(custom.url);
+  else playSound(id, (state.settings.volume || 100) / 100);
   unlock("noisy");
   if (bumpStat("sounds") >= 50) unlock("dj");
   // Goes to the call, wherever the call is — not to whatever you're reading.
@@ -4040,7 +4641,7 @@ function fireSound(id) {
 
 function renderSoundboard() {
   const board = $("soundboard");
-  if (board.childNodes.length) return;
+  board.textContent = "";
   const head = el("div", "sb-head", "🎵 Soundboard");
   board.appendChild(head);
   const grid = el("div", "sb-grid");
@@ -4051,9 +4652,47 @@ function renderSoundboard() {
     b.onclick = () => fireSound(s.id);
     grid.appendChild(b);
   }
+  for (const s of (voiceRealm() || R())?.sounds || []) {
+    const b = el("button", "sb-btn sb-custom");
+    b.appendChild(el("span", "sb-emoji", "📼"));
+    b.appendChild(el("span", "sb-label", s.name));
+    b.title = `${s.name} — uploaded to this server`;
+    b.onclick = () => fireSound(s.id);
+    b.oncontextmenu = (ev) => {
+      ev.preventDefault();
+      ctxMenu(ev.clientX, ev.clientY, [
+        {
+          label: "Delete Clip",
+          danger: true,
+          onClick: () =>
+            confirmModal(`Delete "${s.name}"?`, "It goes for everyone on this server.", () =>
+              wsSend({ type: "sound-remove", id: s.id })
+            ),
+        },
+      ]);
+    };
+    grid.appendChild(b);
+  }
   board.appendChild(grid);
+  const add = el("button", "pill-btn sb-add", "＋ Upload a clip");
+  add.onclick = () => $("sound-picker").click();
+  board.appendChild(add);
   board.appendChild(el("div", "sb-foot", "Everyone in your voice channel hears it. Use responsibly. Or don't."));
 }
+
+$("sound-picker").onchange = (e) => {
+  const file = e.target.files?.[0];
+  e.target.value = "";
+  if (!file) return;
+  if (file.size > SOUND_MAX_BYTES) {
+    toast("Clips cap out at 512 KB. Trim it down.", true);
+    return;
+  }
+  promptModal("Name this clip", file.name.replace(/\.[^.]+$/, "").slice(0, 24), async (name) => {
+    const key = await uploadAsset(file);
+    if (key) wsSend({ type: "sound-add", name, key });
+  });
+};
 
 $("btn-soundboard").onclick = (e) => {
   e.stopPropagation();
@@ -4113,9 +4752,13 @@ function autocompleteCandidates() {
   if (colon) {
     const q = colon[2].toLowerCase();
     const from = upto.length - colon[2].length - 1;
-    const items = EMOJI_NAMES.filter(([name]) => name.includes(q))
-      .slice(0, 8)
-      .map(([name, emoji]) => ({ icon: emoji, label: `:${name}:`, sub: "", insert: emoji + " ", from }));
+    // Custom emoji rank above the built-ins — somebody here went to the
+    // trouble of uploading them, so they're the likelier target.
+    const items = emojiCandidates(q, state.currentCode, emojiReg, EMOJI_NAMES).map((e) =>
+      e.url
+        ? { icon: "", img: e.url, label: `:${e.name}:`, sub: "this server", insert: `:${e.name}: `, from }
+        : { icon: e.char, label: `:${e.name}:`, sub: "", insert: e.char + " ", from }
+    );
     return items.length ? { kind: "emoji", items } : null;
   }
   return null;
@@ -4138,7 +4781,14 @@ function renderAutocomplete() {
   pop.appendChild(el("div", "ac-head", title));
   ac.items.forEach((item, i) => {
     const row = el("div", "ac-row" + (i === ac.index ? " active" : ""));
-    row.appendChild(el("span", "ac-icon", item.icon));
+    if (item.img) {
+      const img = el("img", "ac-emoji");
+      img.src = item.img;
+      img.alt = item.label;
+      row.appendChild(img);
+    } else {
+      row.appendChild(el("span", "ac-icon", item.icon));
+    }
     row.appendChild(el("span", "ac-label", item.label));
     if (item.sub) row.appendChild(el("span", "ac-sub", item.sub));
     row.onmousedown = (e) => {

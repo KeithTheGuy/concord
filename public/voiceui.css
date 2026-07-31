@@ -1,2 +1,107 @@
 /* Voice UI — the audio settings panel and the call quality readout.
-   Kept out of style.css only because that file is already 3800 lines. */
+   Kept out of style.css only because that file is already 3800 lines.
+
+   Everything here is drawn from the custom properties in style.css's :root.
+   There are seven themes swapping those out from under it; a hardcoded hex
+   would look correct in exactly one of them. */
+
+/* -------------------------------------------------------------------------
+   Input sensitivity: meter + gate threshold marker
+   ------------------------------------------------------------------------- */
+
+.vmeter {
+  position: relative;
+  height: 10px;
+  margin-top: 8px;
+  border-radius: 5px;
+  background: var(--bg-rail);
+  overflow: hidden;
+}
+
+/* Muted while the gate is holding this level back, green once it's getting
+   through — the bar answers "am I being heard right now?" on its own. */
+.vmeter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 5px;
+  background: var(--text-muted);
+  transition: width 0.06s linear, background-color 0.12s ease;
+}
+
+.vmeter-fill.open {
+  background: var(--green);
+}
+
+/* The line the slider sets. Shares the meter's axis exactly, so "my voice
+   reaches past the line" means "my voice opens the gate". */
+.vmeter-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--yellow);
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+.vmeter-mark.off {
+  display: none;
+}
+
+.vnote {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+/* select + Test button on one line */
+.vrow {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.vrow select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vrow .pill-btn {
+  flex: 0 0 auto;
+}
+
+/* -------------------------------------------------------------------------
+   Call quality readout (#vs-quality in the voice panel)
+   ------------------------------------------------------------------------- */
+
+#vs-quality {
+  cursor: default; /* it has a tooltip worth hovering for */
+  transition: color 0.2s ease;
+}
+
+/* .vs-title is green by default, which is right for Excellent — the rest
+   walk down through the accent to the warning colours. */
+#vs-quality.q-excellent {
+  color: var(--green);
+}
+
+#vs-quality.q-good {
+  color: var(--blurple);
+}
+
+#vs-quality.q-ok {
+  color: var(--yellow);
+}
+
+#vs-quality.q-poor {
+  color: var(--red);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vmeter-fill,
+  #vs-quality {
+    transition: none;
+  }
+}
