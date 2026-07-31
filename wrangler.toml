@@ -16,6 +16,12 @@ run_worker_first = true
 name = "SERVERS"
 class_name = "ConcordServer"
 
+# Attachments, custom emoji and soundboard clips. Keys are a/<CODE>/<uuid>/<name>,
+# so an object is only findable by someone who already has the invite code.
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "concord-files"
+
 # One ConcordHub for the whole app: accounts, friend tags, the friend graph,
 # and the secret code behind each DM. Never sees message content.
 [[durable_objects.bindings]]

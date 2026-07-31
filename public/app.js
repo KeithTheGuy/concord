@@ -6,6 +6,9 @@ import { HubConnection, groupTitle } from "./hub.js";
 import { SOUNDBOARD, playSound } from "./sounds.js";
 import { VOICE_FX, FX_BY_ID } from "./voicefx.js";
 import {
+  createUploader, renderAttachments, openLightbox, humanSize, fileIcon, isImage,
+} from "./uploads.js";
+import {
   THEMES, applyTheme, applyTurbo, burst, confetti,
   levelFromXp, ACHIEVEMENTS, ACH_BY_ID, achievementToast,
 } from "./flair.js";
@@ -181,7 +184,7 @@ const NO_MAP = new Map();
 const NO_SET = new Set();
 
 function makeRealm(code, kind) {
-  return {
+  const realm = {
     code,
     kind, // "guild" | "dm"
     peer: null, // the friend, when kind === "dm"
@@ -199,7 +202,12 @@ function makeRealm(code, kind) {
     me: null,
     meta: null,
     channels: [],
-    members: new Map(), // sid -> member
+    members: new Map(), // sid -> member, one entry per LIVE SOCKET
+    // The durable half of membership: one row per person, present or not. Kept
+    // beside `members` rather than merged into it, because voice, WebRTC and
+    // typing all address people by sid and two tabs are two sids.
+    roster: new Map(), // userId -> {userId, name, color, avatar, tag, status, at, joinedAt}
+    owner: null,
     messages: new Map(), // chanId -> msg[]
     historyLoaded: new Set(),
     historyPending: new Set(),
@@ -213,6 +221,7 @@ function makeRealm(code, kind) {
     editingId: null,
     pendingByNonce: new Map(),
     touched: Date.now(), // for evicting stale DM sockets
+    flushing: false, // an upload flush is waiting on this socket for tickets
     send(obj) {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify(obj));
@@ -221,6 +230,18 @@ function makeRealm(code, kind) {
       return false;
     },
   };
+  // One uploader per realm, so half-attached files survive a glance at another
+  // server. Tickets come back on this realm's socket, which is why the uploader
+  // can't be global.
+  realm.uploader = createUploader({
+    send: (obj) => realm.send(obj),
+    code: () => realm.code,
+    onError: (text) => toast(text, true),
+    onProgress: () => {
+      if (realm.code === state.activeCode) renderTray();
+    },
+  });
+  return realm;
 }
 
 const R = () => (state.activeCode ? state.realms.get(state.activeCode) : null) || null;
@@ -233,6 +254,7 @@ const voiceRealm = () => (state.voiceCode ? state.realms.get(state.voiceCode) : 
 const REALM_FIELDS = {
   channels: NO_ARR,
   members: NO_MAP,
+  roster: NO_MAP,
   messages: NO_MAP,
   historyLoaded: NO_SET,
   historyPending: NO_SET,
@@ -685,6 +707,8 @@ function handleServerMessage(realm, m) {
       realm.meta = m.meta;
       realm.channels = m.channels;
       realm.members = new Map(m.members.map((mm) => [mm.sid, mm]));
+      realm.roster = new Map((m.roster || []).map((e) => [e.userId, e]));
+      realm.owner = m.owner || null;
       startRealmPing(realm);
 
       const resume = realm.resume;
@@ -773,6 +797,43 @@ function handleServerMessage(realm, m) {
         renderChannels();
         renderTyping();
       }
+      break;
+    }
+
+    case "roster": {
+      realm.roster.set(m.entry.userId, m.entry);
+      if (live) renderMembers();
+      break;
+    }
+
+    case "roster-remove": {
+      realm.roster.delete(m.userId);
+      if (live) renderMembers();
+      break;
+    }
+
+    // A ban is permanent from this client's point of view, so the realm goes
+    // away entirely — reconnecting would just get refused again, forever.
+    case "banned": {
+      const name = realm.meta?.name || realm.code;
+      toast(`You've been banned from ${name}.`, true);
+      const wasActive = realm.code === state.activeCode;
+      state.servers = state.servers.filter((s) => s.code !== realm.code);
+      store.set("servers", state.servers);
+      closeRealm(realm.code); // sets closing + clears the reconnect timer
+      renderServerRail();
+      if (wasActive) {
+        state.activeCode = state.servers[0]?.code || null;
+        if (state.activeCode) goServer(state.activeCode);
+        else goHome();
+      }
+      break;
+    }
+
+    case "upload-tickets": {
+      // Arrives on the socket that asked, which is not necessarily the one
+      // you're looking at.
+      realm.uploader.handleTickets(m);
       break;
     }
 
@@ -1009,6 +1070,9 @@ function handleServerMessage(realm, m) {
     }
 
     case "error": {
+      // A refused upload-ticket comes back as a plain error, and the uploader
+      // would otherwise sit on its 15s timeout with the composer locked.
+      if (realm.flushing) realm.uploader.handleTickets({ tickets: [] });
       if (live) toast(m.error, true);
       break;
     }
@@ -1189,10 +1253,15 @@ function updateTitle() {
   document.title = (n ? `(${n}) ` : "") + "Concord";
 }
 
-function sendCurrentMessage() {
+async function sendCurrentMessage() {
   const input = $("input");
+  const realm = R();
+  const uploader = realm?.uploader;
   let content = input.value.trim();
-  if (!content || !state.activeChan) return;
+  // A picture with no caption is a message. Only the pair being empty isn't.
+  const staged = uploader && !uploader.isEmpty();
+  if ((!content && !staged) || !state.activeChan) return;
+  if (uploader?.busy()) return; // an upload in flight owns the tray
 
   // Slash commands rewrite (or swallow) the message before it goes anywhere.
   if (content.startsWith("/") && !content.startsWith("//")) {
@@ -1211,25 +1280,61 @@ function sendCurrentMessage() {
     }
   }
 
+  // Everything staged goes up before the message that references it exists.
+  // A failure here keeps the tray exactly as it was — losing someone's file
+  // because a PUT hiccuped would be unforgivable.
+  let attachments = [];
+  if (staged) {
+    realm.flushing = true;
+    renderTray(); // repaints the bars and locks the composer
+    try {
+      attachments = await uploader.flush();
+    } catch {
+      realm.flushing = false; // the uploader already said what went wrong
+      renderTray();
+      return;
+    }
+    realm.flushing = false;
+    const failed = uploader.items().filter((it) => it.state === "error");
+    if (failed.length || !attachments.length) {
+      toast(failed[0]?.error || "Nothing uploaded — give it another go.", true);
+      renderTray();
+      return;
+    }
+    attachments = attachments.map((a) => ({ ...a, url: "/f/" + a.key }));
+  }
+
+  // An upload takes time, and the rail is still clickable while it runs — so
+  // everything below addresses the realm this message was composed in.
+  const chanId = realm.activeChan;
   const nonce = "n" + Math.random().toString(36).slice(2);
   const optimistic = {
     id: "pending-" + nonce,
-    chanId: state.activeChan,
+    chanId,
     author: { userId: myUserId(), name: state.profile.name, color: state.profile.color, avatar: state.profile.avatar },
     content,
     ts: Date.now(),
     pending: true,
   };
-  if (state.replyTo) optimistic.replyTo = { id: state.replyTo.id, name: state.replyTo.name, content: state.replyTo.content };
-  state.pendingByNonce.set(nonce, optimistic);
-  const list = state.messages.get(state.activeChan) || [];
+  if (attachments.length) optimistic.attachments = attachments;
+  if (realm.replyTo) optimistic.replyTo = { id: realm.replyTo.id, name: realm.replyTo.name, content: realm.replyTo.content };
+  realm.pendingByNonce.set(nonce, optimistic);
+  const list = realm.messages.get(chanId) || [];
   list.push(optimistic);
-  state.messages.set(state.activeChan, list);
+  realm.messages.set(chanId, list);
 
-  wsSend({ type: "msg", chanId: state.activeChan, content, nonce, replyTo: state.replyTo?.id });
+  realm.send({
+    type: "msg",
+    chanId,
+    content,
+    nonce,
+    replyTo: realm.replyTo?.id,
+    attachments: attachments.length ? attachments : undefined,
+  });
+  uploader?.clear();
+  renderTray();
   // The other half of a DM isn't connected to its Durable Object unless they
   // have it open, so the hub is what lights up their sidebar.
-  const realm = R();
   if (realm?.kind === "dm" && realm.peer) {
     hub.nudgeDm(realm.peer.uid, content.slice(0, 120));
   } else if (realm?.kind === "group" && realm.group) {
@@ -1331,6 +1436,7 @@ function renderAll() {
   renderDmList();
   renderHomeBadge();
   renderVoicePanel();
+  renderTray(); // the tray belongs to the realm, so it follows the switch
   applyView();
 }
 
@@ -1352,6 +1458,7 @@ function applyView() {
   $("btn-invite").classList.toggle("hidden", state.view !== "server");
   $("btn-gremlin").classList.toggle("hidden", state.view !== "server");
   $("btn-members").classList.toggle("hidden", state.view !== "server");
+  $("member-count").classList.toggle("hidden", state.view !== "server");
   $("btn-call").classList.toggle("hidden", !isDm);
   $("btn-pins").classList.toggle("hidden", state.view === "home");
   $("btn-search").classList.toggle("hidden", state.view === "home");
@@ -1945,9 +2052,12 @@ function channelMenu(e, c) {
 }
 
 // Right-clicking anyone in a server: message them, add them, prank them, or
-// set their volume if you're currently in a call with them.
+// set their volume if you're currently in a call with them. Offline people
+// come from the roster and have no sid, so anything that needs a live socket
+// is left out rather than offered and then quietly failing.
 function memberMenu(e, member) {
-  if (member.sid === state.me?.sid) {
+  const isMe = member.sid ? member.sid === state.me?.sid : member.userId === realmUserId(R());
+  if (isMe) {
     ctxMenu(e.clientX, e.clientY, [{ label: "Edit Profile", onClick: openSettings }]);
     return;
   }
@@ -1966,9 +2076,9 @@ function memberMenu(e, member) {
   } else {
     items.push({ label: "No friend tag — ask them for it", onClick: () => {} });
   }
-  items.push({ label: "🃏 Prank", onClick: () => openGremlinModal(member.sid) });
+  if (member.sid) items.push({ label: "🃏 Prank", onClick: () => openGremlinModal(member.sid) });
   const inCallTogether =
-    state.voiceCode === state.activeCode && member.voice && member.voice.chanId === state.voiceChan;
+    member.sid && state.voiceCode === state.activeCode && member.voice && member.voice.chanId === state.voiceChan;
   if (inCallTogether) {
     items.push({ label: "🔊 Volume…", onClick: () => volumeMenu(e, member) });
   }
@@ -1994,41 +2104,94 @@ function volumeMenu(e, member) {
   ctxMenu(e.clientX, e.clientY, [{ custom: wrap }]);
 }
 
+// "just now" up to a date, which is as much precision as anybody wants about
+// when someone was last around.
+function agoText(ts) {
+  const diff = Date.now() - (ts || 0);
+  if (!ts || diff < 60_000) return "just now";
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  if (hours < 48) return "yesterday";
+  return new Date(ts).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// A 200-person roster shouldn't cost 200 nodes every time somebody joins.
+const OFFLINE_SHOWN = 100;
+
 function renderMembers() {
   const wrap = $("member-list");
   wrap.textContent = "";
-  const members = [...state.members.values()].sort((a, b) => a.name.localeCompare(b.name));
-  wrap.appendChild(el("div", "member-group-head", `Online — ${members.length}`));
-  for (const member of members) {
-    const row = el("div", "member-row");
-    const av = el("div", "avatar", member.avatar);
-    av.style.background = member.color;
-    av.dataset.vsid = member.sid;
-    if (voice.isSpeaking(member.sid === state.me?.sid ? "me" : member.sid)) av.classList.add("speaking");
-    row.appendChild(av);
-    const col = el("div", "m-col");
-    const name = el("div", "m-name", member.name);
-    name.style.color = member.color;
-    col.appendChild(name);
-    const sub = member.voice
-      ? `🔊 ${state.channels.find((c) => c.id === member.voice.chanId)?.name || "voice"}`
-      : member.status || "";
-    if (sub) col.appendChild(el("div", "m-status", sub));
-    row.appendChild(col);
-    const icons = el("span", "vu-icons");
-    if (member.voice?.muted) icons.append("🔇");
-    if (member.voice?.deafened) icons.append("🎧");
-    row.appendChild(icons);
-    row.onclick = (e) => {
-      e.stopPropagation(); // otherwise the document handler closes it instantly
-      openProfile(e.clientX - 300, e.clientY - 40, member);
-    };
-    row.oncontextmenu = (e) => {
-      e.preventDefault();
-      memberMenu(e, member);
-    };
-    wrap.appendChild(row);
+
+  // members is keyed by sid — one per socket — so two tabs are two entries and
+  // one person. Dedupe by userId, preferring the session that's in voice,
+  // because that's the one whose mute and channel are worth showing.
+  const online = new Map(); // userId -> live member
+  for (const member of state.members.values()) {
+    const key = member.userId || member.sid;
+    const seen = online.get(key);
+    if (!seen || (!seen.voice && member.voice)) online.set(key, member);
   }
+  const live = [...online.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const offline = [...state.roster.values()]
+    .filter((entry) => !online.has(entry.userId))
+    .sort((a, b) => (b.at || 0) - (a.at || 0));
+
+  wrap.appendChild(el("div", "member-group-head", `Online — ${live.length}`));
+  for (const member of live) wrap.appendChild(memberRow(member));
+
+  if (offline.length) {
+    wrap.appendChild(el("div", "member-group-head", `Offline — ${offline.length}`));
+    for (const entry of offline.slice(0, OFFLINE_SHOWN)) wrap.appendChild(memberRow(entry, true));
+    if (offline.length > OFFLINE_SHOWN) {
+      wrap.appendChild(el("div", "member-more", `+ ${offline.length - OFFLINE_SHOWN} more`));
+    }
+  }
+
+  const count = $("member-count");
+  const total = live.length + offline.length;
+  count.textContent = String(total);
+  count.title = `${live.length} of ${total} online`;
+  count.classList.toggle("hidden", state.view !== "server" || !total);
+}
+
+// `person` is either a live member (has a sid) or a roster row (has only a
+// userId). Anything that needs a socket is gated on the sid actually existing
+// rather than on a faked one.
+function memberRow(person, offline = false) {
+  const row = el("div", "member-row" + (offline ? " offline" : ""));
+  const av = el("div", "avatar", person.avatar);
+  av.style.background = person.color;
+  if (person.sid) {
+    av.dataset.vsid = person.sid;
+    if (voice.isSpeaking(person.sid === state.me?.sid ? "me" : person.sid)) av.classList.add("speaking");
+  }
+  row.appendChild(av);
+  const col = el("div", "m-col");
+  const name = el("div", "m-name", person.name);
+  name.style.color = person.color;
+  col.appendChild(name);
+  const sub = offline
+    ? agoText(person.at)
+    : person.voice
+    ? `🔊 ${state.channels.find((c) => c.id === person.voice.chanId)?.name || "voice"}`
+    : person.status || "";
+  if (sub) col.appendChild(el("div", "m-status", sub));
+  row.appendChild(col);
+  const icons = el("span", "vu-icons");
+  if (person.voice?.muted) icons.append("🔇");
+  if (person.voice?.deafened) icons.append("🎧");
+  row.appendChild(icons);
+  row.onclick = (e) => {
+    e.stopPropagation(); // otherwise the document handler closes it instantly
+    openProfile(e.clientX - 300, e.clientY - 40, person);
+  };
+  row.oncontextmenu = (e) => {
+    e.preventDefault();
+    memberMenu(e, person);
+  };
+  return row;
 }
 
 function renderMe() {
@@ -2044,19 +2207,24 @@ function renderMe() {
   $("me-presence").title = pres.label;
 }
 
+let composerHint = ""; // what renderChatHeader last decided the box should say
+
 // Until a conversation's socket has handed us its channels there is nowhere
 // for a message to go, and sendCurrentMessage would silently drop it. Lock the
-// composer instead, so the state is visible rather than quietly lossy.
+// composer instead, so the state is visible rather than quietly lossy. An
+// upload in flight locks it for the same reason.
 function syncComposer() {
-  const ready = !!state.activeChan && state.view !== "home";
+  const busy = !!R()?.uploader?.busy();
+  const ready = !!state.activeChan && state.view !== "home" && !busy;
   const box = $("input");
   box.disabled = !ready;
   box.classList.toggle("waiting", !ready);
-  if (!ready && state.view !== "home") box.placeholder = "Connecting…";
+  if (busy) box.placeholder = "Uploading…";
+  else if (ready) box.placeholder = composerHint;
+  else if (state.view !== "home") box.placeholder = "Connecting…";
 }
 
 function renderChatHeader() {
-  syncComposer();
   const realm = R();
   if (state.view === "dm" && realm?.kind === "group" && realm.group) {
     const group = hub.groups.get(realm.group.id) || realm.group;
@@ -2064,7 +2232,8 @@ function renderChatHeader() {
     $("chan-name").textContent = groupTitle(group, hub.me?.uid);
     const online = group.members.filter((m) => m.online && m.presence !== "invisible").length;
     $("chan-topic").textContent = `${group.members.length} members · ${online} online`;
-    $("input").placeholder = `Message ${groupTitle(group, hub.me?.uid)}`;
+    composerHint = `Message ${groupTitle(group, hub.me?.uid)}`;
+    syncComposer();
     return;
   }
   if (state.view === "dm" && state.dmPeer) {
@@ -2074,14 +2243,16 @@ function renderChatHeader() {
     $("chan-topic").textContent = f.online && f.presence !== "invisible"
       ? f.status || PRESENCE_META[f.presence]?.label || "Online"
       : "Offline";
-    $("input").placeholder = `Message ${f.name}`;
+    composerHint = `Message ${f.name}`;
+    syncComposer();
     return;
   }
   $("chan-hash").textContent = "#";
   const c = state.channels.find((x) => x.id === state.activeChan);
   $("chan-name").textContent = c ? c.name : "";
   $("chan-topic").textContent = c?.topic || "";
-  $("input").placeholder = c ? `Message #${c.name}` : "Pick a channel";
+  composerHint = c ? `Message #${c.name}` : "Pick a channel";
+  syncComposer();
 }
 
 /* ----------------------------- messages pane ---------------------------- */
@@ -2218,12 +2389,20 @@ function buildMsgNode(msg) {
   content.querySelectorAll(".spoiler").forEach((s) => {
     s.onclick = () => s.classList.add("revealed");
   });
-  if (state.settings.embeds) attachEmbeds(content);
+  if (state.settings.embeds) attachEmbeds(content, msg);
   if (msg.edited) {
     const tag = el("span", "msg-edited", " (edited)");
     content.appendChild(tag);
   }
   node.appendChild(content);
+
+  // Link previews are a setting because they're a guess about what you wanted.
+  // An attachment is something a person deliberately sent, so it always shows.
+  const atts = renderAttachments(msg.attachments, {
+    spoilerRevealed: revealedAtts,
+    onOpen: (att) => openLightbox(att, msg.attachments),
+  });
+  if (atts) node.appendChild(atts);
 
   if (msg.reactions) {
     const row = el("div", "msg-reactions");
@@ -2299,13 +2478,25 @@ function msgActions(msg) {
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|avif|bmp)(\?[^\s]*)?$/i;
 const YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{6,20})/i;
 
-function attachEmbeds(content) {
+function hrefPath(href) {
+  try {
+    return new URL(href, location.origin).pathname;
+  } catch {
+    return href;
+  }
+}
+
+function attachEmbeds(content, msg) {
   const links = [...content.querySelectorAll("a[href]")].slice(0, 4);
   const seen = new Set();
+  // Someone pasting the link to a file they attached shouldn't get the picture
+  // twice — renderAttachments is already showing that key.
+  const ours = new Set((msg?.attachments || []).map((a) => a.url));
   for (const a of links) {
     const href = a.getAttribute("href") || "";
     if (seen.has(href)) continue;
     seen.add(href);
+    if (ours.has(href) || ours.has(hrefPath(href))) continue;
 
     if (IMAGE_RE.test(href)) {
       const wrap = el("div", "embed");
@@ -2708,6 +2899,9 @@ $("add-server-btn").onclick = openJoinModal;
 
 function confirmLeaveServer(s) {
   confirmModal(`Leave ${s.name}?`, "You can rejoin any time with the invite code.", () => {
+    // Say so before the socket goes, or you linger in everyone else's list as
+    // a permanently offline ghost.
+    state.realms.get(s.code)?.send({ type: "leave-server" });
     state.servers = state.servers.filter((x) => x.code !== s.code);
     store.set("servers", state.servers);
     const wasActive = state.activeCode === s.code;
@@ -3171,6 +3365,137 @@ input.addEventListener("keydown", (e) => {
   }
 });
 $("reply-cancel").onclick = clearReply;
+
+/* ------------------------------ attachments ------------------------------ */
+// Three ways in — the 📎 button, a drop anywhere over the chat pane, and a
+// paste — all landing in the active realm's uploader. The tray on screen is
+// always that realm's, so switching servers swaps trays rather than losing one.
+
+// Thumbnails outlive a repaint, so their object URLs are cached per staged
+// item and revoked only once the item itself is gone.
+const trayThumbs = new Map(); // item id -> object URL
+
+function addFiles(files) {
+  const realm = R();
+  if (!realm || !files?.length) return;
+  if (!realm.activeChan) {
+    toast("Pick a channel first.", true);
+    return;
+  }
+  realm.uploader.add(files);
+  renderTray();
+}
+
+function renderTray() {
+  const tray = $("att-tray");
+  const uploader = R()?.uploader;
+  const items = uploader ? uploader.items() : [];
+  const alive = new Set(items.map((it) => it.id));
+  for (const [id, url] of trayThumbs) {
+    if (alive.has(id)) continue;
+    URL.revokeObjectURL(url);
+    trayThumbs.delete(id);
+  }
+
+  tray.textContent = "";
+  tray.classList.toggle("hidden", !items.length);
+  for (const item of items) {
+    const card = el("div", "att-card" + (item.state === "error" ? " error" : ""));
+
+    if (isImage(item.mime)) {
+      let url = trayThumbs.get(item.id);
+      if (!url) {
+        url = URL.createObjectURL(item.file);
+        trayThumbs.set(item.id, url);
+      }
+      const img = el("img", "att-card-thumb");
+      img.alt = "";
+      img.src = url;
+      card.appendChild(img);
+    } else {
+      card.appendChild(el("div", "att-card-icon", fileIcon(item.name, item.mime)));
+    }
+
+    const meta = el("div", "att-card-meta");
+    meta.appendChild(el("div", "att-card-name", item.name));
+    meta.appendChild(el("div", "att-card-size", item.error || humanSize(item.size)));
+    card.appendChild(meta);
+
+    const spoil = el("button", "att-card-spoil" + (item.spoiler ? " on" : ""), item.spoiler ? "🙈" : "👁");
+    spoil.title = item.spoiler ? "Spoilered — click to show it plainly" : "Mark as a spoiler";
+    spoil.onclick = () => {
+      uploader.toggleSpoiler(item.id);
+      renderTray();
+    };
+    const remove = el("button", "att-card-remove", "✕");
+    remove.title = "Remove";
+    remove.onclick = () => {
+      uploader.remove(item.id);
+      renderTray();
+    };
+    card.append(spoil, remove);
+
+    if (item.state === "uploading") {
+      const bar = el("div", "att-card-bar");
+      const fill = el("div", "att-card-fill");
+      fill.style.width = item.pct + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
+    }
+    tray.appendChild(card);
+  }
+  syncComposer();
+}
+
+$("btn-attach").onclick = () => $("file-picker").click();
+$("file-picker").onchange = (e) => {
+  addFiles(e.target.files);
+  e.target.value = ""; // so picking the same file twice still fires
+};
+
+// dragleave fires every time the pointer crosses into a child element, so a
+// naive handler strobes the overlay. Count enters against leaves instead.
+let dragDepth = 0;
+const dragHasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+function showDrop(on) {
+  $("drop-overlay").classList.toggle("hidden", !on);
+}
+$("chat-view").addEventListener("dragenter", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  if (++dragDepth === 1) showDrop(true);
+});
+$("chat-view").addEventListener("dragover", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+});
+$("chat-view").addEventListener("dragleave", (e) => {
+  if (!dragHasFiles(e)) return;
+  if (--dragDepth <= 0) {
+    dragDepth = 0;
+    showDrop(false);
+  }
+});
+$("chat-view").addEventListener("drop", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  showDrop(false);
+  addFiles(e.dataTransfer.files);
+});
+
+// How screenshots actually get shared.
+input.addEventListener("paste", (e) => {
+  const files = e.clipboardData?.files;
+  if (!files?.length) return;
+  e.preventDefault();
+  addFiles(files);
+});
+
+// Revealed spoilers are remembered per attachment key, so a repaint (a new
+// message, a reaction) doesn't hide something you already chose to look at.
+const revealedAtts = new Set();
 
 /* ----------------------------- emoji picker ------------------------------ */
 
@@ -3642,9 +3967,15 @@ function openProfile(x, y, person) {
     const chan = state.channels.find((c) => c.id === person.voice.chanId);
     body.appendChild(el("div", "pp-status", `🔊 In ${chan?.name || "voice"}`));
   }
+  // A roster row has no sid because nobody's holding a socket for them.
+  if (!person.sid && person.at) body.appendChild(el("div", "pp-status", `Last seen ${agoText(person.at)}`));
 
   const acts = el("div", "pp-actions");
-  const isMe = person.sid ? person.sid === state.me?.sid : uid && uid === hub.me?.uid;
+  const isMe = person.sid
+    ? person.sid === state.me?.sid
+    : person.userId
+    ? person.userId === realmUserId(R())
+    : uid && uid === hub.me?.uid;
   if (!isMe) {
     if (friend) {
       const msg = el("button", "primary-btn tiny", "Message");

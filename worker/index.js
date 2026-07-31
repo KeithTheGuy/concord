@@ -33,6 +33,39 @@ const PRANK_KINDS = new Set([
   "colemode",
 ]);
 
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_FILES_PER_MSG = 10;
+const MAX_PENDING_TICKETS = 10; // unspent tickets one person may hold at once
+const UPLOADS_PER_10MIN = 30;
+const TICKET_TTL_MS = 5 * 60 * 1000;
+const ATT_TTL_MS = 30 * 60 * 1000;
+const ROSTER_CAP = 200;
+const CHANNEL_CAP = 100; // threads live in `channels`, so the ceiling had to move
+const EMOJI_CAP = 50;
+const EMOJI_MAX_BYTES = 256 * 1024;
+const SOUND_CAP = 20;
+const SOUND_MAX_BYTES = 512 * 1024;
+const SLOWMODE_MAX_S = 300;
+const EMOJI_NAME_RE = /^[a-z0-9_]{2,20}$/;
+const CUSTOM_EMOJI_RE = /^:[a-z0-9_]{2,20}:$/;
+// `a/<CODE>/<uuid>/<slug>` — four segments, nothing else.
+const ATT_KEY_RE = /^a\/([A-Z0-9]{4,12})\/[a-f0-9-]{36}\/[A-Za-z0-9._-]{1,80}$/;
+
+// A thread is a channel with a parent, and voice channels grew a chat pane, so
+// "can you post here?" is a set membership test rather than `type === "text"`.
+const CHATTABLE = new Set(["text", "thread", "voice"]);
+
+// What we are willing to hand back with a real Content-Type. Everything else
+// becomes application/octet-stream and therefore downloads instead of
+// rendering. image/svg+xml and text/html are absent on purpose: both execute
+// script on our own origin, which is the one thing an attachment must not do.
+const SAFE_MIMES = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp",
+  "video/mp4", "video/webm", "video/quicktime",
+  "audio/mpeg", "audio/ogg", "audio/wav", "audio/webm", "audio/mp4",
+  "application/pdf", "text/plain", "application/zip", "application/json",
+]);
+
 // Everything a client can spam goes through the rate limiter. `rtc` is
 // exempt (ICE candidates legitimately burst) and `hello` runs once.
 const RATE_LIMITED = new Set([
@@ -40,6 +73,8 @@ const RATE_LIMITED = new Set([
   "create-channel", "update-channel", "delete-channel", "update-server",
   "voice-join", "voice-leave", "voice-state", "prank", "hello",
   "pin", "unpin", "pins", "search", "sound",
+  "upload-ticket", "create-thread", "leave-server", "kick", "ban", "unban",
+  "bans", "emoji-add", "emoji-remove", "sound-add", "sound-remove",
 ]);
 
 export default {
@@ -63,9 +98,90 @@ export default {
       return Response.json({ code: newServerCode() });
     }
 
+    if (url.pathname.startsWith("/api/upload/")) {
+      return handleUpload(request, env, url);
+    }
+
+    // Must run before the asset server, or /f/ would be a 404 from the SPA
+    // fallback instead of a file.
+    if (url.pathname.startsWith("/f/")) {
+      return serveFile(request, env, url);
+    }
+
     return env.ASSETS.fetch(request);
   },
 };
+
+// Spend an upload ticket. The ticket is the only identity this request has —
+// there is no socket here — so the DO validates it and hands back the key it
+// already picked, rather than trusting anything on the wire.
+async function handleUpload(request, env, url) {
+  if (request.method !== "PUT") return new Response("expected PUT", { status: 405 });
+  if (!env.FILES) return new Response("uploads are not configured", { status: 503 });
+
+  const code = (url.searchParams.get("code") || "").toUpperCase();
+  if (!CODE_RE.test(code)) return new Response("bad server code", { status: 400 });
+  const ticket = url.pathname.slice("/api/upload/".length);
+  if (!/^[a-f0-9-]{36}$/.test(ticket)) return new Response("bad ticket", { status: 400 });
+
+  // A chunked upload gives us no size to check against, and the whole point of
+  // the ticket is a bound we can enforce before writing a byte.
+  const len = Number(request.headers.get("Content-Length"));
+  if (!Number.isFinite(len) || len <= 0) return new Response("length required", { status: 411 });
+  if (len > MAX_FILE_BYTES) return new Response("too large", { status: 413 });
+
+  const stub = env.SERVERS.get(env.SERVERS.idFromName(code));
+  const claimed = await stub.fetch(
+    `https://do/internal/claim?ticket=${encodeURIComponent(ticket)}`
+  );
+  if (!claimed.ok) return new Response("ticket expired or already spent", { status: 403 });
+  const claim = await claimed.json();
+  if (len > claim.max) return new Response("too large", { status: 413 });
+
+  // The mime on the ticket wins. Believing Content-Type here would let anyone
+  // declare image/png and upload markup we then serve from our own origin.
+  await env.FILES.put(claim.key, request.body, {
+    httpMetadata: { contentType: claim.mime },
+  });
+
+  return Response.json({
+    ok: true,
+    att: { key: claim.key, name: claim.key.split("/").pop(), size: len, mime: claim.mime },
+  });
+}
+
+// Server codes are the auth for everything in this app, so an attacker who can
+// guess a key already knows the code inside it. Validating the prefix here is
+// defence in depth against a malformed or hand-built key, not a real boundary.
+async function serveFile(request, env, url) {
+  if (!env.FILES) return new Response("not found", { status: 404 });
+  let key;
+  try {
+    key = decodeURIComponent(url.pathname.slice(3));
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+  if (!ATT_KEY_RE.test(key)) return new Response("not found", { status: 404 });
+
+  const obj = await env.FILES.get(key);
+  if (!obj) return new Response("not found", { status: 404 });
+
+  // Second pass over the allowlist: the metadata was written whenever this file
+  // was uploaded, which may predate a mime we have since stopped trusting.
+  const mime = safeMime(obj.httpMetadata?.contentType);
+  const inline = /^(image|video|audio)\//.test(mime) || mime === "application/pdf";
+  const name = key.split("/").pop();
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": mime,
+      "Content-Disposition": inline ? "inline" : `attachment; filename="${name}"`,
+      "Content-Length": String(obj.size),
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "X-Content-Type-Options": "nosniff",
+      ETag: obj.httpEtag,
+    },
+  });
+}
 
 // Unambiguous alphabet: no 0/O/1/I/L.
 function newServerCode() {
@@ -87,7 +203,14 @@ export class ConcordServer {
     this.prankAt = new Map(); // userId -> last prank sent (survives reconnects)
     this.prankedAt = new Map(); // userId -> last prank received
     this.soundAt = new Map(); // userId -> last soundboard clip
+    // Every Map on `this` is erased when the DO hibernates, which means all of
+    // these limiters fail open on the first message after a wake-up. That's a
+    // deliberate trade: persisting a counter per keystroke costs more than the
+    // one extra emoji a friend group might squeeze through.
+    this.slowAt = new Map(); // `${userId}:${chanId}` -> last message
+    this.uploadAt = new Map(); // userId -> recent upload timestamps
     this.authWrites = 0;
+    this.code = ""; // this server's invite code; see fetch()
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}')
     );
@@ -100,8 +223,26 @@ export class ConcordServer {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    // Only the Worker holds a stub for this object, so this route is not
+    // reachable from the internet — it is the trusted half of an upload.
+    if (url.pathname === "/internal/claim") {
+      return this.claimTicket(url.searchParams.get("ticket") || "");
+    }
+
     if (url.pathname !== "/ws" || request.headers.get("Upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
+    }
+
+    // A DO cannot ask what name it was created under, and attachment keys need
+    // it. The connect URL is the only place it appears, so remember it — a
+    // socket that wakes from hibernation arrives with no URL at all.
+    const joining = (url.searchParams.get("server") || "").toUpperCase();
+    if (CODE_RE.test(joining) && this.code !== joining) {
+      this.code = joining;
+      if ((await this.state.storage.get("code")) !== joining) {
+        await this.state.storage.put("code", joining);
+      }
     }
 
     let meta = await this.state.storage.get("meta");
@@ -199,6 +340,9 @@ export class ConcordServer {
     for (const [key, at] of this.soundAt) {
       if (now - at > 10_000) this.soundAt.delete(key);
     }
+    for (const [key, at] of this.slowAt) {
+      if (now - at > SLOWMODE_MAX_S * 1000) this.slowAt.delete(key);
+    }
   }
 
   victimKey(session) {
@@ -232,6 +376,199 @@ export class ConcordServer {
     if (doomed.length) await this.state.storage.delete(doomed);
   }
 
+  // Unconsumed uploads and tickets nobody spent, swept on the auth schedule.
+  // Orphans outlive a DO that dies mid-write; R2's free tier is 10 GB and this
+  // is a friend group, so we let those go.
+  async sweepUploads(now) {
+    const storage = this.state.storage;
+    const doomed = [];
+    const orphans = [];
+    for (const [key, rec] of await storage.list({ prefix: "att:" })) {
+      if (rec?.exp > now) continue;
+      doomed.push(key);
+      orphans.push(key.slice(4));
+    }
+    for (const [key, rec] of await storage.list({ prefix: "tkt:" })) {
+      if (!(rec?.exp > now)) doomed.push(key);
+    }
+    await this.dropObjects(orphans);
+    if (doomed.length) await storage.delete(doomed);
+  }
+
+  // The ticket must die in the same breath it is read, or two racing PUTs both
+  // see it alive and the second one overwrites the first one's key.
+  async claimTicket(id) {
+    if (!/^[a-f0-9-]{36}$/.test(id)) return Response.json({ ok: false }, { status: 404 });
+    const storage = this.state.storage;
+    const claim = await this.state.blockConcurrencyWhile(async () => {
+      const tkt = await storage.get(`tkt:${id}`);
+      if (!tkt) return null;
+      await storage.delete(`tkt:${id}`);
+      if (!(tkt.exp > Date.now())) return null;
+      await storage.put(`att:${tkt.key}`, {
+        userId: tkt.userId,
+        mime: tkt.mime,
+        exp: Date.now() + ATT_TTL_MS,
+      });
+      return tkt;
+    });
+    if (!claim) return Response.json({ ok: false }, { status: 404 });
+    return Response.json({
+      ok: true,
+      key: claim.key,
+      mime: claim.mime,
+      max: claim.max,
+      userId: claim.userId,
+    });
+  }
+
+  async dropObjects(keys) {
+    if (!keys?.length || !this.env.FILES) return;
+    try {
+      await this.env.FILES.delete(keys);
+    } catch {
+      // A failed delete leaves an orphan, which is cheaper than a failed send.
+    }
+  }
+
+  async dropMessageFiles(msgs) {
+    const keys = [];
+    for (const msg of msgs) {
+      for (const a of msg?.attachments || []) if (a?.key) keys.push(a.key);
+    }
+    await this.dropObjects(keys);
+  }
+
+  // Turns client-declared attachments into stored ones. Each key must have an
+  // `att:` record minted by *this* person's upload; anything else is dropped
+  // without comment, because a client that sends a bad key is a bug, not a user.
+  async claimAttachments(s, raw) {
+    if (!Array.isArray(raw) || !raw.length) return [];
+    const storage = this.state.storage;
+    const out = [];
+    for (const a of raw.slice(0, MAX_FILES_PER_MSG)) {
+      const key = typeof a?.key === "string" ? a.key : "";
+      if (!ATT_KEY_RE.test(key)) continue;
+      const rec = await storage.get(`att:${key}`);
+      if (!rec || rec.userId !== s.userId) continue;
+      await storage.delete(`att:${key}`);
+      const att = {
+        key,
+        url: `/f/${key}`,
+        name: cleanFileName(a.name) || key.split("/").pop(),
+        size: clampInt(a.size, 0, MAX_FILE_BYTES),
+        mime: safeMime(rec.mime),
+      };
+      // Dimensions and duration are measured by the browser purely so the
+      // bubble reserves the right space before the file loads. Cosmetic, so
+      // clamped rather than verified.
+      const w = clampInt(a.w, 0, 20000);
+      const h = clampInt(a.h, 0, 20000);
+      const dur = clampInt(a.dur, 0, 86400);
+      if (w) att.w = w;
+      if (h) att.h = h;
+      if (dur) att.dur = dur;
+      if (a.spoiler) att.spoiler = true;
+      out.push(att);
+    }
+    return out;
+  }
+
+  async isOwner(userId) {
+    const meta = await this.state.storage.get("meta");
+    return !!userId && meta?.owner === userId;
+  }
+
+  async banList() {
+    return [...(await this.state.storage.list({ prefix: "ban:" })).values()];
+  }
+
+  // Emoji and soundboard clips are both "a spent upload ticket, but smaller".
+  // R2 is asked for the real size because the ticket only ever knew what the
+  // client claimed the size would be.
+  async consumeAsset(s, rawKey, kind, maxBytes) {
+    const key = typeof rawKey === "string" ? rawKey : "";
+    if (!ATT_KEY_RE.test(key)) return { error: "That upload isn't one of ours." };
+    const rec = await this.state.storage.get(`att:${key}`);
+    if (!rec || rec.userId !== s.userId) return { error: "That upload expired. Send it again." };
+    if (!safeMime(rec.mime).startsWith(`${kind}/`)) {
+      return { error: kind === "image" ? "Emoji have to be images." : "Clips have to be audio." };
+    }
+    const head = await this.env.FILES?.head(key);
+    if (!head) return { error: "That upload never finished." };
+    if (head.size > maxBytes) return { error: `That one has to be under ${Math.round(maxBytes / 1024)} KB.` };
+    await this.state.storage.delete(`att:${key}`);
+    return { key };
+  }
+
+  async rosterList() {
+    return [...(await this.state.storage.list({ prefix: "roster:" })).values()];
+  }
+
+  async emojiList() {
+    const rows = await this.state.storage.list({ prefix: "emoji:" });
+    return [...rows.values()].map((e) => ({ name: e.name, url: `/f/${e.key}` }));
+  }
+
+  async soundList() {
+    const rows = await this.state.storage.list({ prefix: "sound:" });
+    return [...rows.values()].map((x) => ({ id: x.id, name: x.name, url: `/f/${x.key}` }));
+  }
+
+  // Roster rows outlive sockets, so they need their own ceiling. Anyone with a
+  // socket open is exempt — evicting someone mid-conversation would be absurd.
+  async sweepRoster() {
+    const rows = await this.state.storage.list({ prefix: "roster:" });
+    if (rows.size <= ROSTER_CAP) return;
+    const live = new Set();
+    for (const s of this.sessions.values()) if (s.userId) live.add(`roster:${s.userId}`);
+    const cold = [...rows].filter(([key]) => !live.has(key)).sort((a, b) => (a[1]?.at || 0) - (b[1]?.at || 0));
+    const doomed = cold.slice(0, rows.size - ROSTER_CAP).map(([key]) => key);
+    if (doomed.length) await this.state.storage.delete(doomed);
+  }
+
+  async writeRoster(s) {
+    const key = `roster:${s.userId}`;
+    const now = Date.now();
+    const existing = await this.state.storage.get(key);
+    const entry = {
+      userId: s.userId,
+      name: s.name,
+      color: s.color,
+      avatar: s.avatar,
+      tag: s.tag || "",
+      status: s.status || "",
+      at: now,
+      joinedAt: existing?.joinedAt || now,
+    };
+    await this.state.storage.put(key, entry);
+    if (!existing) await this.sweepRoster();
+    return entry;
+  }
+
+  // Removing the owner has to hand the keys to someone, or the server locks
+  // itself out of its own moderation forever.
+  async removeMember(userId, closeSockets) {
+    const storage = this.state.storage;
+    await storage.delete(`roster:${userId}`);
+    const meta = await storage.get("meta");
+    if (meta?.owner === userId) {
+      const rows = await this.rosterList();
+      const heir = rows.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0))[0];
+      meta.owner = heir?.userId || null;
+      await storage.put("meta", meta);
+      this.broadcast({ type: "server-meta", meta });
+    }
+    this.broadcast({ type: "roster-remove", userId });
+    if (!closeSockets) return;
+    for (const [ws, other] of this.sessions) {
+      if (other.userId !== userId) continue;
+      try {
+        ws.close(4003, "removed");
+      } catch {}
+    }
+  }
+
   overRate(sid) {
     const now = Date.now();
     let r = this.rate.get(sid);
@@ -241,6 +578,14 @@ export class ConcordServer {
     }
     r.count++;
     return r.count > 30; // 30 messages per 5s is plenty for humans
+  }
+
+  uploadBudget(userId, count, now) {
+    const recent = (this.uploadAt.get(userId) || []).filter((t) => now - t < 600_000);
+    if (recent.length + count > UPLOADS_PER_10MIN) return false;
+    for (let i = 0; i < count; i++) recent.push(now);
+    this.uploadAt.set(userId, recent);
+    return true;
   }
 
   async webSocketMessage(ws, raw) {
@@ -284,6 +629,20 @@ export class ConcordServer {
           const owner = tokenOf(await storage.get(`auth:${userId}`));
           if (owner && owner !== presented) userId = "";
         }
+
+        // Before the identity is minted, not after: a banned member should
+        // never get a session, a roster row, or a storage write out of us.
+        // Bans key on userId, so someone willing to throw away their token can
+        // walk back in as a stranger — that is the honest limit of a system
+        // where the invite code is the only real credential.
+        if (userId && (await storage.get(`ban:${userId}`))) {
+          ws.send(JSON.stringify({ type: "banned" }));
+          try {
+            ws.close(4003, "banned");
+          } catch {}
+          return;
+        }
+
         if (!userId) userId = crypto.randomUUID();
         let token = tokenOf(await storage.get(`auth:${userId}`));
         const isNewIdentity = !token;
@@ -292,6 +651,7 @@ export class ConcordServer {
         await storage.put(`auth:${userId}`, { token, at: Date.now() });
         if (isNewIdentity && ++this.authWrites % AUTH_SWEEP_EVERY === 0) {
           await this.sweepAuth(Date.now());
+          await this.sweepUploads(Date.now());
         }
 
         s.userId = userId;
@@ -308,9 +668,19 @@ export class ConcordServer {
         s.joined = true;
         this.saveSession(ws, s);
 
-        const [meta, channels] = await Promise.all([
-          storage.get("meta"),
+        const meta = await storage.get("meta");
+        // Whoever turns up first is in charge. There is no other moment at
+        // which we could possibly tell.
+        if (meta && !meta.owner) {
+          meta.owner = userId;
+          await storage.put("meta", meta);
+        }
+        const entry = await this.writeRoster(s);
+        const [channels, roster, emoji, sounds] = await Promise.all([
           storage.get("channels"),
+          this.rosterList(),
+          this.emojiList(),
+          this.soundList(),
         ]);
         ws.send(
           JSON.stringify({
@@ -320,9 +690,14 @@ export class ConcordServer {
             meta,
             channels,
             members: this.members(),
+            roster,
+            owner: meta?.owner || null,
+            emoji,
+            sounds,
           })
         );
         this.broadcast({ type: "member-join", member: publicMember(s) }, ws);
+        this.broadcast({ type: "roster", entry }, ws);
         break;
       }
 
@@ -334,16 +709,41 @@ export class ConcordServer {
         if (m.status !== undefined) s.status = cleanText(m.status, 60);
         this.saveSession(ws, s);
         this.broadcast({ type: "member-update", member: publicMember(s) });
+        this.broadcast({ type: "roster", entry: await this.writeRoster(s) });
         break;
       }
 
       case "msg": {
         if (!s.joined) return;
         const content = cleanText(m.content, 4000);
-        if (!content) return;
         const chanId = String(m.chanId || "");
         const channels = (await storage.get("channels")) || [];
-        if (!channels.some((c) => c.id === chanId && c.type === "text")) return;
+        const chan = channels.find((c) => c.id === chanId);
+        if (!chan || !CHATTABLE.has(chan.type)) return;
+        // A picture with no caption is the entire reason attachments exist.
+        // Counted before they're claimed, because a slowmode bounce must not
+        // consume the upload the sender is about to retry with.
+        const wanted = Array.isArray(m.attachments) ? m.attachments.length : 0;
+        if (!content && !wanted) return;
+
+        if (chan.slow && !(await this.isOwner(s.userId))) {
+          const now = Date.now();
+          const waited = now - (this.slowAt.get(`${s.userId}:${chanId}`) || 0);
+          if (waited < chan.slow * 1000) {
+            ws.send(
+              JSON.stringify({
+                type: "slowmode",
+                chanId,
+                seconds: Math.ceil((chan.slow * 1000 - waited) / 1000),
+              })
+            );
+            return;
+          }
+          this.slowAt.set(`${s.userId}:${chanId}`, now);
+        }
+
+        const attachments = await this.claimAttachments(s, m.attachments);
+        if (!content && !attachments.length) return;
 
         const seqKey = `chanseq:${chanId}`;
         const seq = ((await storage.get(seqKey)) || 0) + 1;
@@ -354,6 +754,7 @@ export class ConcordServer {
           content,
           ts: Date.now(),
         };
+        if (attachments.length) msg.attachments = attachments;
         if (m.replyTo) {
           const parent = await storage.get(msgKey(chanId, Number(m.replyTo)));
           if (parent) {
@@ -366,7 +767,13 @@ export class ConcordServer {
         }
         const writes = { [seqKey]: seq, [msgKey(chanId, seq)]: msg };
         await storage.put(writes);
-        if (seq > MSG_CAP) await storage.delete(msgKey(chanId, seq - MSG_CAP));
+        if (seq > MSG_CAP) {
+          // Read the message falling off the end before dropping it, or its
+          // files sit in the bucket forever with nothing left pointing at them.
+          const evicted = msgKey(chanId, seq - MSG_CAP);
+          await this.dropMessageFiles([await storage.get(evicted)]);
+          await storage.delete(evicted);
+        }
         this.broadcast({ type: "msg", msg }, ws);
         // The author instead gets an ack carrying the nonce so their
         // optimistic bubble resolves (other tabs of the author still get msg).
@@ -409,6 +816,7 @@ export class ConcordServer {
         const key = msgKey(chanId, Number(m.msgId));
         const msg = await storage.get(key);
         if (!msg || msg.author.userId !== s.userId) return;
+        await this.dropMessageFiles([msg]);
         await storage.delete(key);
         if (msg.pinned) {
           const idxKey = `pins:${chanId}`;
@@ -421,7 +829,16 @@ export class ConcordServer {
 
       case "react": {
         if (!s.joined) return;
-        const emoji = cleanText(m.emoji, 8);
+        // `:name:` is a custom emoji and needs room for the name; everything
+        // else is a literal glyph and keeps the tight clamp it always had.
+        const wide = cleanText(m.emoji, 24);
+        let emoji;
+        if (CUSTOM_EMOJI_RE.test(wide)) {
+          if (!(await storage.get(`emoji:${wide.slice(1, -1)}`))) return;
+          emoji = wide;
+        } else {
+          emoji = cleanText(m.emoji, 8);
+        }
         if (!emoji) return;
         const key = msgKey(String(m.chanId || ""), Number(m.msgId));
         const msg = await storage.get(key);
@@ -500,8 +917,8 @@ export class ConcordServer {
         const scope = String(m.chanId || "");
         const channels = (await storage.get("channels")) || [];
         const targets = scope
-          ? channels.filter((c) => c.id === scope && c.type === "text")
-          : channels.filter((c) => c.type === "text");
+          ? channels.filter((c) => c.id === scope && CHATTABLE.has(c.type))
+          : channels.filter((c) => CHATTABLE.has(c.type));
         const hits = [];
         let scanned = 0;
         for (const c of targets) {
@@ -524,16 +941,22 @@ export class ConcordServer {
       // relays *which* sound to play, and only to people in the same room.
       case "sound": {
         if (!s.joined || !s.voice) return;
-        const sound = cleanText(m.sound, 20);
-        if (!SOUNDS.has(sound)) return;
+        const sound = cleanText(m.sound, 24);
+        // Built-ins are synthesized on the receiver; a custom clip is a file,
+        // so it travels with a url and nothing else about the shape changes.
+        const custom = SOUNDS.has(sound) ? null : await storage.get(`sound:${sound}`);
+        if (!SOUNDS.has(sound) && !custom) return;
         const now = Date.now();
         const last = this.soundAt.get(s.userId) || 0;
         if (now - last < 2000) return; // one clip per 2s per person
         this.soundAt.set(s.userId, now);
+        const payload = { type: "sound", sound, name: s.name, sid: s.sid };
+        if (custom) payload.url = `/f/${custom.key}`;
+        const raw = JSON.stringify(payload);
         for (const [sock, other] of this.sessions) {
           if (!other.joined || other.voice?.chanId !== s.voice.chanId) continue;
           try {
-            sock.send(JSON.stringify({ type: "sound", sound, name: s.name, sid: s.sid }));
+            sock.send(raw);
           } catch {}
         }
         break;
@@ -545,10 +968,15 @@ export class ConcordServer {
         const type = m.chanType === "voice" ? "voice" : "text";
         if (!name) return;
         const channels = (await storage.get("channels")) || [];
-        if (channels.length >= 50) return;
+        if (channels.length >= CHANNEL_CAP) return;
         const nextChanId = ((await storage.get("nextChanId")) || 100) + 1;
         const chan = { id: `c${nextChanId}`, type, name };
         if (type === "text") chan.topic = cleanText(m.topic, 100);
+        // Categories are one string on the channel. Grouping, ordering and
+        // whether you folded one away are all the client's problem.
+        const cat = cleanText(m.cat, 24);
+        if (cat) chan.cat = cat;
+        if (m.slow !== undefined) chan.slow = clampInt(m.slow, 0, SLOWMODE_MAX_S);
         channels.push(chan);
         await storage.put({ channels, nextChanId });
         this.broadcast({ type: "channel-create", channel: chan });
@@ -561,7 +989,13 @@ export class ConcordServer {
         const chan = channels.find((c) => c.id === m.chanId);
         if (!chan) return;
         if (m.name !== undefined) chan.name = cleanChannelName(m.name) || chan.name;
-        if (m.topic !== undefined && chan.type === "text") chan.topic = cleanText(m.topic, 100);
+        if (m.topic !== undefined && chan.type !== "voice") chan.topic = cleanText(m.topic, 100);
+        if (m.cat !== undefined) {
+          const cat = cleanText(m.cat, 24);
+          if (cat) chan.cat = cat;
+          else delete chan.cat;
+        }
+        if (m.slow !== undefined) chan.slow = clampInt(m.slow, 0, SLOWMODE_MAX_S);
         await storage.put("channels", channels);
         this.broadcast({ type: "channel-update", channel: chan });
         break;
@@ -572,13 +1006,59 @@ export class ConcordServer {
         let channels = (await storage.get("channels")) || [];
         const chan = channels.find((c) => c.id === m.chanId);
         if (!chan) return;
-        if (channels.filter((c) => c.type === chan.type).length <= 1) return; // keep at least one of each
-        channels = channels.filter((c) => c.id !== m.chanId);
+        // Keep at least one text and one voice channel. Threads are disposable
+        // by nature, so the floor never applies to them.
+        if (chan.type !== "thread" && channels.filter((c) => c.type === chan.type).length <= 1) return;
+        // A thread without its parent is just an orphan nobody can reach.
+        const doomed = [chan.id, ...channels.filter((c) => c.parent === chan.id).map((c) => c.id)];
+        channels = channels.filter((c) => !doomed.includes(c.id));
         await storage.put("channels", channels);
-        // Purge that channel's stored messages.
-        const keys = await storage.list({ prefix: `msg:${m.chanId}:` });
-        await storage.delete([...keys.keys(), `chanseq:${m.chanId}`, `pins:${m.chanId}`]);
-        this.broadcast({ type: "channel-delete", chanId: m.chanId });
+        for (const id of doomed) {
+          const rows = await storage.list({ prefix: `msg:${id}:` });
+          await this.dropMessageFiles([...rows.values()]);
+          await storage.delete([...rows.keys(), `chanseq:${id}`, `pins:${id}`]);
+          this.broadcast({ type: "channel-delete", chanId: id });
+        }
+        break;
+      }
+
+      // A thread is a channel with a parent. Everything that already works on
+      // a channel — history, pins, reactions, slowmode — works on it for free.
+      case "create-thread": {
+        if (!s.joined) return;
+        const chanId = String(m.chanId || "");
+        const key = msgKey(chanId, Number(m.msgId));
+        const src = await storage.get(key);
+        if (!src) return;
+        const channels = (await storage.get("channels")) || [];
+        const parent = channels.find((c) => c.id === chanId);
+        if (!parent || parent.type === "thread") return; // no threads on threads
+        // One thread per message; asking twice hands back the first one.
+        const already = src.threadId && channels.find((c) => c.id === src.threadId);
+        if (already) {
+          ws.send(
+            JSON.stringify({
+              type: "msg-thread",
+              chanId,
+              msgId: src.id,
+              threadId: already.id,
+              name: already.name,
+            })
+          );
+          return;
+        }
+        if (channels.length >= CHANNEL_CAP) {
+          ws.send(JSON.stringify({ type: "error", error: `${CHANNEL_CAP} channels is the ceiling. Delete something.` }));
+          return;
+        }
+        const nextChanId = ((await storage.get("nextChanId")) || 100) + 1;
+        const name = cleanChannelName(m.name) || cleanChannelName(src.content) || `thread-${src.id}`;
+        const chan = { id: `t${nextChanId}`, type: "thread", name, parent: chanId, rootId: src.id, at: Date.now() };
+        channels.push(chan);
+        src.threadId = chan.id;
+        await storage.put({ channels, nextChanId, [key]: src });
+        this.broadcast({ type: "channel-create", channel: chan });
+        this.broadcast({ type: "msg-thread", chanId, msgId: src.id, threadId: chan.id, name: chan.name });
         break;
       }
 
@@ -589,6 +1069,175 @@ export class ConcordServer {
         if (m.icon !== undefined) meta.icon = cleanText(m.icon, 8) || meta.icon;
         await storage.put("meta", meta);
         this.broadcast({ type: "server-meta", meta });
+        break;
+      }
+
+      // Uploads can't ride the socket, and a bare HTTP POST has no identity, so
+      // the socket you're already authenticated on issues a ticket you spend
+      // over HTTP. The DO picks the key; the client never gets to name it.
+      case "upload-ticket": {
+        if (!s.joined) return;
+        if (!this.env.FILES) {
+          ws.send(JSON.stringify({ type: "error", error: "Uploads aren't switched on here." }));
+          return;
+        }
+        const files = Array.isArray(m.files) ? m.files : [];
+        if (!files.length || files.length > MAX_FILES_PER_MSG) {
+          ws.send(JSON.stringify({ type: "error", error: `${MAX_FILES_PER_MSG} files at a time, tops.` }));
+          return;
+        }
+        for (const f of files) {
+          const size = Number(f?.size);
+          if (!Number.isFinite(size) || size <= 0 || size > MAX_FILE_BYTES) {
+            ws.send(JSON.stringify({ type: "error", error: "Files cap out at 25 MB." }));
+            return;
+          }
+        }
+        const now = Date.now();
+        if (!this.uploadBudget(s.userId, files.length, now)) {
+          ws.send(JSON.stringify({ type: "error", error: "That's a lot of uploading. Give it ten minutes." }));
+          return;
+        }
+        const pending = await storage.list({ prefix: "tkt:" });
+        let mine = 0;
+        for (const t of pending.values()) if (t?.userId === s.userId && t.exp > now) mine++;
+        if (mine + files.length > MAX_PENDING_TICKETS) {
+          ws.send(JSON.stringify({ type: "error", error: "Finish the uploads you already started." }));
+          return;
+        }
+        const code = this.code || (await storage.get("code")) || "";
+        if (!CODE_RE.test(code)) {
+          ws.send(JSON.stringify({ type: "error", error: "This server can't take uploads yet. Reconnect." }));
+          return;
+        }
+        const writes = {};
+        const tickets = [];
+        for (const f of files) {
+          const id = crypto.randomUUID();
+          const key = `a/${code}/${crypto.randomUUID()}/${cleanFileName(f?.name)}`;
+          writes[`tkt:${id}`] = {
+            key,
+            mime: safeMime(f?.mime),
+            max: MAX_FILE_BYTES,
+            userId: s.userId,
+            exp: now + TICKET_TTL_MS,
+          };
+          tickets.push({ id, key, max: MAX_FILE_BYTES });
+        }
+        await storage.put(writes);
+        ws.send(JSON.stringify({ type: "upload-tickets", tickets }));
+        break;
+      }
+
+      case "leave-server": {
+        if (!s.joined) return;
+        await this.removeMember(s.userId, false);
+        break;
+      }
+
+      case "kick":
+      case "ban": {
+        if (!s.joined || !(await this.isOwner(s.userId))) return;
+        const userId = cleanText(m.userId, 40);
+        // Banning yourself would leave the server ownerless and you outside it.
+        if (!userId || userId === s.userId) return;
+        if (m.type === "ban") {
+          const row = await storage.get(`roster:${userId}`);
+          await storage.put(`ban:${userId}`, {
+            userId,
+            name: row?.name || "",
+            at: Date.now(),
+            by: s.userId,
+          });
+        }
+        await this.removeMember(userId, true);
+        break;
+      }
+
+      case "unban": {
+        if (!s.joined || !(await this.isOwner(s.userId))) return;
+        const userId = cleanText(m.userId, 40);
+        if (!userId) return;
+        await storage.delete(`ban:${userId}`);
+        ws.send(JSON.stringify({ type: "bans", list: await this.banList() }));
+        break;
+      }
+
+      case "bans": {
+        if (!s.joined || !(await this.isOwner(s.userId))) return;
+        ws.send(JSON.stringify({ type: "bans", list: await this.banList() }));
+        break;
+      }
+
+      // Stored as plain text, rendered as an image by the client — so a message
+      // full of :blobcat: is still a message you can search.
+      case "emoji-add": {
+        if (!s.joined) return;
+        const name = cleanText(m.name, 20).toLowerCase();
+        if (!EMOJI_NAME_RE.test(name)) {
+          ws.send(JSON.stringify({ type: "error", error: "Emoji names are 2–20 of a–z, 0–9 and _." }));
+          return;
+        }
+        const rows = await storage.list({ prefix: "emoji:" });
+        if (rows.has(`emoji:${name}`)) {
+          ws.send(JSON.stringify({ type: "error", error: `:${name}: is already taken.` }));
+          return;
+        }
+        if (rows.size >= EMOJI_CAP) {
+          ws.send(JSON.stringify({ type: "error", error: `${EMOJI_CAP} emoji is the limit. Retire one.` }));
+          return;
+        }
+        const asset = await this.consumeAsset(s, m.key, "image", EMOJI_MAX_BYTES);
+        if (asset.error) {
+          ws.send(JSON.stringify({ type: "error", error: asset.error }));
+          return;
+        }
+        await storage.put(`emoji:${name}`, { name, key: asset.key, by: s.userId, at: Date.now() });
+        this.broadcast({ type: "emoji", list: await this.emojiList() });
+        break;
+      }
+
+      case "emoji-remove": {
+        if (!s.joined) return;
+        const name = cleanText(m.name, 20).toLowerCase();
+        const row = await storage.get(`emoji:${name}`);
+        if (!row) return;
+        if (row.by !== s.userId && !(await this.isOwner(s.userId))) return;
+        await storage.delete(`emoji:${name}`);
+        await this.dropObjects([row.key]);
+        this.broadcast({ type: "emoji", list: await this.emojiList() });
+        break;
+      }
+
+      case "sound-add": {
+        if (!s.joined) return;
+        const name = cleanText(m.name, 24);
+        if (!name) return;
+        const rows = await storage.list({ prefix: "sound:" });
+        if (rows.size >= SOUND_CAP) {
+          ws.send(JSON.stringify({ type: "error", error: `${SOUND_CAP} clips is the limit. Retire one.` }));
+          return;
+        }
+        const asset = await this.consumeAsset(s, m.key, "audio", SOUND_MAX_BYTES);
+        if (asset.error) {
+          ws.send(JSON.stringify({ type: "error", error: asset.error }));
+          return;
+        }
+        const id = "sc" + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+        await storage.put(`sound:${id}`, { id, name, key: asset.key, by: s.userId, at: Date.now() });
+        this.broadcast({ type: "sounds", list: await this.soundList() });
+        break;
+      }
+
+      case "sound-remove": {
+        if (!s.joined) return;
+        const id = cleanText(m.id, 24);
+        const row = await storage.get(`sound:${id}`);
+        if (!row) return;
+        if (row.by !== s.userId && !(await this.isOwner(s.userId))) return;
+        await storage.delete(`sound:${id}`);
+        await this.dropObjects([row.key]);
+        this.broadcast({ type: "sounds", list: await this.soundList() });
         break;
       }
 
@@ -1445,4 +2094,25 @@ function cleanChannelName(v) {
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 function cleanColor(v) {
   return typeof v === "string" && COLOR_RE.test(v) ? v.toLowerCase() : "#5865f2";
+}
+
+// A filename ends up inside an R2 key and inside a Content-Disposition header,
+// so separators, dot-dot and quotes all have to be gone before it gets there.
+function cleanFileName(v) {
+  const name = cleanText(v, 80)
+    .replace(/[\\/]/g, "_")
+    .replace(/\.{2,}/g, ".")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/^[._-]+/, "");
+  return name.slice(0, 80) || "file";
+}
+
+function safeMime(v) {
+  const mime = typeof v === "string" ? v.split(";")[0].trim().toLowerCase() : "";
+  return SAFE_MIMES.has(mime) ? mime : "application/octet-stream";
+}
+
+function clampInt(v, lo, hi) {
+  const n = Math.floor(Number(v));
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo;
 }

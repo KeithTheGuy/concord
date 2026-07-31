@@ -3241,3 +3241,543 @@ body.turbo .mention.me {
   cursor: default;
   opacity: 0.6;
 }
+
+/* -------------------------------------------------------------------------
+   Attachments — the staging tray, the drop target, rendered files, lightbox
+   ------------------------------------------------------------------------- */
+
+/* Staged files, between the reply bar and the box you type in. */
+#att-tray {
+  flex: 0 0 auto;
+  margin: 0 16px;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border-radius: 8px 8px 0 0;
+  border-bottom: 1px solid var(--bg-hover);
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* One rounded card, not two stacked ones. */
+#att-tray:not(.hidden) + #composer {
+  border-radius: 0 0 8px 8px;
+}
+
+.att-card {
+  position: relative;
+  flex: 0 0 auto;
+  width: 210px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--bg-hover);
+}
+
+.att-card.error {
+  border-color: var(--red);
+}
+
+.att-card-thumb {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--bg-rail);
+}
+
+.att-card-icon {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  border-radius: 4px;
+  background: var(--bg-rail);
+}
+
+.att-card-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.att-card-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-card-size {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-card.error .att-card-size {
+  color: var(--red);
+}
+
+.att-card-spoil,
+.att-card-remove {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.att-card-spoil:hover,
+.att-card-remove:hover {
+  background: var(--bg-hover);
+  color: var(--text-header);
+}
+
+.att-card-spoil.on {
+  background: var(--bg-active);
+  color: var(--text-header);
+}
+
+.att-card-bar {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 3px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--bg-rail);
+  overflow: hidden;
+}
+
+.att-card-fill {
+  height: 100%;
+  background: var(--blurple);
+  transition: width 0.12s linear;
+}
+
+/* Drop target: covers the whole chat pane while a drag with files is over it. */
+#drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.drop-card {
+  border: 2px dashed var(--blurple);
+  border-radius: 12px;
+  background: var(--bg-chat);
+  padding: 28px 44px;
+  text-align: center;
+  animation: drop-pop 0.16s ease-out;
+}
+
+@keyframes drop-pop {
+  from { transform: scale(0.96); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.drop-icon {
+  font-size: 40px;
+  line-height: 1.1;
+}
+
+.drop-title {
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-header);
+}
+
+.drop-sub {
+  margin-top: 2px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ---------------------------- rendered files ----------------------------- */
+
+.att-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  max-width: 520px;
+}
+
+.att-grid {
+  display: grid;
+  gap: 4px;
+}
+
+.att-grid-solo {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 400px;
+}
+
+.att-grid-tiled {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 400px;
+}
+
+.att-grid-compact {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  max-width: 400px;
+}
+
+.att-img-tile {
+  position: relative;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--bg-rail);
+  max-height: 350px;
+}
+
+/* In a grid the tile is a fixed slot the picture is cropped into — its own
+   aspect ratio would leave the cells ragged and the row height unpredictable.
+   The height still reserves the space before anything decodes. */
+.att-grid-tiled .att-img-tile,
+.att-grid-compact .att-img-tile {
+  aspect-ratio: auto !important;
+  height: 150px;
+  max-height: none;
+}
+
+.att-grid-compact .att-img-tile {
+  height: 110px;
+}
+
+/* A tile that failed to decode becomes a file card, so drop the picture frame. */
+.att-img-tile-broken {
+  aspect-ratio: auto !important;
+  background: transparent;
+  height: auto !important;
+  max-height: none;
+}
+
+.att-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  cursor: zoom-in;
+}
+
+/* A lone tile already carries the file's own aspect ratio, so "contain" fills
+   it exactly: no letterbox around a small picture, and the space reserved
+   before it decodes is never left over as a hole. */
+.att-grid-solo .att-img {
+  object-fit: contain;
+}
+
+.att-video-wrap,
+.att-audio-wrap {
+  position: relative;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-rail);
+  max-width: 400px;
+}
+
+.att-video {
+  display: block;
+  width: 100%;
+  max-height: 350px;
+  background: #000;
+}
+
+.att-audio-wrap {
+  padding: 8px 10px;
+}
+
+.att-audio {
+  display: block;
+  width: 100%;
+}
+
+.att-audio-name {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 400px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--bg-hover);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.att-file:hover {
+  background: var(--bg-hover);
+  text-decoration: none;
+}
+
+.att-file-icon {
+  flex: 0 0 auto;
+  font-size: 26px;
+}
+
+.att-file-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.att-file-name {
+  font-size: 14px;
+  color: var(--blurple);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-file-size {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.att-file-download {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 18px;
+}
+
+.att-file:hover .att-file-download {
+  color: var(--text-header);
+}
+
+/* Spoilers: blurred until clicked. The capture-phase listener in uploads.js is
+   what stops that first click reaching a video's controls. */
+.att-spoiler {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.att-spoiler > *:first-child {
+  filter: blur(44px);
+  transform: scale(1.06); /* hides the blur's soft edge against the corners */
+  transition: filter 0.18s ease;
+}
+
+.att-spoiler-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--bg-rail);
+  color: var(--text-header);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+.att-spoiler.revealed {
+  cursor: auto;
+}
+
+.att-spoiler.revealed > *:first-child {
+  filter: none;
+  transform: none;
+}
+
+.att-spoiler.revealed .att-spoiler-label {
+  display: none;
+}
+
+/* -------------------------------- lightbox -------------------------------- */
+
+.lb-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 250;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  animation: lb-in 0.14s ease-out;
+}
+
+@keyframes lb-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.lb-frame {
+  position: relative;
+  max-width: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.lb-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  max-height: calc(100vh - 140px);
+}
+
+.lb-media {
+  display: block;
+  max-width: min(1200px, calc(100vw - 120px));
+  max-height: calc(100vh - 140px);
+  border-radius: 6px;
+  background: var(--bg-rail);
+}
+
+.lb-close,
+.lb-prev,
+.lb-next {
+  position: absolute;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--bg-sidebar);
+  color: var(--text-header);
+  font-size: 20px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+}
+
+.lb-close:hover,
+.lb-prev:hover,
+.lb-next:hover {
+  background: var(--bg-hover);
+  opacity: 1;
+}
+
+.lb-close {
+  top: -14px;
+  right: -14px;
+}
+
+.lb-prev {
+  left: -56px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 28px;
+}
+
+.lb-next {
+  right: -56px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 28px;
+}
+
+.lb-footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 100%;
+}
+
+.lb-caption {
+  min-width: 0;
+  color: var(--text);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lb-download {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border-radius: 4px;
+  background: var(--blurple);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.lb-download:hover {
+  background: var(--blurple-hover);
+  text-decoration: none;
+}
+
+/* ------------------------------ member list ------------------------------- */
+
+/* Offline people come from the roster, not from a socket — dimmed, and with
+   how long ago they were here instead of a voice channel. */
+.member-row.offline .avatar,
+.member-row.offline .m-name {
+  opacity: 0.45;
+}
+
+.member-row.offline .m-status {
+  opacity: 0.7;
+}
+
+.member-more {
+  padding: 6px 8px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#member-count {
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--bg-rail);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-card,
+  .lb-backdrop {
+    animation: none;
+  }
+  .att-card-fill,
+  .att-spoiler > *:first-child {
+    transition: none;
+  }
+}

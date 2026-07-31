@@ -10,6 +10,9 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#313338">
 <link rel="stylesheet" href="style.css">
+<!-- Voice-panel and audio-settings styling lives apart from the main sheet
+     purely because style.css is enormous and this is a self-contained slice. -->
+<link rel="stylesheet" href="voiceui.css">
 </head>
 <body>
 
@@ -132,6 +135,7 @@
         <button id="btn-squirt" class="pill-btn" title="Squirt gun — spray Gorb (Esc to put it away)">💦</button>
         <button id="btn-gremlin" class="pill-btn" title="Gremlin Mode — troll your friends">🃏</button>
         <button id="btn-invite" class="pill-btn">Invite</button>
+        <span id="member-count" class="hidden"></span>
         <button id="btn-members" title="Toggle member list">👥</button>
       </div>
     </header>
@@ -154,6 +158,15 @@
 
       <div id="messages"></div>
 
+      <!-- Shown while a drag carrying files is anywhere over the chat pane. -->
+      <div id="drop-overlay" class="hidden">
+        <div class="drop-card">
+          <div class="drop-icon">📎</div>
+          <div class="drop-title">Drop it here</div>
+          <div class="drop-sub">Up to 10 files, 25 MB each</div>
+        </div>
+      </div>
+
       <button id="jump-present" class="hidden">Jump to present ↓</button>
 
       <div id="reply-bar" class="hidden">
@@ -161,13 +174,18 @@
         <button id="reply-cancel">✕</button>
       </div>
 
+      <!-- Staged attachments, between the reply bar and the box you type in. -->
+      <div id="att-tray" class="hidden"></div>
+
       <div id="composer">
         <textarea id="input" rows="1" placeholder="Message #general" maxlength="4000"></textarea>
         <!-- Buttons live to the RIGHT of the box. dapmon was very clear. -->
         <div id="composer-actions">
           <span id="char-count" class="hidden"></span>
+          <button id="btn-attach" title="Attach a file">📎</button>
           <button id="btn-soundboard" title="Soundboard (join voice first)">🎵</button>
           <button id="btn-emoji" title="Emoji">😄</button>
+          <input id="file-picker" type="file" multiple class="hidden">
         </div>
       </div>
       <div id="typing-bar">&nbsp;</div>
