@@ -5613,3 +5613,137 @@ body.turbo #composer:focus-within {
 .bk-applied { color: var(--text); }
 
 #backup-section .modal-sub { margin-bottom: 4px; }
+
+/* ============================== RINGING =================================
+   A call you're being invited to, everywhere you might be looking: the DM row
+   in the sidebar, the home badge, the 📞 button, and a toast that — unlike
+   every other toast in here — does not go away on its own.
+
+   Every colour comes out of --green so all seven themes get a pill that reads
+   as "live" rather than as "alert"; red is already spoken for by unread. */
+
+:root {
+  --call-bg: color-mix(in srgb, var(--green) 80%, #fff);
+  --call-ink: var(--bg-rail);
+}
+
+/* Same shape as .chan-badge so a row carrying both stays level. */
+.dm-call {
+  flex: 0 0 auto;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--call-bg);
+  color: var(--call-ink);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* A call you're already sitting in is information, not a summons. */
+.dm-call.mine {
+  background: transparent;
+  color: var(--green);
+  box-shadow: inset 0 0 0 1px var(--green);
+}
+
+.dm-call.ringing {
+  animation: call-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes call-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 60%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--green) 0%, transparent); }
+}
+
+/* The home badge is normally an unread count in red. A ring borrows it whole
+   and repaints it green, because "📞 3" would read as three missed calls. */
+#home-badge.ringing {
+  background: var(--call-bg);
+  color: var(--call-ink);
+  font-size: 10px;
+  animation: call-pulse 1.4s ease-in-out infinite;
+}
+
+/* Its neighbours in the header are fixed 32px squares. This one has to carry a
+   headcount as well as the phone, and wrapping it onto two lines turned the
+   count into a mystery digit under an emoji. */
+#btn-call {
+  width: auto;
+  min-width: var(--ctl-md);
+  padding: 0 var(--sp-2);
+  gap: 4px;
+  white-space: nowrap;
+}
+
+/* live = a call is running and you aren't in it. on = you are. */
+#btn-call.live {
+  color: var(--green);
+  box-shadow: inset 0 0 0 1px var(--green);
+}
+
+#btn-call.ringing {
+  animation: call-pulse 1.4s ease-in-out infinite;
+}
+
+.ring-toast {
+  border-left: 3px solid var(--green);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 340px;
+  padding-bottom: 12px;
+}
+
+.ring-head {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-header);
+}
+
+.ring-sub {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.ring-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ring-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.ring-actions .primary-btn,
+.ring-actions .pill-btn {
+  flex: 1 1 0;
+}
+
+.ring-join {
+  background: var(--green);
+}
+
+.ring-join:hover {
+  background: color-mix(in srgb, var(--green) 82%, #000);
+}
+
+/* Someone who asked for less motion still gets the colour, the pill and the
+   toast — they just don't get a phone vibrating at them in the corner of the
+   sidebar for as long as the call lasts. */
+@media (prefers-reduced-motion: reduce) {
+  .dm-call.ringing,
+  #home-badge.ringing,
+  #btn-call.ringing {
+    animation: none;
+  }
+  .ring-toast {
+    animation: none;
+  }
+}

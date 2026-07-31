@@ -1,6 +1,6 @@
 // Concord client — state, WebSocket protocol, and all UI.
 import { VoiceEngine } from "./voice.js";
-import { installVoiceUI, startQualityMeter, stopQualityMeter } from "./voiceui.js";
+import { installVoiceUI, startQualityMeter, stopQualityMeter, peerTrouble } from "./voiceui.js";
 import { PRANKS, runPrank, installPrankStyles } from "./prank.js";
 import { startMascot, stopMascot, setSquirt, reviveMascot, mascotDown } from "./mascot.js";
 import { HubConnection, groupTitle } from "./hub.js";
@@ -292,6 +292,13 @@ function makeRealm(code, kind) {
     firstUnread: new Map(), // chanId -> id of the first message you missed
     mentions: 0, // how many of those unreads were aimed at you
     typing: new Map(), // sid -> {name, chanId, until}
+    // A ring belongs to the conversation, not to whoever walked in last: one
+    // call, one ring, however many people pile into it. `ringHushed` survives
+    // an Ignore and is cleared when the call empties, so the next call rings.
+    ringNode: null, // the live ring toast, so it can be taken back down
+    ringNotif: null, // …and its OS notification, for the same reason
+    ringSig: null, // what the toast currently says, so it only repaints on news
+    ringHushed: false,
     replyTo: null,
     editingId: null,
     pendingByNonce: new Map(),
@@ -518,6 +525,10 @@ const voice = new VoiceEngine({
     $("btn-camera").classList.remove("on");
   },
   onError: (t) => toast(t, true),
+  // The engine knows a peer is unreachable but not who they are, so the name
+  // is attached here — off the realm holding the CALL, since the person who
+  // can't hear you is in a conversation you may well not be looking at.
+  onPeerTrouble: (sid, kind) => peerTrouble(sid, kind, voiceRealm()?.members.get(sid)?.name || "someone"),
   settings: () => state.settings,
   inMyChannel: (sid) => !!state.voiceChan && voiceRealm()?.members.get(sid)?.voice?.chanId === state.voiceChan,
   // Per-person volume keyed on the stable userId, so it survives reconnects,
@@ -548,6 +559,10 @@ const voiceUiHooks = {
   onSettingsOpen: (fn) => settingsOpenHooks.push(fn),
   panelEl: () => $("settings-modal"),
   qualityEl: () => $("vs-quality"),
+  // app.js owns the modal, so the voice panel's gear has to borrow it. Without
+  // this the gear isn't drawn at all, which is the right failure — a dead
+  // button is worse than a missing one.
+  openSettings: () => openSettings(),
 };
 installVoiceUI(voiceUiHooks);
 
@@ -708,8 +723,10 @@ function openRealm(code, kind, intent) {
 }
 
 function evictStaleDms() {
+  // A conversation that is ringing at you is exempt: quietly hanging up the
+  // socket to make room would drop the call you were about to answer.
   const dms = [...state.realms.values()].filter(
-    (r) => isDirect(r) && r.code !== state.activeCode && r.code !== state.voiceCode
+    (r) => isDirect(r) && r.code !== state.activeCode && r.code !== state.voiceCode && !r.ringNode
   );
   if (dms.length <= MAX_DM_REALMS) return;
   dms.sort((a, b) => a.touched - b.touched);
@@ -728,8 +745,10 @@ function connectRealm(realm, intent) {
     url += `&create=1&name=${encodeURIComponent(intent.name)}&icon=${encodeURIComponent(intent.icon)}`;
   } else if (isDirect(realm)) {
     // The DM's Durable Object is created lazily the first time either friend
-    // opens it; create=1 is a no-op once it exists.
-    url += `&create=1&kind=dm&name=${encodeURIComponent("DM")}&icon=${encodeURIComponent("💬")}`;
+    // opens it; create=1 is a no-op once it exists. No `kind` here: the worker
+    // asks the hub what a code is rather than believing the client, so passing
+    // it would only read like it still decided something.
+    url += `&create=1&name=${encodeURIComponent("DM")}&icon=${encodeURIComponent("💬")}`;
   }
 
   let ws;
@@ -743,7 +762,7 @@ function connectRealm(realm, intent) {
 
   ws.onopen = () => {
     realm.wsState = "open";
-    realm.send({
+    const hello = {
       type: "hello",
       userId: identityFor(code)?.userId || state.profile.userId,
       token: identityFor(code)?.token || "", // proves this userId is ours
@@ -752,7 +771,16 @@ function connectRealm(realm, intent) {
       color: state.profile.color,
       avatar: state.profile.avatar,
       status: state.profile.status || "",
-    });
+    };
+    // A conversation checks with the hub that you're still in it, which needs
+    // proof of who you are globally rather than just on this realm. Sent only
+    // for DMs and groups on purpose: the hub token is the key to your whole
+    // account, and no ordinary server has any business being handed it.
+    if (isDirect(realm) && state.account?.uid && state.account?.token) {
+      hello.hubUid = state.account.uid;
+      hello.hubToken = state.account.token;
+    }
+    realm.send(hello);
   };
   ws.onmessage = (ev) => {
     let m;
@@ -822,6 +850,7 @@ function closeRealm(code) {
   realm.closing = true;
   if (realm.reconnectTimer) clearTimeout(realm.reconnectTimer);
   stopRealmPing(realm);
+  stopRing(realm); // the conversation is going away; its ring can't outlive it
   if (state.voiceCode === code) leaveVoice({ silent: true });
   if (realm.ws) {
     const old = realm.ws;
@@ -908,9 +937,17 @@ function handleServerMessage(realm, m) {
         } else if (realm.activeChan && !realm.historyLoaded.has(realm.activeChan)) {
           requestHistoryIn(realm, realm.activeChan);
         }
-        if (resume?.voiceChan && realm.channels.some((c) => c.id === resume.voiceChan && c.type === "voice")) {
-          joinVoiceIn(realm, resume.voiceChan);
-        }
+        // `welcome` carries everyone's `voice` field, so opening a DM — or
+        // getting its socket back after an outage — is the other moment a call
+        // can become news to us.
+        const rejoin =
+          !!resume?.voiceChan && realm.channels.some((c) => c.id === resume.voiceChan && c.type === "voice");
+        // A reconnect that's about to drop us straight back into our own call
+        // must not ring on the way: `voiceCode` isn't set again until the join
+        // resolves, and until then our call is indistinguishable from theirs.
+        if (rejoin) realm.ringHushed = true;
+        syncRing(realm);
+        if (rejoin) joinVoiceIn(realm, resume.voiceChan);
         break;
       }
 
@@ -959,6 +996,7 @@ function handleServerMessage(realm, m) {
     case "member-join": {
       realm.members.set(m.member.sid, m.member);
       bumpMentions();
+      syncRing(realm);
       if (live) {
         renderMembers();
         renderChannels();
@@ -975,6 +1013,7 @@ function handleServerMessage(realm, m) {
         voice.peerLeft(m.sid);
         voice.playCue("leave");
       }
+      syncRing(realm); // the last person out stops the ring
       if (live) {
         renderMembers();
         renderChannels();
@@ -1013,6 +1052,30 @@ function handleServerMessage(realm, m) {
       break;
     }
 
+    // The hub says this conversation isn't ours any more: someone removed us
+    // from the group, or unfriended us, or this tab predates the check and
+    // can't prove otherwise. The socket closes with 4005 straight after, and a
+    // reconnect loop would knock on that door until the tab was shut — so the
+    // realm goes away instead of retrying. The server's sentence is the reason;
+    // ours is only the place it happened to.
+    case "dm-denied": {
+      const where =
+        realm.kind === "group"
+          ? groupTitle(hub.groups.get(realm.group?.id) || realm.group || {}, hub.me?.uid)
+          : realm.peer?.name
+          ? `Your DM with ${realm.peer.name}`
+          : "That conversation";
+      const wasActive = realm.code === state.activeCode;
+      closeRealm(realm.code);
+      toast(`🚪 ${where} — ${m.error || "you're not in this conversation any more."}`, true);
+      if (wasActive) {
+        state.activeCode = state.servers[0]?.code || null;
+        goHome();
+      }
+      renderDmList();
+      break;
+    }
+
     case "upload-tickets": {
       // Arrives on the socket that asked, which is not necessarily the one
       // you're looking at. Both uploaders share the socket, so both are offered
@@ -1036,6 +1099,9 @@ function handleServerMessage(realm, m) {
           voice.playCue("join"); // they'll initiate the WebRTC offer to us
         }
       }
+      // This is the frame that carries a call: `member.voice` is the only thing
+      // anyone ever says about being on one.
+      syncRing(realm);
       if (live) {
         renderMembers();
         renderChannels();
@@ -1584,7 +1650,10 @@ function totalUnread() {
 }
 function updateTitle() {
   const n = totalUnread() + hub.totalUnread() + hub.pendingCount();
-  document.title = (n ? `(${n}) ` : "") + "Concord";
+  // A ring outranks a count. The unread will still be there in an hour; the
+  // person waiting on the other end of the call will not.
+  const flag = anyRinging() ? "(📞) " : n ? `(${n}) ` : "";
+  document.title = flag + "Concord";
 }
 
 async function sendCurrentMessage() {
@@ -2012,8 +2081,12 @@ function openAddToGroup(group) {
 function renderHomeBadge() {
   const n = hub.totalUnread() + hub.pendingCount();
   const badge = $("home-badge");
-  badge.textContent = n > 99 ? "99+" : String(n);
-  badge.classList.toggle("hidden", !n);
+  // A ring takes the badge over rather than adding to it: a number next to a
+  // ringing phone reads as "3 missed", which would be a lie.
+  const ringing = anyRinging();
+  badge.textContent = ringing ? "📞" : n > 99 ? "99+" : String(n);
+  badge.classList.toggle("ringing", ringing);
+  badge.classList.toggle("hidden", !n && !ringing);
   const pend = hub.pendingCount();
   for (const id of ["dm-pending-badge", "fv-pending-badge"]) {
     const b = $(id);
@@ -2055,6 +2128,8 @@ function renderDmList() {
     col.appendChild(el("span", "dm-name", groupTitle(g, hub.me?.uid)));
     col.appendChild(el("span", "dm-sub", `${g.members.length} members`));
     row.appendChild(col);
+    const gPill = callPill(g.code ? state.realms.get(g.code) : null);
+    if (gPill) row.appendChild(gPill);
     const gUnread = hub.unread.get(g.id);
     if (gUnread) row.appendChild(el("span", "chan-badge", String(Math.min(gUnread, 99))));
     row.onclick = () => openGroup(g.id);
@@ -2086,6 +2161,8 @@ function renderDmList() {
       if (t.until > Date.now()) typing = true;
     });
     if (typing) row.appendChild(el("span", "dm-typing", "typing…"));
+    const pill = callPill(dmRealm);
+    if (pill) row.appendChild(pill);
     const unread = hub.unread.get(f.uid);
     if (unread) row.appendChild(el("span", "chan-badge", String(Math.min(unread, 99))));
     row.onclick = () => openDm(f.uid);
@@ -3521,6 +3598,233 @@ function recoverOutbox(realm) {
   }
 }
 
+/* ================================ ringing =============================== */
+
+// Nothing on the wire ever says "Alice is calling". The server only ever says
+// "here is what Alice's membership looks like now" — and that member carries a
+// `voice` field. So a ring is derived, not announced, which is why it needs no
+// protocol change and works for any conversation whose socket is open.
+//
+// Server voice channels are deliberately left out of all of this. People drift
+// in and out of #lounge all day and the channel list already shows who's
+// sitting in each one; ringing for that would be noise. A DM or group call is
+// aimed at you personally, and that's the difference worth a sound.
+
+function callIn(realm) {
+  if (!isDirect(realm)) return null;
+  const chan = realm.channels.find((c) => c.type === "voice");
+  if (!chan) return null;
+  // Deduped by userId, because two tabs of the same person is one person.
+  const seen = new Map();
+  realm.members.forEach((mm) => {
+    if (mm.voice?.chanId === chan.id && !seen.has(mm.userId)) seen.set(mm.userId, mm);
+  });
+  if (!seen.size) return null;
+  const me = realm.me?.userId;
+  return {
+    chan,
+    people: [...seen.values()],
+    // `voiceCode` counts as being in it too: for the first moment after a
+    // reconnect the server has forgotten you were in the call while you very
+    // much still are, and ringing someone about their own call is the silliest
+    // failure available here.
+    mine: (me != null && seen.has(me)) || state.voiceCode === realm.code,
+  };
+}
+
+// The toast node is the ring — one place to ask, so the tab title, the home
+// badge and the pill can never disagree with what's on screen.
+const anyRinging = () => [...state.realms.values()].some((r) => r.ringNode);
+
+// Recomputed from scratch on every membership change rather than trying to spot
+// the one transition that matters. It's cheap, and a derived ring can't get
+// stuck the way a counter can.
+function syncRing(realm) {
+  if (!realm || !isDirect(realm)) return;
+  const call = callIn(realm);
+  if (!call) {
+    // Everyone hung up, so the hush expires with them. That's the whole reason
+    // Ignore is safe: it silences this call, not every call they'll ever make.
+    realm.ringHushed = false;
+    stopRing(realm);
+  } else if (call.mine || realm.ringHushed || state.settings.muted?.[realm.code]) {
+    stopRing(realm);
+  } else if (!realm.ringNode) {
+    startRing(realm, call);
+  } else {
+    paintRing(realm, call); // a second person joined a group call already ringing
+  }
+  renderDmList();
+  renderHomeBadge(); // ends in updateTitle(), which flies the 📞 flag
+  renderCallButton();
+}
+
+function startRing(realm, call) {
+  paintRing(realm, call);
+  // Do Not Disturb drops the noise, not the news. It's a label your friends can
+  // already see before they dial, so they called knowing — and a call you can't
+  // tell you missed is a worse outcome than one you heard at a bad moment. The
+  // toast, pill, badge and tab all stay; only the sound and the OS notification
+  // go. A muted conversation is the stricter case and never gets this far.
+  if (state.settings.presence === "dnd") return;
+  voice.playCue("join"); // playCue already honours the sounds setting
+  ringNotify(realm, call);
+}
+
+// Three lines: who, who else, and how to get out of it. The last one exists
+// because Ignore looks final and isn't.
+function ringLines(realm, call) {
+  const me = realm.me?.userId;
+  const others = call.people.filter((p) => p.userId !== me);
+  const hint = "Ignore only hushes it — 📞 in the header still answers.";
+  if (realm.kind === "group") {
+    const group = hub.groups.get(realm.group?.id) || realm.group;
+    const names = others.map((p) => p.name);
+    const sub =
+      names.length > 2
+        ? `${names[0]} and ${names.length - 1} others are in it.`
+        : names.length === 2
+        ? `${names[0]} and ${names[1]} are in it.`
+        : names.length
+        ? `${names[0]} is in it.`
+        : "";
+    return [`${group?.icon || "👥"} ${groupTitle(group, hub.me?.uid)} is calling`, sub, hint];
+  }
+  const f = hub.friends.get(realm.peer?.uid) || realm.peer || others[0] || {};
+  const name = f.name || others[0]?.name || "Someone";
+  return [`${f.avatar || others[0]?.avatar || "💬"} ${name} is calling`, "", hint];
+}
+
+// The one notification in here that must not time out. A ring that evaporates
+// after four seconds like every other toast is precisely how you miss a call,
+// so this one stays up until you answer, wave it off, or they give up.
+function paintRing(realm, call) {
+  const [head, sub, hint] = ringLines(realm, call);
+  // Every mute toggle in a live call arrives as a member-update, and rebuilding
+  // the toast for each one would swap the Join button out from under a cursor
+  // that was already on its way to it.
+  const sig = head + "\n" + sub;
+  if (realm.ringNode && realm.ringSig === sig) return;
+  realm.ringSig = sig;
+  let node = realm.ringNode;
+  if (!node) {
+    node = el("div", "toast ring-toast");
+    node.dataset.ring = realm.code;
+    // Goes to the top of the stack, not the bottom. Ordinary toasts evaporate
+    // and this one doesn't, so appending it left the ring being shoved down the
+    // screen by whatever chatter happened to be on show when the call landed.
+    $("toasts").prepend(node);
+    realm.ringNode = node;
+  }
+  node.textContent = "";
+  node.appendChild(el("div", "ring-head", head));
+  if (sub) node.appendChild(el("div", "ring-sub", sub));
+  node.appendChild(el("div", "ring-hint", hint));
+  const row = el("div", "ring-actions");
+  const join = el("button", "primary-btn ring-join", "Join");
+  join.onclick = () => answerRing(realm);
+  const ignore = el("button", "pill-btn ring-ignore", "Ignore");
+  ignore.onclick = () => hushRing(realm);
+  row.appendChild(join);
+  row.appendChild(ignore);
+  node.appendChild(row);
+}
+
+function stopRing(realm) {
+  if (realm.ringNode) realm.ringNode.remove();
+  realm.ringNode = null;
+  realm.ringSig = null;
+  // Take the OS notification down with it, or a hung-up call keeps sitting in
+  // the tray insisting someone is waiting for you.
+  if (realm.ringNotif) {
+    try {
+      realm.ringNotif.close();
+    } catch {}
+    realm.ringNotif = null;
+  }
+}
+
+function answerRing(realm) {
+  const call = callIn(realm);
+  stopRing(realm);
+  if (!call) {
+    toast("They hung up before you got there. Hit 📞 to call them back.");
+    syncRing(realm);
+    return;
+  }
+  if (state.activeCode !== realm.code) switchToRealm(realm.code);
+  joinVoiceIn(realm, call.chan.id);
+}
+
+// Ignore is client-side and deliberately weak: it takes away the noise and
+// leaves the call exactly where it was, so a hasty tap can't lock you out of a
+// conversation. Nothing is sent — the caller is never told they were declined,
+// because six friends do not need a rejection protocol between them.
+function hushRing(realm) {
+  realm.ringHushed = true;
+  stopRing(realm);
+  renderDmList();
+  renderHomeBadge();
+  renderCallButton();
+}
+
+// Goes out through the same gate as every other desktop notification, so a ring
+// you never granted permission for is simply a silent toast.
+function ringNotify(realm, call) {
+  if (!notificationsReady()) return;
+  const [head, sub] = ringLines(realm, call);
+  try {
+    const n = new Notification(head, {
+      body: sub || "Click to answer in Concord.",
+      icon: "/icon-192.png",
+      tag: "concord-call-" + realm.code, // one per conversation, never a stack
+      renotify: true,
+      requireInteraction: true, // it's a call; it doesn't get to slide away
+      silent: false,
+    });
+    n.onclick = () => {
+      window.focus();
+      answerRing(realm);
+      n.close();
+    };
+    realm.ringNotif = n;
+  } catch {
+    // some platforms throw on the constructor; the toast is still up
+  }
+}
+
+// "Start" and "Join" are different promises, and getting them backwards is how
+// you end up sitting alone in a call you thought you were answering. This is
+// also the only way back in once a ring has been hushed, so it has to be right.
+function renderCallButton() {
+  const btn = $("btn-call");
+  if (!btn) return;
+  const realm = R();
+  const call = callIn(realm);
+  const mine = !!call?.mine;
+  const n = call ? call.people.length : 0;
+  btn.classList.toggle("on", mine);
+  btn.classList.toggle("live", !!call && !mine);
+  btn.classList.toggle("ringing", !!realm?.ringNode);
+  btn.textContent = n ? `📞 ${n}` : "📞";
+  btn.title = mine ? `Leave the call · ${n}` : n ? `Join call · ${n}` : "Start a voice call";
+}
+
+// A call in a conversation you can't see is the entire point of this feature,
+// so it gets a pill of its own instead of borrowing the unread badge: "3
+// unread" and "3 people waiting for you" are not the same news.
+function callPill(realm) {
+  const call = realm ? callIn(realm) : null;
+  if (!call) return null;
+  const pill = el(
+    "span",
+    "dm-call" + (realm.ringNode ? " ringing" : "") + (call.mine ? " mine" : ""),
+    `🔊 ${call.people.length}`
+  );
+  pill.title = call.mine ? "You're in this call" : "Call in progress — open it to join";
+  return pill;
+}
+
 /* =============================== voice ui =============================== */
 
 // Joins in whichever realm you're currently viewing.
@@ -3540,6 +3844,7 @@ async function joinVoiceIn(realm, chanId) {
   state.voiceCode = realm.code;
   state.voiceChan = chanId;
   realm.send({ type: "voice-join", chanId, muted: voice.muted, deafened: voice.deafened });
+  syncRing(realm); // answering is one of the three ways a ring stops
   renderVoicePanel();
   renderChannels();
   renderChatHeader();
@@ -3555,11 +3860,15 @@ function leaveVoice({ silent } = {}) {
   state.voiceChan = null;
   voice.leave({ silent });
   realm?.send({ type: "voice-leave" });
+  // Hanging up hushes this call for you. Without it, the people still sitting
+  // in it ring you back the instant you walk out, which reads as a bug.
+  if (realm && isDirect(realm)) realm.ringHushed = true;
   $("voice-status").classList.add("hidden");
   $("btn-share").classList.remove("on");
   $("btn-camera").classList.remove("on");
   $("btn-call").classList.remove("on");
   clearShareStage();
+  syncRing(realm);
   renderChannels();
   renderMembers();
   renderChatHeader();
@@ -3570,6 +3879,7 @@ function leaveVoice({ silent } = {}) {
 // wandered off to another server, and clicking it takes you back.
 function renderVoicePanel() {
   const realm = voiceRealm();
+  renderCallButton();
   if (!realm || !state.voiceChan) {
     $("voice-status").classList.add("hidden");
     return;
@@ -3583,10 +3893,15 @@ function renderVoicePanel() {
   label.textContent = where;
   label.title = "Jump to the call";
   label.onclick = () => switchToRealm(realm.code);
+  // The quality readout owns these words and repaints them every two seconds;
+  // all this owns is the "↗ the call is somewhere else" arrow. Rewriting the
+  // whole string meant that for up to two seconds after any view switch the
+  // panel cheerfully claimed "Connected" over a call that was failing.
+  const q = $("vs-quality");
   const elsewhere = realm.code !== state.activeCode;
-  $("vs-quality").textContent = elsewhere ? "Voice Connected ↗" : "Voice Connected";
+  const words = q.textContent.replace(/\s*↗$/, "").trim() || "Voice Connected";
+  q.textContent = elsewhere ? `${words} ↗` : words;
   $("voice-status").classList.remove("hidden");
-  $("btn-call").classList.toggle("on", realm.code === state.activeCode);
 }
 
 function addShareTile(key, stream, label, mirror = false) {

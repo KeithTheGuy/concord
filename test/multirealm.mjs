@@ -8,7 +8,7 @@
 
 import { chromium } from "playwright";
 
-const base = "http://127.0.0.1:4189";
+const base = process.argv[2] || "http://127.0.0.1:4189";
 let failures = 0;
 const ok = (l) => console.log(`  PASS ${l}`);
 const bad = (l, d) => {
